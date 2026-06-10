@@ -13,6 +13,128 @@
 
 // Buffer size for receiving data
 constexpr int32 MCPReceiveBufferSize = 8192;
+constexpr int32 MCPMaxBufferedMessageSize = 8 * 1024 * 1024;
+
+namespace
+{
+FString MakeMCPLogPreview(const FString& Text, int32 MaxChars = 512)
+{
+    if (Text.Len() <= MaxChars)
+    {
+        return Text;
+    }
+
+    return FString::Printf(TEXT("%s... [truncated, total chars=%d]"), *Text.Left(MaxChars), Text.Len());
+}
+
+bool IsCompleteJsonObjectMessage(const FString& Text)
+{
+    bool bStarted = false;
+    bool bInString = false;
+    bool bEscaped = false;
+    bool bCompleted = false;
+    int32 Depth = 0;
+
+    for (int32 Index = 0; Index < Text.Len(); ++Index)
+    {
+        const TCHAR Ch = Text[Index];
+
+        if (bCompleted)
+        {
+            if (!FChar::IsWhitespace(Ch))
+            {
+                return false;
+            }
+            continue;
+        }
+
+        if (!bStarted)
+        {
+            if (FChar::IsWhitespace(Ch))
+            {
+                continue;
+            }
+            if (Ch != TEXT('{'))
+            {
+                return false;
+            }
+            bStarted = true;
+            Depth = 1;
+            continue;
+        }
+
+        if (bInString)
+        {
+            if (bEscaped)
+            {
+                bEscaped = false;
+            }
+            else if (Ch == TEXT('\\'))
+            {
+                bEscaped = true;
+            }
+            else if (Ch == TEXT('"'))
+            {
+                bInString = false;
+            }
+            continue;
+        }
+
+        if (Ch == TEXT('"'))
+        {
+            bInString = true;
+        }
+        else if (Ch == TEXT('{') || Ch == TEXT('['))
+        {
+            ++Depth;
+        }
+        else if (Ch == TEXT('}') || Ch == TEXT(']'))
+        {
+            --Depth;
+            if (Depth == 0)
+            {
+                bCompleted = true;
+            }
+            else if (Depth < 0)
+            {
+                return false;
+            }
+        }
+    }
+
+    return bStarted && bCompleted && !bInString && !bEscaped && Depth == 0;
+}
+
+bool SendAllToMCPSocket(TSharedPtr<FSocket> Socket, const FString& Response, int32& OutBytesSent)
+{
+    OutBytesSent = 0;
+    if (!Socket.IsValid())
+    {
+        return false;
+    }
+
+    FTCHARToUTF8 ResponseUtf8(*Response);
+    const uint8* Data = reinterpret_cast<const uint8*>(ResponseUtf8.Get());
+    const int32 TotalBytes = ResponseUtf8.Length();
+
+    while (OutBytesSent < TotalBytes)
+    {
+        int32 BytesSentThisCall = 0;
+        if (!Socket->Send(Data + OutBytesSent, TotalBytes - OutBytesSent, BytesSentThisCall))
+        {
+            return false;
+        }
+        if (BytesSentThisCall <= 0)
+        {
+            FPlatformProcess::Sleep(0.001f);
+            continue;
+        }
+        OutBytesSent += BytesSentThisCall;
+    }
+
+    return true;
+}
+}
 
 FMCPServerRunnable::FMCPServerRunnable(UUnrealMCPBridge* InBridge, TSharedPtr<FSocket> InListenerSocket)
     : Bridge(InBridge)
@@ -57,6 +179,7 @@ uint32 FMCPServerRunnable::Run()
                 ClientSocket->SetReceiveBufferSize(SocketBufferSize, SocketBufferSize);
                 
                 uint8 Buffer[MCPReceiveBufferSize + 1];
+                FString MessageBuffer;
                 while (bRunning)
                 {
                     int32 BytesRead = 0;
@@ -64,6 +187,10 @@ uint32 FMCPServerRunnable::Run()
                     {
                         if (BytesRead == 0)
                         {
+                            if (!MessageBuffer.IsEmpty())
+                            {
+                                UE_LOG(LogTemp, Warning, TEXT("MCPServerRunnable: Client disconnected with incomplete buffered message, chars=%d preview=%s"), MessageBuffer.Len(), *MakeMCPLogPreview(MessageBuffer));
+                            }
                             UE_LOG(LogTemp, Display, TEXT("MCPServerRunnable: Client disconnected (zero bytes)"));
                             break;
                         }
@@ -71,28 +198,45 @@ uint32 FMCPServerRunnable::Run()
                         // Convert received data to string
                         Buffer[BytesRead] = '\0';
                         FString ReceivedText = UTF8_TO_TCHAR(Buffer);
-                        UE_LOG(LogTemp, Display, TEXT("MCPServerRunnable: Received: %s"), *ReceivedText);
+                        MessageBuffer.Append(ReceivedText);
+                        UE_LOG(LogTemp, Display, TEXT("MCPServerRunnable: Received chunk bytes=%d buffered_chars=%d preview=%s"), BytesRead, MessageBuffer.Len(), *MakeMCPLogPreview(MessageBuffer));
+
+                        if (MessageBuffer.Len() > MCPMaxBufferedMessageSize)
+                        {
+                            UE_LOG(LogTemp, Warning, TEXT("MCPServerRunnable: Buffered message exceeded limit, chars=%d"), MessageBuffer.Len());
+                            break;
+                        }
+
+                        if (!IsCompleteJsonObjectMessage(MessageBuffer))
+                        {
+                            continue;
+                        }
 
                         // Parse JSON
                         TSharedPtr<FJsonObject> JsonObject;
-                        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ReceivedText);
+                        TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(MessageBuffer);
                         
-                        if (FJsonSerializer::Deserialize(Reader, JsonObject))
+                        if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
                         {
                             // Get command type
                             FString CommandType;
                             if (JsonObject->TryGetStringField(TEXT("type"), CommandType))
                             {
                                 // Execute command
-                                FString Response = Bridge->ExecuteCommand(CommandType, JsonObject->GetObjectField(TEXT("params")));
+                                TSharedPtr<FJsonObject> Params = MakeShareable(new FJsonObject());
+                                const TSharedPtr<FJsonObject>* ParamsObject = nullptr;
+                                if (JsonObject->TryGetObjectField(TEXT("params"), ParamsObject) && ParamsObject && ParamsObject->IsValid())
+                                {
+                                    Params = *ParamsObject;
+                                }
+                                FString Response = Bridge->ExecuteCommand(CommandType, Params);
                                 
                                 // Log response for debugging
-                                UE_LOG(LogTemp, Display, TEXT("MCPServerRunnable: Sending response: %s"), *Response);
+                                UE_LOG(LogTemp, Display, TEXT("MCPServerRunnable: Sending response: %s"), *MakeMCPLogPreview(Response));
                                 
                                 // Send response
-                                FTCHARToUTF8 ResponseUtf8(*Response);
                                 int32 BytesSent = 0;
-                                if (!ClientSocket->Send(reinterpret_cast<const uint8*>(ResponseUtf8.Get()), ResponseUtf8.Length(), BytesSent))
+                                if (!SendAllToMCPSocket(ClientSocket, Response, BytesSent))
                                 {
                                     UE_LOG(LogTemp, Warning, TEXT("MCPServerRunnable: Failed to send response"));
                                 }
@@ -107,8 +251,9 @@ uint32 FMCPServerRunnable::Run()
                         }
                         else
                         {
-                            UE_LOG(LogTemp, Warning, TEXT("MCPServerRunnable: Failed to parse JSON from: %s"), *ReceivedText);
+                            UE_LOG(LogTemp, Warning, TEXT("MCPServerRunnable: Failed to parse complete JSON from: %s"), *MakeMCPLogPreview(MessageBuffer));
                         }
+                        MessageBuffer.Empty();
                     }
                     else
                     {
