@@ -80,6 +80,17 @@ UBlueprint* LoadBlueprintFromObjectPath(const FString& ObjectPath)
         return nullptr;
     }
 
+    const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
+    FText InvalidPackageReason;
+    if (PackageName.IsEmpty() ||
+        ObjectPath.Contains(TEXT("//")) ||
+        PackageName.Contains(TEXT("//")) ||
+        !FPackageName::IsValidLongPackageName(PackageName, true, &InvalidPackageReason))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Skipping invalid blueprint object path '%s': %s"), *ObjectPath, *InvalidPackageReason.ToString());
+        return nullptr;
+    }
+
     if (UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *ObjectPath))
     {
         return Blueprint;
@@ -233,10 +244,14 @@ UBlueprint* FUnrealMCPCommonUtils::FindBlueprintByName(const FString& BlueprintN
         return DirectBlueprint;
     }
 
-    const FString LegacyObjectPath = FString::Printf(TEXT("/Game/Blueprints/%s.%s"), *BlueprintName, *BlueprintName);
-    if (UBlueprint* LegacyBlueprint = LoadBlueprintFromObjectPath(LegacyObjectPath))
+    const bool bIsPathLikeInput = BlueprintName.Contains(TEXT("/")) || BlueprintName.Contains(TEXT("."));
+    if (!bIsPathLikeInput)
     {
-        return LegacyBlueprint;
+        const FString LegacyObjectPath = FString::Printf(TEXT("/Game/Blueprints/%s.%s"), *BlueprintName, *BlueprintName);
+        if (UBlueprint* LegacyBlueprint = LoadBlueprintFromObjectPath(LegacyObjectPath))
+        {
+            return LegacyBlueprint;
+        }
     }
 
     const TArray<FString> CandidatePaths = FindBlueprintAssetPaths(BlueprintName);
