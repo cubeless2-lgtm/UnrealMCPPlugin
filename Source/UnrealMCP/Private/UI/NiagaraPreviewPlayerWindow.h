@@ -8,6 +8,7 @@ class FNiagaraPreviewPlayerWindow
 {
 public:
     static void Show();
+    static void Shutdown();
     static bool PreviewSystemByPath(const FString& SystemPath, FString& OutError);
     static TSharedPtr<FJsonObject> GetStateJson();
 

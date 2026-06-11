@@ -151,7 +151,7 @@ public:
 
     virtual ~SNiagaraPreviewViewport() override
     {
-        ClearPreviewSystem();
+        ClearPreviewSystem(false);
     }
 
     virtual void AddReferencedObjects(FReferenceCollector& Collector) override
@@ -235,7 +235,7 @@ public:
         Invalidate();
     }
 
-    void ClearPreviewSystem()
+    void ClearPreviewSystem(bool bInvalidateWidget = true)
     {
         if (PreviewComponent && PreviewScene.IsValid())
         {
@@ -249,7 +249,10 @@ public:
         bLooping = true;
         PendingFrameTicks = 0;
         LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
-        Invalidate();
+        if (bInvalidateWidget)
+        {
+            Invalidate();
+        }
     }
 
     bool HasPreviewSystem() const
@@ -861,6 +864,18 @@ void FNiagaraPreviewPlayerWindow::Show()
 
     AddPlayerWindow(Window);
     PresentPlayerWindow(Window);
+}
+
+void FNiagaraPreviewPlayerWindow::Shutdown()
+{
+    if (PlayerWindow.IsValid())
+    {
+        PlayerWindow->SetOnWindowClosed(FOnWindowClosed());
+    }
+
+    PlayerWidget.Reset();
+    PlayerWindow.Reset();
+    ResetDropState();
 }
 
 bool FNiagaraPreviewPlayerWindow::PreviewSystemByPath(const FString& SystemPath, FString& OutError)

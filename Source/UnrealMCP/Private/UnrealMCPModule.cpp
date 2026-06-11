@@ -20,6 +20,8 @@ void FUnrealMCPModule::StartupModule()
 
 void FUnrealMCPModule::ShutdownModule()
 {
+	FNiagaraPreviewPlayerWindow::Shutdown();
+
 	if (UToolMenus::IsToolMenuUIEnabled())
 	{
 		UToolMenus::UnRegisterStartupCallback(this);
