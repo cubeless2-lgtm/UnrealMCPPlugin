@@ -19,4 +19,7 @@ public:
 	{
 		return FModuleManager::Get().IsModuleLoaded("UnrealMCP");
 	}
+
+private:
+	void RegisterMenus();
 }; 

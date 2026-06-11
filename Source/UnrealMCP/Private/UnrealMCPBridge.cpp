@@ -341,7 +341,14 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("set_actor_property") ||
                      CommandType == TEXT("spawn_blueprint_actor") ||
                      CommandType == TEXT("focus_viewport") || 
-                     CommandType == TEXT("take_screenshot"))
+                     CommandType == TEXT("take_screenshot") ||
+                     CommandType == TEXT("open_niagara_preview_player") ||
+                     CommandType == TEXT("get_niagara_preview_player_state") ||
+                     CommandType == TEXT("get_niagara_preview_lab_state") ||
+                     CommandType == TEXT("cleanup_niagara_preview_lab") ||
+                     CommandType == TEXT("capture_niagara_preview_lab_view") ||
+                     CommandType == TEXT("preview_niagara_system_in_preview_lab") ||
+                     CommandType == TEXT("sample_niagara_system_in_preview_lab"))
             {
                 ResultJson = EditorCommands->HandleCommand(CommandType, Params);
             }

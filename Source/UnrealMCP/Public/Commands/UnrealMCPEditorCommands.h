@@ -31,4 +31,13 @@ private:
     // Editor viewport commands
     TSharedPtr<FJsonObject> HandleFocusViewport(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleTakeScreenshot(const TSharedPtr<FJsonObject>& Params);
+
+    // Niagara Preview Lab commands
+    TSharedPtr<FJsonObject> HandleOpenNiagaraPreviewPlayer(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGetNiagaraPreviewPlayerState(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGetNiagaraPreviewLabState(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleCleanupNiagaraPreviewLab(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleCaptureNiagaraPreviewLabView(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandlePreviewNiagaraSystemInPreviewLab(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSampleNiagaraSystemInPreviewLab(const TSharedPtr<FJsonObject>& Params);
 }; 
