@@ -2410,6 +2410,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRendererMater
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after renderer material update"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -3249,6 +3253,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleDuplicateOrAttachEmitte
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(TargetSystem, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save target Niagara system after emitter attach"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -3511,6 +3519,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCreateOrDuplicateScratc
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(TargetSystem, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save target Niagara system after Scratch Pad duplication"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -4087,6 +4099,9 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputVa
     bool bSave = true;
     Params->TryGetBoolField(TEXT("save"), bSave);
 
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
     int32 TargetEmitterIndex = INDEX_NONE;
     int32 TargetModuleIndex = INDEX_NONE;
     FString TargetEmitterName;
@@ -4230,12 +4245,19 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputVa
     OwningScript->Modify();
     OwningScript->RapidIterationParameters.SetParameterData(RapidIterationParameter.GetData(), RapidIterationParameter, false);
     System->MarkPackageDirty();
-    System->RequestCompile(false);
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
 
     bool bSaved = false;
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after module input value update"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -4251,6 +4273,7 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputVa
     Result->SetObjectField(TEXT("rapid_iteration_parameter"), NiagaraVariableWithDataToJsonObject(RapidIterationParameter));
     Result->SetField(TEXT("previous_value"), PreviousValue);
     Result->SetField(TEXT("new_value"), NiagaraVariableDataToJsonValue(RapidIterationParameter));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
     Result->SetBoolField(TEXT("saved"), bSaved);
     Result->SetStringField(TEXT("write_scope"), TEXT("existing_rapid_iteration_parameter_only"));
     return Result;
@@ -4288,6 +4311,9 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCreateNiagaraModuleInpu
 
     bool bSave = true;
     Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
 
     int32 TargetEmitterIndex = INDEX_NONE;
     int32 TargetModuleIndex = INDEX_NONE;
@@ -4443,12 +4469,19 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCreateNiagaraModuleInpu
     OwningScript->Modify();
     OwningScript->RapidIterationParameters.SetParameterData(RapidIterationParameter.GetData(), RapidIterationParameter, true);
     System->MarkPackageDirty();
-    System->RequestCompile(false);
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
 
     bool bSaved = false;
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after module input override creation"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -4466,6 +4499,7 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCreateNiagaraModuleInpu
     Result->SetBoolField(TEXT("overwrote_existing"), ExistingData != nullptr);
     Result->SetField(TEXT("previous_value"), PreviousValue);
     Result->SetField(TEXT("new_value"), NiagaraVariableDataToJsonValue(RapidIterationParameter));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
     Result->SetBoolField(TEXT("saved"), bSaved);
     Result->SetStringField(TEXT("write_scope"), TEXT("new_or_explicitly_overwritten_rapid_iteration_parameter"));
     return Result;
@@ -4498,6 +4532,9 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputsB
 
     bool bContinueOnError = false;
     Params->TryGetBoolField(TEXT("continue_on_error"), bContinueOnError);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
 
     FString DefaultOperation = TEXT("set_existing");
     Params->TryGetStringField(TEXT("operation"), DefaultOperation);
@@ -4569,6 +4606,7 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputsB
         CopyFields(EditObject, ChildParams);
         ChildParams->SetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
         ChildParams->SetBoolField(TEXT("save"), false);
+        ChildParams->SetBoolField(TEXT("request_compile"), false);
 
         if (Operation.Equals(TEXT("upsert"), ESearchCase::IgnoreCase) &&
             !EditObject->HasField(TEXT("overwrite_existing")) &&
@@ -4625,23 +4663,56 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputsB
     }
 
     bool bSaved = false;
-    if (bSave && AppliedCount > 0)
+    bool bCompileRequested = false;
+    bool bPostProcessFailed = false;
+    FString PostProcessError;
+    if (AppliedCount > 0)
     {
         if (UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath)))
         {
-            bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+            if (bRequestCompile)
+            {
+                System->RequestCompile(false);
+                bCompileRequested = true;
+            }
+            if (bSave)
+            {
+                bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+                if (!bSaved)
+                {
+                    bPostProcessFailed = true;
+                    PostProcessError = TEXT("Failed to save Niagara system after batch module input edits");
+                }
+            }
+        }
+        else
+        {
+            bPostProcessFailed = true;
+            PostProcessError = FString::Printf(TEXT("Failed to reload Niagara system after batch edits: %s"), *SystemPath);
         }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-    Result->SetBoolField(TEXT("success"), FailedCount == 0 || (bContinueOnError && AppliedCount > 0));
+    const bool bPartialSuccess = AppliedCount > 0 && FailedCount > 0;
+    const bool bSuccess = FailedCount == 0 && !bPostProcessFailed;
+    Result->SetBoolField(TEXT("success"), bSuccess);
     Result->SetStringField(TEXT("system_path"), SystemPath);
     Result->SetNumberField(TEXT("requested_count"), EditValues->Num());
     Result->SetNumberField(TEXT("processed_count"), ResultValues.Num());
     Result->SetNumberField(TEXT("applied_count"), AppliedCount);
     Result->SetNumberField(TEXT("failed_count"), FailedCount);
+    Result->SetBoolField(TEXT("partial_success"), bPartialSuccess);
     Result->SetBoolField(TEXT("continue_on_error"), bContinueOnError);
+    Result->SetBoolField(TEXT("compile_requested"), bCompileRequested);
     Result->SetBoolField(TEXT("saved"), bSaved);
+    if (!bSuccess && PostProcessError.IsEmpty() && FailedCount > 0)
+    {
+        PostProcessError = FString::Printf(TEXT("%d of %d Niagara module input batch edits failed"), FailedCount, EditValues->Num());
+    }
+    if (!bSuccess && !PostProcessError.IsEmpty())
+    {
+        Result->SetStringField(TEXT("error"), PostProcessError);
+    }
     Result->SetStringField(TEXT("write_scope"), TEXT("batch_rapid_iteration_module_inputs"));
     Result->SetArrayField(TEXT("results"), ResultValues);
     return Result;
@@ -4719,6 +4790,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraUserParameter
     if (bSave)
     {
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after user parameter update"));
+        }
     }
 
     TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
