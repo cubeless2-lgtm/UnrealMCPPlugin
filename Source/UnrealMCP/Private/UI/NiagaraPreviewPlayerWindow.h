@@ -22,6 +22,7 @@ private:
     static void RecordDroppedAssetPath(const FString& AssetPath);
     static void SetPlaybackState(const FString& PlaybackState);
     static void SetLoopingState(bool bLooping);
+    static void UpdateAnalysisForSystem(class UNiagaraSystem* NiagaraSystem);
     static void NotifyDropStateChanged();
     static void ResetDropState();
 
@@ -35,6 +36,7 @@ private:
     static FString LastObjectPath;
     static FString LastClassName;
     static FString LastPlaybackState;
+    static FString LastAnalysisSummary;
     static bool bLastLooping;
     static bool bLastPreviewRenderable;
     static int32 DropCount;

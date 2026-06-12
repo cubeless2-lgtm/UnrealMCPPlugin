@@ -289,6 +289,30 @@ namespace
         return Root;
     }
 
+    FLevelEditorViewportClient* GetActiveLevelEditorViewportClient()
+    {
+        if (!GEditor)
+        {
+            return nullptr;
+        }
+
+        FViewport* ActiveViewport = GEditor->GetActiveViewport();
+        if (!ActiveViewport)
+        {
+            return GCurrentLevelEditingViewportClient;
+        }
+
+        for (FLevelEditorViewportClient* Candidate : GEditor->GetLevelViewportClients())
+        {
+            if (Candidate && Candidate->Viewport == ActiveViewport)
+            {
+                return Candidate;
+            }
+        }
+
+        return GCurrentLevelEditingViewportClient;
+    }
+
     bool ResolveNiagaraPreviewLabFilePath(const FString& InputPath, FString& OutPath, FString& OutError)
     {
         if (InputPath.IsEmpty())
@@ -1322,7 +1346,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFocusViewport(const TSha
     }
 
     // Get the active viewport
-    FLevelEditorViewportClient* ViewportClient = (FLevelEditorViewportClient*)GEditor->GetActiveViewport()->GetClient();
+    FLevelEditorViewportClient* ViewportClient = GetActiveLevelEditorViewportClient();
     if (!ViewportClient)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get active viewport"));
@@ -1540,7 +1564,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCaptureNiagaraPreviewLab
     }
 
     FViewport* Viewport = GEditor->GetActiveViewport();
-    FLevelEditorViewportClient* ViewportClient = static_cast<FLevelEditorViewportClient*>(Viewport->GetClient());
+    FLevelEditorViewportClient* ViewportClient = GetActiveLevelEditorViewportClient();
     if (!ViewportClient)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active viewport is not a level editor viewport"));
