@@ -714,7 +714,7 @@ public:
         LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
         PendingFrameTicks = PreviewFrameStabilizationTicks;
         FramePreview(true);
-        Invalidate();
+        InvalidatePreviewViewport();
         return true;
     }
 
@@ -744,14 +744,14 @@ public:
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("playing"));
         }
 
-        Invalidate();
+        InvalidatePreviewViewport();
     }
 
     void SetLooping(bool bInLooping)
     {
         bLooping = bInLooping;
         FNiagaraPreviewPlayerWindow::SetLoopingState(bLooping);
-        Invalidate();
+        InvalidatePreviewViewport();
     }
 
     void ClearPreviewSystem(bool bInvalidateWidget = true)
@@ -770,7 +770,7 @@ public:
         LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
         if (bInvalidateWidget)
         {
-            Invalidate();
+            InvalidatePreviewViewport();
         }
     }
 
@@ -810,7 +810,10 @@ public:
         if (PreviewComponent && PendingFrameTicks > 0)
         {
             --PendingFrameTicks;
-            FramePreview(false);
+            if (PendingFrameTicks == 0)
+            {
+                FramePreview(true);
+            }
         }
 
         if (!PreviewComponent || !bPreviewPlaying || !PreviewComponent->IsComplete())
@@ -831,7 +834,7 @@ public:
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("stopped"));
         }
 
-        Invalidate();
+        InvalidatePreviewViewport();
     }
 
 protected:
@@ -842,6 +845,17 @@ protected:
     }
 
 private:
+    void InvalidatePreviewViewport()
+    {
+        if (ViewportClient.IsValid())
+        {
+            ViewportClient->Invalidate();
+            return;
+        }
+
+        SEditorViewport::Invalidate();
+    }
+
     void FramePreview(bool bForce)
     {
         if (!ViewportClient.IsValid() || !PreviewComponent)
@@ -1594,12 +1608,6 @@ void FNiagaraPreviewPlayerWindow::NotifyDropStateChanged()
     if (const TSharedPtr<SNiagaraPreviewPlayerWidget> Widget = PlayerWidget.Pin())
     {
         Widget->RefreshDropState();
-    }
-
-    if (PlayerWindow.IsValid() && FSlateApplication::IsInitialized())
-    {
-        FSlateApplication& SlateApplication = FSlateApplication::Get();
-        SlateApplication.ForceRedrawWindow(PlayerWindow.ToSharedRef());
     }
 }
 
