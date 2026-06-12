@@ -117,6 +117,17 @@ namespace
         return Value;
     }
 
+    bool JsonBoolField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return false;
+        }
+
+        bool bValue = false;
+        return Object->TryGetBoolField(FieldName, bValue) ? bValue : false;
+    }
+
     const TArray<TSharedPtr<FJsonValue>>* JsonArrayField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
     {
         if (!Object.IsValid())
@@ -327,7 +338,8 @@ namespace
         const FString& Command,
         const FString& SystemPath,
         bool bStackCommand = false,
-        bool bModuleInputsCommand = false)
+        bool bModuleInputsCommand = false,
+        bool bGraphCommand = false)
     {
         TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
         Params->SetStringField(TEXT("system_path"), SystemPath);
@@ -345,6 +357,14 @@ namespace
             Params->SetNumberField(TEXT("max_resolved_inputs_per_module"), 6);
             Params->SetNumberField(TEXT("max_top_candidates"), 24);
         }
+        if (bGraphCommand)
+        {
+            Params->SetBoolField(TEXT("include_pins"), false);
+            Params->SetBoolField(TEXT("include_links"), false);
+            Params->SetBoolField(TEXT("include_scratch_pads"), true);
+            Params->SetNumberField(TEXT("max_nodes_per_graph"), 120);
+            Params->SetNumberField(TEXT("max_links_per_graph"), 0);
+        }
         return Commands.HandleCommand(Command, Params);
     }
 
@@ -360,6 +380,17 @@ namespace
         const TSharedPtr<FJsonObject> RendererResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_renderers"), SystemPath);
         const TSharedPtr<FJsonObject> UserResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_user_parameters"), SystemPath);
         const TSharedPtr<FJsonObject> StackResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_stack"), SystemPath, true);
+        const TSharedPtr<FJsonObject> GraphResult = RunNiagaraPreviewAnalysisCommand(
+            Commands,
+            TEXT("inspect_niagara_graph"),
+            SystemPath,
+            false,
+            false,
+            true);
+        const TSharedPtr<FJsonObject> CompileStatusResult = RunNiagaraPreviewAnalysisCommand(
+            Commands,
+            TEXT("inspect_niagara_compile_status"),
+            SystemPath);
         const TSharedPtr<FJsonObject> ModuleInputResult = RunNiagaraPreviewAnalysisCommand(
             Commands,
             TEXT("inspect_niagara_module_inputs"),
@@ -373,6 +404,13 @@ namespace
         const int32 SettableUserParameterCount = JsonIntField(UserResult, TEXT("settable_count"));
         const int32 ScratchPadCount = JsonIntField(StackResult, TEXT("total_scratch_pad_count"));
         const int32 FunctionCallCount = JsonIntField(StackResult, TEXT("total_emitter_function_call_count"));
+        const int32 GraphCount = JsonIntField(GraphResult, TEXT("total_graph_count"));
+        const int32 GraphNodeCount = JsonIntField(GraphResult, TEXT("total_node_count"));
+        const int32 GraphLinkCount = JsonIntField(GraphResult, TEXT("total_link_count"));
+        const int32 CompileErrorCount = JsonIntField(CompileStatusResult, TEXT("error_count"));
+        const int32 CompileWarningCount = JsonIntField(CompileStatusResult, TEXT("warning_count"));
+        const int32 CompileDirtyCount = JsonIntField(CompileStatusResult, TEXT("dirty_count"));
+        const bool bOutstandingCompile = JsonBoolField(CompileStatusResult, TEXT("outstanding_compilation_requests_after"));
         const int32 ModuleInputCandidateCount = JsonIntField(ModuleInputResult, TEXT("candidate_count"));
 
         TArray<FString> Lines;
@@ -385,6 +423,13 @@ namespace
             UserParameterCount,
             SettableUserParameterCount));
         Lines.Add(FString::Printf(TEXT("Stack calls %d | Scratch Pads %d"), FunctionCallCount, ScratchPadCount));
+        Lines.Add(FString::Printf(TEXT("Graph topology %d graphs | %d nodes | %d links"), GraphCount, GraphNodeCount, GraphLinkCount));
+        Lines.Add(FString::Printf(
+            TEXT("Compile status errors %d | warnings %d | dirty %d | outstanding %s"),
+            CompileErrorCount,
+            CompileWarningCount,
+            CompileDirtyCount,
+            bOutstandingCompile ? TEXT("true") : TEXT("false")));
         Lines.Add(FString::Printf(TEXT("Module input candidates %d | Authoring read-only"), ModuleInputCandidateCount));
 
         TArray<FString> RendererClasses;
@@ -423,6 +468,37 @@ namespace
             }
         }
         Lines.Add(FString::Printf(TEXT("Control hints: %s"), Hints.IsEmpty() ? TEXT("none") : *FString::Join(Hints, TEXT(", "))));
+
+        TArray<FString> NodeClasses;
+        if (const TArray<TSharedPtr<FJsonValue>>* SystemScripts = JsonArrayField(GraphResult, TEXT("system_scripts")))
+        {
+            for (const TSharedPtr<FJsonValue>& ScriptValue : *SystemScripts)
+            {
+                const TSharedPtr<FJsonObject> ScriptObject = ScriptValue.IsValid() ? ScriptValue->AsObject() : nullptr;
+                const TSharedPtr<FJsonObject> GraphObject = JsonObjectField(ScriptObject, TEXT("graph"));
+                if (const TArray<TSharedPtr<FJsonValue>>* ClassCounts = JsonArrayField(GraphObject, TEXT("node_class_counts")))
+                {
+                    for (const TSharedPtr<FJsonValue>& ClassValue : *ClassCounts)
+                    {
+                        const TSharedPtr<FJsonObject> ClassObject = ClassValue.IsValid() ? ClassValue->AsObject() : nullptr;
+                        const FString NodeClass = JsonStringField(ClassObject, TEXT("node_class"));
+                        if (!NodeClass.IsEmpty() && !NodeClasses.Contains(NodeClass))
+                        {
+                            NodeClasses.Add(NodeClass);
+                        }
+                        if (NodeClasses.Num() >= 6)
+                        {
+                            break;
+                        }
+                    }
+                }
+                if (NodeClasses.Num() >= 6)
+                {
+                    break;
+                }
+            }
+        }
+        Lines.Add(FString::Printf(TEXT("Graph node classes: %s"), NodeClasses.IsEmpty() ? TEXT("none") : *FString::Join(NodeClasses, TEXT(", "))));
 
         Lines.Add(TEXT(""));
         Lines.Add(TEXT("Control candidates"));

@@ -436,12 +436,21 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                 ResultJson = MaterialCommands->HandleCommand(CommandType, Params);
             }
             // Niagara Commands
-            else if (CommandType == TEXT("inspect_niagara_renderers") ||
+            else if (CommandType == TEXT("analyze_niagara_system") ||
+                     CommandType == TEXT("inspect_niagara_renderers") ||
                      CommandType == TEXT("set_niagara_renderer_material") ||
                      CommandType == TEXT("inspect_niagara_user_parameters") ||
                      CommandType == TEXT("set_niagara_user_parameter") ||
                      CommandType == TEXT("inspect_niagara_stack") ||
+                     CommandType == TEXT("inspect_niagara_graph") ||
+                     CommandType == TEXT("inspect_niagara_compile_status") ||
+                     CommandType == TEXT("inspect_niagara_scratch_pad_interface") ||
+                     CommandType == TEXT("duplicate_or_attach_emitter_from_source") ||
+                     CommandType == TEXT("create_or_duplicate_scratch_pad_module") ||
+                     CommandType == TEXT("add_scratch_pad_module_to_stack") ||
                      CommandType == TEXT("inspect_niagara_module_inputs") ||
+                     CommandType == TEXT("create_niagara_module_input_override") ||
+                     CommandType == TEXT("set_niagara_module_inputs_batch") ||
                      CommandType == TEXT("set_niagara_module_input_value"))
             {
                 ResultJson = NiagaraCommands->HandleCommand(CommandType, Params);
