@@ -342,6 +342,9 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("spawn_blueprint_actor") ||
                      CommandType == TEXT("focus_viewport") || 
                      CommandType == TEXT("take_screenshot") ||
+                     CommandType == TEXT("list_viewport_bookmarks") ||
+                     CommandType == TEXT("capture_viewport_bookmark_screenshot") ||
+                     CommandType == TEXT("open_editor_level") ||
                      CommandType == TEXT("open_niagara_preview_player") ||
                      CommandType == TEXT("get_niagara_preview_player_state") ||
                      CommandType == TEXT("get_niagara_preview_lab_state") ||

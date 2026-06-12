@@ -1,12 +1,15 @@
 #include "Commands/UnrealMCPEditorCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
+#include "Bookmarks/IBookmarkTypeTools.h"
 #include "Editor.h"
 #include "EditorViewportClient.h"
+#include "FileHelpers.h"
 #include "LevelEditorViewport.h"
 #include "ImageUtils.h"
 #include "HighResScreenshot.h"
 #include "Engine/GameViewportClient.h"
 #include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
 #include "GameFramework/Actor.h"
@@ -31,6 +34,227 @@
 
 namespace
 {
+    TArray<TSharedPtr<FJsonValue>> EditorVectorToJsonArray(const FVector& Value)
+    {
+        TArray<TSharedPtr<FJsonValue>> Array;
+        Array.Add(MakeShared<FJsonValueNumber>(Value.X));
+        Array.Add(MakeShared<FJsonValueNumber>(Value.Y));
+        Array.Add(MakeShared<FJsonValueNumber>(Value.Z));
+        return Array;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> EditorRotatorToJsonArray(const FRotator& Value)
+    {
+        TArray<TSharedPtr<FJsonValue>> Array;
+        Array.Add(MakeShared<FJsonValueNumber>(Value.Pitch));
+        Array.Add(MakeShared<FJsonValueNumber>(Value.Yaw));
+        Array.Add(MakeShared<FJsonValueNumber>(Value.Roll));
+        return Array;
+    }
+
+    TArray<TSharedPtr<FJsonValue>> StringArrayToJsonArray(const TArray<FString>& Values)
+    {
+        TArray<TSharedPtr<FJsonValue>> Array;
+        for (const FString& Value : Values)
+        {
+            Array.Add(MakeShared<FJsonValueString>(Value));
+        }
+        return Array;
+    }
+
+    TArray<FString> GetDirtyPackageNames()
+    {
+        TArray<UPackage*> DirtyPackages;
+        FEditorFileUtils::GetDirtyPackages(DirtyPackages);
+
+        TArray<FString> DirtyPackageNames;
+        TSet<FString> SeenPackageNames;
+        for (UPackage* Package : DirtyPackages)
+        {
+            if (!Package)
+            {
+                continue;
+            }
+
+            const FString PackageName = Package->GetName();
+            if (SeenPackageNames.Contains(PackageName))
+            {
+                continue;
+            }
+
+            SeenPackageNames.Add(PackageName);
+            DirtyPackageNames.Add(PackageName);
+        }
+
+        DirtyPackageNames.Sort();
+        return DirtyPackageNames;
+    }
+
+    FString NormalizeLevelPackageName(const FString& InLevelPath)
+    {
+        FString LevelPath = FPackageName::ExportTextPathToObjectPath(InLevelPath).TrimStartAndEnd();
+        LevelPath.TrimQuotesInline();
+        LevelPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+        if (LevelPath.EndsWith(TEXT(".umap"), ESearchCase::IgnoreCase))
+        {
+            FString LongPackageName;
+            if (FPackageName::TryConvertFilenameToLongPackageName(LevelPath, LongPackageName))
+            {
+                return LongPackageName;
+            }
+        }
+
+        if (LevelPath.Contains(TEXT(".")))
+        {
+            LevelPath = FPackageName::ObjectPathToPackageName(LevelPath);
+        }
+
+        return LevelPath;
+    }
+
+    FString GetCurrentEditorWorldPackageName()
+    {
+        if (!GEditor)
+        {
+            return FString();
+        }
+
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        if (!World || !World->GetOutermost())
+        {
+            return FString();
+        }
+
+        return World->GetOutermost()->GetName();
+    }
+
+    void AddDirtyPackageSummary(TSharedPtr<FJsonObject>& ResultObj)
+    {
+        const TArray<FString> DirtyPackageNames = GetDirtyPackageNames();
+        ResultObj->SetNumberField(TEXT("dirty_package_count"), DirtyPackageNames.Num());
+        ResultObj->SetArrayField(TEXT("dirty_packages"), StringArrayToJsonArray(DirtyPackageNames));
+    }
+
+    void AddDirtyPackageCommandDelta(TSharedPtr<FJsonObject>& ResultObj, const TArray<FString>& DirtyPackagesBefore)
+    {
+        const TArray<FString> DirtyPackagesAfter = GetDirtyPackageNames();
+
+        TSet<FString> BeforeSet;
+        for (const FString& PackageName : DirtyPackagesBefore)
+        {
+            BeforeSet.Add(PackageName);
+        }
+
+        TSet<FString> AfterSet;
+        for (const FString& PackageName : DirtyPackagesAfter)
+        {
+            AfterSet.Add(PackageName);
+        }
+
+        TArray<FString> AddedPackages;
+        for (const FString& PackageName : DirtyPackagesAfter)
+        {
+            if (!BeforeSet.Contains(PackageName))
+            {
+                AddedPackages.Add(PackageName);
+            }
+        }
+
+        TArray<FString> RemovedPackages;
+        for (const FString& PackageName : DirtyPackagesBefore)
+        {
+            if (!AfterSet.Contains(PackageName))
+            {
+                RemovedPackages.Add(PackageName);
+            }
+        }
+
+        AddedPackages.Sort();
+        RemovedPackages.Sort();
+
+        ResultObj->SetNumberField(TEXT("dirty_package_count_before"), DirtyPackagesBefore.Num());
+        ResultObj->SetArrayField(TEXT("dirty_packages_before"), StringArrayToJsonArray(DirtyPackagesBefore));
+        ResultObj->SetNumberField(TEXT("dirty_package_count_after"), DirtyPackagesAfter.Num());
+        ResultObj->SetArrayField(TEXT("dirty_packages_after"), StringArrayToJsonArray(DirtyPackagesAfter));
+        ResultObj->SetNumberField(TEXT("dirty_package_added_count"), AddedPackages.Num());
+        ResultObj->SetArrayField(TEXT("dirty_packages_added_by_command"), StringArrayToJsonArray(AddedPackages));
+        ResultObj->SetNumberField(TEXT("dirty_package_removed_count"), RemovedPackages.Num());
+        ResultObj->SetArrayField(TEXT("dirty_packages_removed_by_command"), StringArrayToJsonArray(RemovedPackages));
+    }
+
+    TSharedPtr<FJsonObject> CaptureActiveEditorViewportToPng(
+        const FString& InFilePath,
+        FViewport* Viewport,
+        FEditorViewportClient* ViewportClient,
+        int32 RedrawCount)
+    {
+        if (!Viewport || !ViewportClient)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor viewport is available"));
+        }
+
+        FString FilePath = InFilePath;
+        if (!FilePath.EndsWith(TEXT(".png"), ESearchCase::IgnoreCase))
+        {
+            FilePath += TEXT(".png");
+        }
+        FPaths::NormalizeFilename(FilePath);
+
+        const FString Directory = FPaths::GetPath(FilePath);
+        if (!Directory.IsEmpty())
+        {
+            IFileManager::Get().MakeDirectory(*Directory, true);
+        }
+
+        ViewportClient->Invalidate();
+        Viewport->Invalidate();
+        for (int32 DrawIndex = 0; DrawIndex < FMath::Clamp(RedrawCount, 0, 3); ++DrawIndex)
+        {
+            Viewport->Draw(false);
+        }
+
+        const FIntPoint Size = Viewport->GetSizeXY();
+        if (Size.X <= 0 || Size.Y <= 0)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active viewport has invalid size"));
+        }
+
+        TArray<FColor> Bitmap;
+        const FIntRect ViewportRect(0, 0, Size.X, Size.Y);
+        if (!Viewport->ReadPixels(Bitmap, FReadSurfaceDataFlags(), ViewportRect))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to read active viewport pixels"));
+        }
+
+        TArray64<uint8> CompressedBitmap;
+        FImageUtils::PNGCompressImageArray(
+            Size.X,
+            Size.Y,
+            TArrayView64<const FColor>(Bitmap.GetData(), Bitmap.Num()),
+            CompressedBitmap);
+
+        if (!FFileHelper::SaveArrayToFile(CompressedBitmap, *FilePath))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to save screenshot: %s"), *FilePath));
+        }
+
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), true);
+        ResultObj->SetStringField(TEXT("filepath"), FilePath);
+        ResultObj->SetNumberField(TEXT("width"), Size.X);
+        ResultObj->SetNumberField(TEXT("height"), Size.Y);
+        ResultObj->SetNumberField(TEXT("pixel_count"), Bitmap.Num());
+        ResultObj->SetNumberField(TEXT("compressed_byte_count"), static_cast<double>(CompressedBitmap.Num()));
+        ResultObj->SetNumberField(TEXT("file_size_bytes"), static_cast<double>(IFileManager::Get().FileSize(*FilePath)));
+        ResultObj->SetNumberField(TEXT("redraw_count"), FMath::Clamp(RedrawCount, 0, 3));
+        ResultObj->SetArrayField(TEXT("view_location"), EditorVectorToJsonArray(ViewportClient->GetViewLocation()));
+        ResultObj->SetArrayField(TEXT("view_rotation"), EditorRotatorToJsonArray(ViewportClient->GetViewRotation()));
+        ResultObj->SetBoolField(TEXT("is_perspective"), ViewportClient->IsPerspective());
+        AddDirtyPackageSummary(ResultObj);
+        return ResultObj;
+    }
+
     constexpr const TCHAR* NiagaraPreviewLabMapPackage = TEXT("/Game/SampleTestMap/Niagara_TestMap");
     constexpr const TCHAR* NiagaraPreviewLabMapObject = TEXT("/Game/SampleTestMap/Niagara_TestMap.Niagara_TestMap");
     constexpr const TCHAR* NiagaraPreviewLabPrefix = TEXT("MCP_NiagaraPreviewLab_");
@@ -391,6 +615,18 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleTakeScreenshot(Params);
     }
+    else if (CommandType == TEXT("list_viewport_bookmarks"))
+    {
+        return HandleListViewportBookmarks(Params);
+    }
+    else if (CommandType == TEXT("capture_viewport_bookmark_screenshot"))
+    {
+        return HandleCaptureViewportBookmarkScreenshot(Params);
+    }
+    else if (CommandType == TEXT("open_editor_level"))
+    {
+        return HandleOpenEditorLevel(Params);
+    }
     else if (CommandType == TEXT("open_niagara_preview_player"))
     {
         return HandleOpenNiagaraPreviewPlayer(Params);
@@ -450,6 +686,213 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetNiagaraPreviewPlayerS
 {
     (void)Params;
     return FNiagaraPreviewPlayerWindow::GetStateJson();
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleListViewportBookmarks(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!GEditor || !GEditor->GetActiveViewport())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor viewport is available"));
+    }
+
+    FViewport* Viewport = GEditor->GetActiveViewport();
+    FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(Viewport->GetClient());
+    if (!ViewportClient)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active viewport does not have an editor viewport client"));
+    }
+
+    const uint32 MaxBookmarkCount = IBookmarkTypeTools::Get().GetMaxNumberOfBookmarks(ViewportClient);
+    TArray<TSharedPtr<FJsonValue>> BookmarkArray;
+    TArray<TSharedPtr<FJsonValue>> ExistingIndices;
+    for (uint32 Index = 0; Index < MaxBookmarkCount; ++Index)
+    {
+        const bool bExists = IBookmarkTypeTools::Get().CheckBookmark(Index, ViewportClient);
+
+        TSharedPtr<FJsonObject> BookmarkObject = MakeShared<FJsonObject>();
+        BookmarkObject->SetNumberField(TEXT("index"), Index);
+        BookmarkObject->SetBoolField(TEXT("exists"), bExists);
+        BookmarkArray.Add(MakeShared<FJsonValueObject>(BookmarkObject));
+
+        if (bExists)
+        {
+            ExistingIndices.Add(MakeShared<FJsonValueNumber>(Index));
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetNumberField(TEXT("max_bookmark_count"), MaxBookmarkCount);
+    ResultObj->SetArrayField(TEXT("bookmarks"), BookmarkArray);
+    ResultObj->SetArrayField(TEXT("existing_indices"), ExistingIndices);
+    ResultObj->SetArrayField(TEXT("view_location"), EditorVectorToJsonArray(ViewportClient->GetViewLocation()));
+    ResultObj->SetArrayField(TEXT("view_rotation"), EditorRotatorToJsonArray(ViewportClient->GetViewRotation()));
+    ResultObj->SetBoolField(TEXT("is_perspective"), ViewportClient->IsPerspective());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCaptureViewportBookmarkScreenshot(const TSharedPtr<FJsonObject>& Params)
+{
+    const TArray<FString> DirtyPackagesBeforeCommand = GetDirtyPackageNames();
+
+    FString FilePath;
+    if (!Params->TryGetStringField(TEXT("filepath"), FilePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'filepath' parameter"));
+    }
+
+    if (!GEditor || !GEditor->GetActiveViewport())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No active editor viewport is available"));
+    }
+
+    FViewport* Viewport = GEditor->GetActiveViewport();
+    FEditorViewportClient* ViewportClient = static_cast<FEditorViewportClient*>(Viewport->GetClient());
+    if (!ViewportClient)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Active viewport does not have an editor viewport client"));
+    }
+
+    int32 RedrawCount = 1;
+    if (Params->HasField(TEXT("redraw_count")))
+    {
+        RedrawCount = Params->GetIntegerField(TEXT("redraw_count"));
+    }
+
+    bool bBookmarkRequested = false;
+    bool bBookmarkExists = false;
+    int32 BookmarkIndex = INDEX_NONE;
+    if (Params->HasField(TEXT("bookmark_index")))
+    {
+        bBookmarkRequested = true;
+        BookmarkIndex = Params->GetIntegerField(TEXT("bookmark_index"));
+        if (BookmarkIndex < 0)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("bookmark_index must be >= 0"));
+        }
+
+        const uint32 MaxBookmarkCount = IBookmarkTypeTools::Get().GetMaxNumberOfBookmarks(ViewportClient);
+        if (static_cast<uint32>(BookmarkIndex) >= MaxBookmarkCount)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+                TEXT("bookmark_index %d is outside the valid range 0-%u"),
+                BookmarkIndex,
+                MaxBookmarkCount > 0 ? MaxBookmarkCount - 1 : 0));
+        }
+
+        bBookmarkExists = IBookmarkTypeTools::Get().CheckBookmark(static_cast<uint32>(BookmarkIndex), ViewportClient);
+        if (!bBookmarkExists)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No bookmark exists at index %d"), BookmarkIndex));
+        }
+
+        IBookmarkTypeTools::Get().JumpToBookmark(static_cast<uint32>(BookmarkIndex), TSharedPtr<FBookmarkBaseJumpToSettings>(), ViewportClient);
+        ViewportClient->Invalidate();
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = CaptureActiveEditorViewportToPng(FilePath, Viewport, ViewportClient, RedrawCount);
+    if (ResultObj.IsValid() && ResultObj->HasField(TEXT("success")) && ResultObj->GetBoolField(TEXT("success")))
+    {
+        ResultObj->SetBoolField(TEXT("bookmark_requested"), bBookmarkRequested);
+        ResultObj->SetBoolField(TEXT("bookmark_exists"), bBookmarkExists);
+        ResultObj->SetNumberField(TEXT("bookmark_index"), BookmarkIndex);
+        ResultObj->SetStringField(TEXT("capture_mode"), bBookmarkRequested ? TEXT("bookmark") : TEXT("active_viewport"));
+        AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+    }
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TSharedPtr<FJsonObject>& Params)
+{
+    FString RequestedLevelPath;
+    if (!Params->TryGetStringField(TEXT("level_path"), RequestedLevelPath) &&
+        !Params->TryGetStringField(TEXT("map_path"), RequestedLevelPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'level_path' parameter"));
+    }
+
+    bool bDryRun = true;
+    Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    bool bAllowDirtyPackages = false;
+    Params->TryGetBoolField(TEXT("allow_dirty_packages"), bAllowDirtyPackages);
+
+    bool bLoadAsTemplate = false;
+    Params->TryGetBoolField(TEXT("load_as_template"), bLoadAsTemplate);
+
+    bool bShowProgress = true;
+    Params->TryGetBoolField(TEXT("show_progress"), bShowProgress);
+
+    const FString TargetLongPackageName = NormalizeLevelPackageName(RequestedLevelPath);
+    FText InvalidPackageReason;
+    if (TargetLongPackageName.IsEmpty() ||
+        TargetLongPackageName.Contains(TEXT("//")) ||
+        !FPackageName::IsValidLongPackageName(TargetLongPackageName, true, &InvalidPackageReason))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Invalid level package path '%s': %s"),
+            *RequestedLevelPath,
+            *InvalidPackageReason.ToString()));
+    }
+
+    const FString TargetFilename = FPackageName::LongPackageNameToFilename(
+        TargetLongPackageName,
+        FPackageName::GetMapPackageExtension());
+    const bool bTargetExists = FPaths::FileExists(TargetFilename);
+    const FString CurrentWorldPackageName = GetCurrentEditorWorldPackageName();
+    const bool bAlreadyOpen = CurrentWorldPackageName == TargetLongPackageName;
+    const TArray<FString> DirtyPackagesBeforeCommand = GetDirtyPackageNames();
+
+    TArray<FString> BlockedReasons;
+    if (!bTargetExists)
+    {
+        BlockedReasons.Add(TEXT("target_map_file_missing"));
+    }
+    if (!bAlreadyOpen && DirtyPackagesBeforeCommand.Num() > 0 && !bAllowDirtyPackages)
+    {
+        BlockedReasons.Add(TEXT("dirty_packages_present"));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("requested_level_path"), RequestedLevelPath);
+    ResultObj->SetStringField(TEXT("target_long_package_name"), TargetLongPackageName);
+    ResultObj->SetStringField(TEXT("target_filename"), TargetFilename);
+    ResultObj->SetBoolField(TEXT("target_exists"), bTargetExists);
+    ResultObj->SetStringField(TEXT("current_world_package_name"), CurrentWorldPackageName);
+    ResultObj->SetBoolField(TEXT("already_open"), bAlreadyOpen);
+    ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
+    ResultObj->SetBoolField(TEXT("allow_dirty_packages"), bAllowDirtyPackages);
+    ResultObj->SetBoolField(TEXT("can_load"), BlockedReasons.Num() == 0 || bAlreadyOpen);
+    ResultObj->SetArrayField(TEXT("blocked_reasons"), StringArrayToJsonArray(BlockedReasons));
+    ResultObj->SetNumberField(TEXT("dirty_package_count_before"), DirtyPackagesBeforeCommand.Num());
+    ResultObj->SetArrayField(TEXT("dirty_packages_before"), StringArrayToJsonArray(DirtyPackagesBeforeCommand));
+
+    if (bDryRun || bAlreadyOpen || BlockedReasons.Num() > 0)
+    {
+        ResultObj->SetBoolField(TEXT("load_attempted"), false);
+        ResultObj->SetBoolField(TEXT("loaded"), bAlreadyOpen);
+        ResultObj->SetStringField(
+            TEXT("message"),
+            bDryRun
+                ? TEXT("Dry run only; no editor level transition was attempted")
+                : (bAlreadyOpen ? TEXT("Target level is already open") : TEXT("Editor level transition blocked")));
+        return ResultObj;
+    }
+
+    const bool bLoaded = FEditorFileUtils::LoadMap(TargetFilename, bLoadAsTemplate, bShowProgress);
+    ResultObj->SetBoolField(TEXT("load_attempted"), true);
+    ResultObj->SetBoolField(TEXT("loaded"), bLoaded);
+    ResultObj->SetStringField(TEXT("current_world_package_name_after"), GetCurrentEditorWorldPackageName());
+    AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+
+    if (!bLoaded)
+    {
+        ResultObj->SetBoolField(TEXT("success"), false);
+        ResultObj->SetStringField(TEXT("message"), TEXT("FEditorFileUtils::LoadMap returned false"));
+    }
+
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorsInLevel(const TSharedPtr<FJsonObject>& Params)
