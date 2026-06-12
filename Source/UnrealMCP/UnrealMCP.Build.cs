@@ -56,6 +56,7 @@ public class UnrealMCP : ModuleRules
 				"InputBlueprintNodes",
 				"MaterialEditor",
 				"Niagara",
+				"NiagaraEditor",
 				"PCG",
 				"Projects",
 				"AssetRegistry",

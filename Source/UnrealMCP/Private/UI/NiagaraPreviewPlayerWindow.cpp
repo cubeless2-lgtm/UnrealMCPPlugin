@@ -1,7 +1,9 @@
 #include "UI/NiagaraPreviewPlayerWindow.h"
 
 #include "AssetRegistry/AssetData.h"
+#include "Commands/UnrealMCPNiagaraCommands.h"
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "DragAndDrop/ActorDragDropOp.h"
 #include "DragAndDrop/AssetDragDropOp.h"
 #include "DragAndDrop/CompositeDragDropOp.h"
@@ -22,6 +24,7 @@
 #include "Widgets/SOverlay.h"
 #include "Widgets/Layout/SBorder.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/SWindow.h"
@@ -89,6 +92,446 @@ namespace
 
         const TSharedPtr<FActorDragDropOp> ActorOp = GetActorDragDropOp(DragDropEvent);
         return ActorOp.IsValid() && ActorOp->Actors.Num() > 0;
+    }
+
+    int32 JsonIntField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return 0;
+        }
+
+        double Value = 0.0;
+        return Object->TryGetNumberField(FieldName, Value) ? static_cast<int32>(Value) : 0;
+    }
+
+    FString JsonStringField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return FString();
+        }
+
+        FString Value;
+        Object->TryGetStringField(FieldName, Value);
+        return Value;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* JsonArrayField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return nullptr;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Array = nullptr;
+        return Object->TryGetArrayField(FieldName, Array) ? Array : nullptr;
+    }
+
+    TSharedPtr<FJsonObject> JsonObjectField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return nullptr;
+        }
+
+        const TSharedPtr<FJsonObject>* FoundObject = nullptr;
+        if (Object->TryGetObjectField(FieldName, FoundObject) && FoundObject)
+        {
+            return *FoundObject;
+        }
+        return nullptr;
+    }
+
+    int32 JsonArrayCount(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Array = JsonArrayField(Object, FieldName);
+        return Array ? Array->Num() : 0;
+    }
+
+    FString JoinFirstStringsFromArray(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, int32 MaxItems)
+    {
+        const TArray<TSharedPtr<FJsonValue>>* Array = JsonArrayField(Object, FieldName);
+        if (!Array || Array->IsEmpty())
+        {
+            return TEXT("none");
+        }
+
+        TArray<FString> Values;
+        for (int32 Index = 0; Index < Array->Num() && Index < MaxItems; ++Index)
+        {
+            FString Value;
+            if ((*Array)[Index].IsValid() && (*Array)[Index]->TryGetString(Value) && !Value.IsEmpty())
+            {
+                Values.Add(Value);
+            }
+        }
+        return Values.IsEmpty() ? FString(TEXT("none")) : FString::Join(Values, TEXT(", "));
+    }
+
+    FString BuildEmitterModuleLine(const TSharedPtr<FJsonObject>& EmitterObject, int32 MaxFunctions)
+    {
+        const FString EmitterName = JsonStringField(EmitterObject, TEXT("name"));
+        const TSharedPtr<FJsonObject> GraphObject = JsonObjectField(EmitterObject, TEXT("graph"));
+        const int32 FunctionCallCount = JsonIntField(GraphObject, TEXT("function_call_count"));
+        const FString Hints = JoinFirstStringsFromArray(GraphObject, TEXT("control_hints"), 5);
+
+        TArray<FString> FunctionNames;
+        if (const TArray<TSharedPtr<FJsonValue>>* FunctionCalls = JsonArrayField(GraphObject, TEXT("function_calls")))
+        {
+            for (int32 Index = 0; Index < FunctionCalls->Num() && Index < MaxFunctions; ++Index)
+            {
+                const TSharedPtr<FJsonObject> FunctionObject = (*FunctionCalls)[Index].IsValid() ? (*FunctionCalls)[Index]->AsObject() : nullptr;
+                const FString FunctionName = JsonStringField(FunctionObject, TEXT("function_name"));
+                if (!FunctionName.IsEmpty())
+                {
+                    FunctionNames.Add(FunctionName);
+                }
+            }
+        }
+
+        return FString::Printf(
+            TEXT("- %s: %d calls | %s\n  %s"),
+            *EmitterName,
+            FunctionCallCount,
+            *Hints,
+            FunctionNames.IsEmpty() ? TEXT("no module names") : *FString::Join(FunctionNames, TEXT(", ")));
+    }
+
+    FString BuildModuleInputCandidateLine(const TSharedPtr<FJsonObject>& CandidateObject)
+    {
+        const FString EmitterName = JsonStringField(CandidateObject, TEXT("emitter_name"));
+        const FString ModuleName = JsonStringField(CandidateObject, TEXT("module_name"));
+        const FString PinName = JsonStringField(CandidateObject, TEXT("pin_name"));
+        const FString ControlKind = JsonStringField(CandidateObject, TEXT("control_kind"));
+        const FString DefaultValue = JsonStringField(CandidateObject, TEXT("default_value"));
+        const FString DefaultObject = JsonStringField(CandidateObject, TEXT("default_object"));
+        const int32 LinkedCount = JsonIntField(CandidateObject, TEXT("linked_to_count"));
+
+        FString ValueSummary = DefaultValue;
+        if (ValueSummary.IsEmpty())
+        {
+            ValueSummary = DefaultObject;
+        }
+        if (ValueSummary.IsEmpty() && LinkedCount > 0)
+        {
+            ValueSummary = FString::Printf(TEXT("%d linked source(s)"), LinkedCount);
+        }
+        if (ValueSummary.IsEmpty())
+        {
+            ValueSummary = TEXT("no default");
+        }
+
+        return FString::Printf(
+            TEXT("- %s / %s.%s: %s | %s"),
+            EmitterName.IsEmpty() ? TEXT("system") : *EmitterName,
+            ModuleName.IsEmpty() ? TEXT("module") : *ModuleName,
+            PinName.IsEmpty() ? TEXT("input") : *PinName,
+            ControlKind.IsEmpty() ? TEXT("unknown") : *ControlKind,
+            *ValueSummary);
+    }
+
+    FString JsonValueDisplayString(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName)
+    {
+        if (!Object.IsValid())
+        {
+            return FString();
+        }
+
+        const TSharedPtr<FJsonValue> Value = Object->TryGetField(FieldName);
+        if (!Value.IsValid() || Value->IsNull())
+        {
+            return FString();
+        }
+
+        FString StringValue;
+        if (Value->TryGetString(StringValue))
+        {
+            return StringValue;
+        }
+
+        double NumberValue = 0.0;
+        if (Value->TryGetNumber(NumberValue))
+        {
+            return FString::SanitizeFloat(NumberValue);
+        }
+
+        bool BoolValue = false;
+        if (Value->TryGetBool(BoolValue))
+        {
+            return BoolValue ? TEXT("true") : TEXT("false");
+        }
+
+        if (Value->Type == EJson::Array)
+        {
+            TArray<FString> Parts;
+            for (const TSharedPtr<FJsonValue>& Item : Value->AsArray())
+            {
+                double ArrayNumber = 0.0;
+                FString ArrayString;
+                if (Item.IsValid() && Item->TryGetNumber(ArrayNumber))
+                {
+                    Parts.Add(FString::SanitizeFloat(ArrayNumber));
+                }
+                else if (Item.IsValid() && Item->TryGetString(ArrayString))
+                {
+                    Parts.Add(ArrayString);
+                }
+            }
+            return FString::Printf(TEXT("[%s]"), *FString::Join(Parts, TEXT(", ")));
+        }
+
+        return TEXT("value");
+    }
+
+    FString BuildResolvedStackInputLine(
+        const TSharedPtr<FJsonObject>& EmitterObject,
+        const TSharedPtr<FJsonObject>& ModuleObject,
+        const TSharedPtr<FJsonObject>& InputObject)
+    {
+        const TSharedPtr<FJsonObject> VariableObject = JsonObjectField(InputObject, TEXT("variable"));
+        const TSharedPtr<FJsonObject> RapidIterationObject = JsonObjectField(InputObject, TEXT("rapid_iteration_parameter"));
+        FString ValueSummary = JsonValueDisplayString(RapidIterationObject, TEXT("value"));
+        if (ValueSummary.IsEmpty())
+        {
+            ValueSummary = JsonStringField(InputObject, TEXT("value_source"));
+        }
+
+        return FString::Printf(
+            TEXT("- %s / %s.%s = %s"),
+            *JsonStringField(EmitterObject, TEXT("name")),
+            *JsonStringField(ModuleObject, TEXT("function_name")),
+            *JsonStringField(VariableObject, TEXT("name")),
+            ValueSummary.IsEmpty() ? TEXT("unresolved") : *ValueSummary);
+    }
+
+    bool IsPriorityResolvedStackInput(const TSharedPtr<FJsonObject>& InputObject)
+    {
+        const TSharedPtr<FJsonObject> VariableObject = JsonObjectField(InputObject, TEXT("variable"));
+        const FString InputName = JsonStringField(VariableObject, TEXT("name"));
+        return InputName.Contains(TEXT("Color"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Scale RGB"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Scale RGBA"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Scale Alpha"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Spawn Count"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Spawn Rate"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Velocity"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Loop Duration"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Lifetime"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Size"), ESearchCase::IgnoreCase)
+            || InputName.Contains(TEXT("Scale Factor"), ESearchCase::IgnoreCase);
+    }
+
+    TSharedPtr<FJsonObject> RunNiagaraPreviewAnalysisCommand(
+        FUnrealMCPNiagaraCommands& Commands,
+        const FString& Command,
+        const FString& SystemPath,
+        bool bStackCommand = false,
+        bool bModuleInputsCommand = false)
+    {
+        TSharedPtr<FJsonObject> Params = MakeShared<FJsonObject>();
+        Params->SetStringField(TEXT("system_path"), SystemPath);
+        if (bStackCommand)
+        {
+            Params->SetBoolField(TEXT("include_pins"), false);
+            Params->SetNumberField(TEXT("max_function_calls"), 80);
+        }
+        if (bModuleInputsCommand)
+        {
+            Params->SetBoolField(TEXT("include_linked_sources"), true);
+            Params->SetBoolField(TEXT("include_resolved_stack_inputs"), true);
+            Params->SetNumberField(TEXT("max_modules"), 40);
+            Params->SetNumberField(TEXT("max_candidates_per_module"), 16);
+            Params->SetNumberField(TEXT("max_resolved_inputs_per_module"), 6);
+            Params->SetNumberField(TEXT("max_top_candidates"), 24);
+        }
+        return Commands.HandleCommand(Command, Params);
+    }
+
+    FString BuildNiagaraPreviewAnalysisSummary(UNiagaraSystem* NiagaraSystem)
+    {
+        if (!NiagaraSystem)
+        {
+            return TEXT("Analysis\nNo Niagara system loaded.");
+        }
+
+        FUnrealMCPNiagaraCommands Commands;
+        const FString SystemPath = NiagaraSystem->GetPathName();
+        const TSharedPtr<FJsonObject> RendererResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_renderers"), SystemPath);
+        const TSharedPtr<FJsonObject> UserResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_user_parameters"), SystemPath);
+        const TSharedPtr<FJsonObject> StackResult = RunNiagaraPreviewAnalysisCommand(Commands, TEXT("inspect_niagara_stack"), SystemPath, true);
+        const TSharedPtr<FJsonObject> ModuleInputResult = RunNiagaraPreviewAnalysisCommand(
+            Commands,
+            TEXT("inspect_niagara_module_inputs"),
+            SystemPath,
+            false,
+            true);
+
+        const int32 EmitterCount = JsonIntField(StackResult, TEXT("emitter_count"));
+        const int32 RendererCount = JsonIntField(RendererResult, TEXT("renderer_count"));
+        const int32 UserParameterCount = JsonIntField(UserResult, TEXT("parameter_count"));
+        const int32 SettableUserParameterCount = JsonIntField(UserResult, TEXT("settable_count"));
+        const int32 ScratchPadCount = JsonIntField(StackResult, TEXT("total_scratch_pad_count"));
+        const int32 FunctionCallCount = JsonIntField(StackResult, TEXT("total_emitter_function_call_count"));
+        const int32 ModuleInputCandidateCount = JsonIntField(ModuleInputResult, TEXT("candidate_count"));
+
+        TArray<FString> Lines;
+        Lines.Add(TEXT("Analysis"));
+        Lines.Add(FString::Printf(TEXT("System: %s"), *NiagaraSystem->GetName()));
+        Lines.Add(FString::Printf(
+            TEXT("Emitters %d | Renderers %d | User.* %d (%d settable)"),
+            EmitterCount,
+            RendererCount,
+            UserParameterCount,
+            SettableUserParameterCount));
+        Lines.Add(FString::Printf(TEXT("Stack calls %d | Scratch Pads %d"), FunctionCallCount, ScratchPadCount));
+        Lines.Add(FString::Printf(TEXT("Module input candidates %d | Authoring read-only"), ModuleInputCandidateCount));
+
+        TArray<FString> RendererClasses;
+        if (const TArray<TSharedPtr<FJsonValue>>* Renderers = JsonArrayField(RendererResult, TEXT("renderers")))
+        {
+            for (const TSharedPtr<FJsonValue>& RendererValue : *Renderers)
+            {
+                const TSharedPtr<FJsonObject> RendererObject = RendererValue.IsValid() ? RendererValue->AsObject() : nullptr;
+                const FString RendererClass = JsonStringField(RendererObject, TEXT("renderer_class"));
+                if (!RendererClass.IsEmpty() && !RendererClasses.Contains(RendererClass))
+                {
+                    RendererClasses.Add(RendererClass);
+                }
+            }
+        }
+        Lines.Add(FString::Printf(TEXT("Renderer classes: %s"), RendererClasses.IsEmpty() ? TEXT("none") : *FString::Join(RendererClasses, TEXT(", "))));
+
+        TArray<FString> Hints;
+        if (const TArray<TSharedPtr<FJsonValue>>* Emitters = JsonArrayField(StackResult, TEXT("emitters")))
+        {
+            for (const TSharedPtr<FJsonValue>& EmitterValue : *Emitters)
+            {
+                const TSharedPtr<FJsonObject> EmitterObject = EmitterValue.IsValid() ? EmitterValue->AsObject() : nullptr;
+                const TSharedPtr<FJsonObject> GraphObject = JsonObjectField(EmitterObject, TEXT("graph"));
+                if (const TArray<TSharedPtr<FJsonValue>>* ControlHints = JsonArrayField(GraphObject, TEXT("control_hints")))
+                {
+                    for (const TSharedPtr<FJsonValue>& HintValue : *ControlHints)
+                    {
+                        FString Hint;
+                        if (HintValue.IsValid() && HintValue->TryGetString(Hint) && !Hint.IsEmpty() && !Hints.Contains(Hint))
+                        {
+                            Hints.Add(Hint);
+                        }
+                    }
+                }
+            }
+        }
+        Lines.Add(FString::Printf(TEXT("Control hints: %s"), Hints.IsEmpty() ? TEXT("none") : *FString::Join(Hints, TEXT(", "))));
+
+        Lines.Add(TEXT(""));
+        Lines.Add(TEXT("Control candidates"));
+        if (const TArray<TSharedPtr<FJsonValue>>* Candidates = JsonArrayField(ModuleInputResult, TEXT("top_candidates")))
+        {
+            const int32 CandidateLines = FMath::Min(Candidates->Num(), 10);
+            for (int32 Index = 0; Index < CandidateLines; ++Index)
+            {
+                const TSharedPtr<FJsonObject> CandidateObject = (*Candidates)[Index].IsValid() ? (*Candidates)[Index]->AsObject() : nullptr;
+                Lines.Add(BuildModuleInputCandidateLine(CandidateObject));
+            }
+            if (Candidates->Num() > CandidateLines)
+            {
+                Lines.Add(FString::Printf(TEXT("... %d more candidates"), Candidates->Num() - CandidateLines));
+            }
+        }
+        else
+        {
+            Lines.Add(TEXT("- module input analysis unavailable"));
+        }
+
+        Lines.Add(TEXT(""));
+        Lines.Add(TEXT("Resolved stack inputs"));
+        constexpr int32 MaxResolvedPreviewLines = 18;
+        int32 ResolvedLineCount = 0;
+        TSet<FString> AddedResolvedLines;
+        if (const TArray<TSharedPtr<FJsonValue>>* Emitters = JsonArrayField(ModuleInputResult, TEXT("emitters")))
+        {
+            auto AddResolvedLines = [&](const bool bPriorityOnly)
+            {
+                for (const TSharedPtr<FJsonValue>& EmitterValue : *Emitters)
+                {
+                    const TSharedPtr<FJsonObject> EmitterObject = EmitterValue.IsValid() ? EmitterValue->AsObject() : nullptr;
+                    if (const TArray<TSharedPtr<FJsonValue>>* Modules = JsonArrayField(EmitterObject, TEXT("modules")))
+                    {
+                        for (const TSharedPtr<FJsonValue>& ModuleValue : *Modules)
+                        {
+                            const TSharedPtr<FJsonObject> ModuleObject = ModuleValue.IsValid() ? ModuleValue->AsObject() : nullptr;
+                            if (const TArray<TSharedPtr<FJsonValue>>* Inputs = JsonArrayField(ModuleObject, TEXT("resolved_stack_inputs")))
+                            {
+                                for (const TSharedPtr<FJsonValue>& InputValue : *Inputs)
+                                {
+                                    const TSharedPtr<FJsonObject> InputObject = InputValue.IsValid() ? InputValue->AsObject() : nullptr;
+                                    if (JsonStringField(InputObject, TEXT("value_source")) != TEXT("rapid_iteration"))
+                                    {
+                                        continue;
+                                    }
+                                    if (bPriorityOnly && !IsPriorityResolvedStackInput(InputObject))
+                                    {
+                                        continue;
+                                    }
+
+                                    const FString Line = BuildResolvedStackInputLine(EmitterObject, ModuleObject, InputObject);
+                                    if (!AddedResolvedLines.Contains(Line))
+                                    {
+                                        Lines.Add(Line);
+                                        AddedResolvedLines.Add(Line);
+                                        ++ResolvedLineCount;
+                                    }
+                                    if (ResolvedLineCount >= MaxResolvedPreviewLines)
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            if (ResolvedLineCount >= MaxResolvedPreviewLines)
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    if (ResolvedLineCount >= MaxResolvedPreviewLines)
+                    {
+                        return;
+                    }
+                }
+            };
+
+            AddResolvedLines(true);
+            if (ResolvedLineCount < MaxResolvedPreviewLines)
+            {
+                AddResolvedLines(false);
+            }
+        }
+        if (ResolvedLineCount == 0)
+        {
+            Lines.Add(TEXT("- no resolved rapid-iteration values in limited scan"));
+        }
+
+        Lines.Add(TEXT(""));
+        Lines.Add(TEXT("Emitter modules"));
+        if (const TArray<TSharedPtr<FJsonValue>>* Emitters = JsonArrayField(StackResult, TEXT("emitters")))
+        {
+            for (int32 Index = 0; Index < Emitters->Num() && Index < 6; ++Index)
+            {
+                const TSharedPtr<FJsonObject> EmitterObject = (*Emitters)[Index].IsValid() ? (*Emitters)[Index]->AsObject() : nullptr;
+                Lines.Add(BuildEmitterModuleLine(EmitterObject, 8));
+            }
+            if (Emitters->Num() > 6)
+            {
+                Lines.Add(FString::Printf(TEXT("... %d more emitters"), Emitters->Num() - 6));
+            }
+        }
+        else
+        {
+            Lines.Add(TEXT("- stack analysis unavailable"));
+        }
+
+        return FString::Join(Lines, TEXT("\n"));
     }
 }
 
@@ -501,56 +944,86 @@ public:
                 .FillHeight(1.0f)
                 .Padding(0.0f, 10.0f, 0.0f, 10.0f)
                 [
-                    SNew(SOverlay)
+                    SNew(SHorizontalBox)
 
-                    + SOverlay::Slot()
+                    + SHorizontalBox::Slot()
+                    .FillWidth(1.0f)
                     [
-                        SAssignNew(PreviewViewport, SNiagaraPreviewViewport)
+                        SNew(SOverlay)
+
+                        + SOverlay::Slot()
+                        [
+                            SAssignNew(PreviewViewport, SNiagaraPreviewViewport)
+                        ]
+
+                        + SOverlay::Slot()
+                        .HAlign(HAlign_Center)
+                        .VAlign(VAlign_Center)
+                        [
+                            SNew(SBorder)
+                            .Visibility(this, &SNiagaraPreviewPlayerWidget::GetViewportOverlayVisibility)
+                            .Padding(18.0f)
+                            .BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
+                            .BorderBackgroundColor(FLinearColor(0.018f, 0.021f, 0.027f, 0.78f))
+                            [
+                                SNew(SVerticalBox)
+
+                                + SVerticalBox::Slot()
+                                .AutoHeight()
+                                .HAlign(HAlign_Center)
+                                [
+                                    SAssignNew(DropTitleTextBlock, STextBlock)
+                                    .Text(this, &SNiagaraPreviewPlayerWidget::GetDropSurfaceTitleText)
+                                    .Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"), 14))
+                                    .ColorAndOpacity(FLinearColor(0.82f, 0.88f, 0.92f, 1.0f))
+                                ]
+
+                                + SVerticalBox::Slot()
+                                .AutoHeight()
+                                .Padding(0.0f, 8.0f, 0.0f, 0.0f)
+                                .HAlign(HAlign_Center)
+                                [
+                                    SAssignNew(DropBodyTextBlock, STextBlock)
+                                    .Text(this, &SNiagaraPreviewPlayerWidget::GetDropSurfaceBodyText)
+                                    .ColorAndOpacity(FLinearColor(0.52f, 0.59f, 0.65f, 1.0f))
+                                ]
+
+                                + SVerticalBox::Slot()
+                                .AutoHeight()
+                                .Padding(0.0f, 16.0f, 0.0f, 0.0f)
+                                .HAlign(HAlign_Center)
+                                [
+                                    SAssignNew(DropDetailsTextBlock, STextBlock)
+                                    .Text(this, &SNiagaraPreviewPlayerWidget::GetDropDetailsText)
+                                    .Visibility(this, &SNiagaraPreviewPlayerWidget::GetDropDetailsVisibility)
+                                    .AutoWrapText(true)
+                                    .Justification(ETextJustify::Center)
+                                    .ColorAndOpacity(FLinearColor(0.74f, 0.86f, 0.92f, 1.0f))
+                                ]
+                            ]
+                        ]
                     ]
 
-                    + SOverlay::Slot()
-                    .HAlign(HAlign_Center)
-                    .VAlign(VAlign_Center)
+                    + SHorizontalBox::Slot()
+                    .AutoWidth()
+                    .Padding(10.0f, 0.0f, 0.0f, 0.0f)
                     [
-                        SNew(SBorder)
-                        .Visibility(this, &SNiagaraPreviewPlayerWidget::GetViewportOverlayVisibility)
-                        .Padding(18.0f)
-                        .BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
-                        .BorderBackgroundColor(FLinearColor(0.018f, 0.021f, 0.027f, 0.78f))
+                        SNew(SBox)
+                        .WidthOverride(315.0f)
                         [
-                            SNew(SVerticalBox)
-
-                            + SVerticalBox::Slot()
-                            .AutoHeight()
-                            .HAlign(HAlign_Center)
+                            SNew(SBorder)
+                            .Padding(10.0f)
+                            .BorderImage(FCoreStyle::Get().GetBrush(TEXT("ToolPanel.GroupBorder")))
                             [
-                                SAssignNew(DropTitleTextBlock, STextBlock)
-                                .Text(this, &SNiagaraPreviewPlayerWidget::GetDropSurfaceTitleText)
-                                .Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"), 14))
-                                .ColorAndOpacity(FLinearColor(0.82f, 0.88f, 0.92f, 1.0f))
-                            ]
+                                SNew(SScrollBox)
 
-                            + SVerticalBox::Slot()
-                            .AutoHeight()
-                            .Padding(0.0f, 8.0f, 0.0f, 0.0f)
-                            .HAlign(HAlign_Center)
-                            [
-                                SAssignNew(DropBodyTextBlock, STextBlock)
-                                .Text(this, &SNiagaraPreviewPlayerWidget::GetDropSurfaceBodyText)
-                                .ColorAndOpacity(FLinearColor(0.52f, 0.59f, 0.65f, 1.0f))
-                            ]
-
-                            + SVerticalBox::Slot()
-                            .AutoHeight()
-                            .Padding(0.0f, 16.0f, 0.0f, 0.0f)
-                            .HAlign(HAlign_Center)
-                            [
-                                SAssignNew(DropDetailsTextBlock, STextBlock)
-                                .Text(this, &SNiagaraPreviewPlayerWidget::GetDropDetailsText)
-                                .Visibility(this, &SNiagaraPreviewPlayerWidget::GetDropDetailsVisibility)
-                                .AutoWrapText(true)
-                                .Justification(ETextJustify::Center)
-                                .ColorAndOpacity(FLinearColor(0.74f, 0.86f, 0.92f, 1.0f))
+                                + SScrollBox::Slot()
+                                [
+                                    SAssignNew(AnalysisTextBlock, STextBlock)
+                                    .Text(this, &SNiagaraPreviewPlayerWidget::GetAnalysisText)
+                                    .AutoWrapText(true)
+                                    .ColorAndOpacity(FLinearColor(0.76f, 0.84f, 0.88f, 1.0f))
+                                ]
                             ]
                         ]
                     ]
@@ -700,6 +1173,11 @@ private:
             PreviewViewport->IsLooping() ? TEXT("On") : TEXT("Off")));
     }
 
+    FText GetAnalysisText() const
+    {
+        return FText::FromString(FNiagaraPreviewPlayerWindow::LastAnalysisSummary);
+    }
+
     FText GetPlayPauseButtonText() const
     {
         return PreviewViewport.IsValid() && PreviewViewport->IsPreviewPlaying()
@@ -762,6 +1240,10 @@ public:
         {
             PlaybackStatusTextBlock->Invalidate(EInvalidateWidgetReason::Paint);
         }
+        if (AnalysisTextBlock.IsValid())
+        {
+            AnalysisTextBlock->Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
+        }
         Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
     }
 
@@ -775,6 +1257,7 @@ public:
         }
 
         bHasRenderablePreview = PreviewViewport->SetPreviewSystem(NiagaraSystem);
+        FNiagaraPreviewPlayerWindow::UpdateAnalysisForSystem(NiagaraSystem);
         FNiagaraPreviewPlayerWindow::bLastPreviewRenderable = bHasRenderablePreview;
         FNiagaraPreviewPlayerWindow::SetPlaybackState(bHasRenderablePreview ? TEXT("playing") : TEXT("none"));
         RefreshDropState();
@@ -793,6 +1276,7 @@ public:
             }
             FNiagaraPreviewPlayerWindow::bLastPreviewRenderable = false;
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("none"));
+            FNiagaraPreviewPlayerWindow::UpdateAnalysisForSystem(nullptr);
             return;
         }
 
@@ -811,6 +1295,7 @@ public:
             }
             FNiagaraPreviewPlayerWindow::bLastPreviewRenderable = false;
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("none"));
+            FNiagaraPreviewPlayerWindow::UpdateAnalysisForSystem(nullptr);
             RefreshDropState();
             return;
         }
@@ -828,6 +1313,7 @@ private:
     TSharedPtr<STextBlock> DropDetailsTextBlock;
     TSharedPtr<STextBlock> StatusTextBlock;
     TSharedPtr<STextBlock> PlaybackStatusTextBlock;
+    TSharedPtr<STextBlock> AnalysisTextBlock;
     bool bHasRenderablePreview = false;
 };
 
@@ -924,6 +1410,7 @@ TSharedPtr<FJsonObject> FNiagaraPreviewPlayerWindow::GetStateJson()
     State->SetStringField(TEXT("last_class_name"), LastClassName);
     State->SetStringField(TEXT("playback_state"), LastPlaybackState);
     State->SetBoolField(TEXT("looping"), bLastLooping);
+    State->SetStringField(TEXT("analysis_summary"), LastAnalysisSummary.Left(4096));
     return State;
 }
 
@@ -982,6 +1469,7 @@ void FNiagaraPreviewPlayerWindow::RecordDroppedActor(AActor* Actor)
     LastClassName = Actor->GetClass() ? Actor->GetClass()->GetPathName() : FString();
     bLastPreviewRenderable = false;
     SetPlaybackState(TEXT("none"));
+    UpdateAnalysisForSystem(nullptr);
     ++DropCount;
     NotifyDropStateChanged();
 }
@@ -1020,6 +1508,11 @@ void FNiagaraPreviewPlayerWindow::SetLoopingState(bool bLooping)
     bLastLooping = bLooping;
 }
 
+void FNiagaraPreviewPlayerWindow::UpdateAnalysisForSystem(UNiagaraSystem* NiagaraSystem)
+{
+    LastAnalysisSummary = BuildNiagaraPreviewAnalysisSummary(NiagaraSystem);
+}
+
 void FNiagaraPreviewPlayerWindow::NotifyDropStateChanged()
 {
     if (const TSharedPtr<SNiagaraPreviewPlayerWidget> Widget = PlayerWidget.Pin())
@@ -1041,6 +1534,7 @@ void FNiagaraPreviewPlayerWindow::ResetDropState()
     LastObjectPath.Reset();
     LastClassName.Reset();
     LastPlaybackState = TEXT("none");
+    LastAnalysisSummary = TEXT("Analysis\nNo Niagara system loaded.");
     bLastLooping = true;
     bLastPreviewRenderable = false;
     DropCount = 0;
@@ -1053,6 +1547,7 @@ FString FNiagaraPreviewPlayerWindow::LastDisplayName;
 FString FNiagaraPreviewPlayerWindow::LastObjectPath;
 FString FNiagaraPreviewPlayerWindow::LastClassName;
 FString FNiagaraPreviewPlayerWindow::LastPlaybackState = TEXT("none");
+FString FNiagaraPreviewPlayerWindow::LastAnalysisSummary = TEXT("Analysis\nNo Niagara system loaded.");
 bool FNiagaraPreviewPlayerWindow::bLastLooping = true;
 bool FNiagaraPreviewPlayerWindow::bLastPreviewRenderable = false;
 int32 FNiagaraPreviewPlayerWindow::DropCount = 0;

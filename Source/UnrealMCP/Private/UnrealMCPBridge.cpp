@@ -57,6 +57,7 @@
 #include "Commands/UnrealMCPBlueprintCommands.h"
 #include "Commands/UnrealMCPBlueprintNodeCommands.h"
 #include "Commands/UnrealMCPMaterialCommands.h"
+#include "Commands/UnrealMCPNiagaraCommands.h"
 #include "Commands/UnrealMCPPCGCommands.h"
 #include "Commands/UnrealMCPProjectCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
@@ -72,6 +73,7 @@ UUnrealMCPBridge::UUnrealMCPBridge()
     BlueprintCommands = MakeShared<FUnrealMCPBlueprintCommands>();
     BlueprintNodeCommands = MakeShared<FUnrealMCPBlueprintNodeCommands>();
     MaterialCommands = MakeShared<FUnrealMCPMaterialCommands>();
+    NiagaraCommands = MakeShared<FUnrealMCPNiagaraCommands>();
     PCGCommands = MakeShared<FUnrealMCPPCGCommands>();
     ProjectCommands = MakeShared<FUnrealMCPProjectCommands>();
     UMGCommands = MakeShared<FUnrealMCPUMGCommands>();
@@ -83,6 +85,7 @@ UUnrealMCPBridge::~UUnrealMCPBridge()
     BlueprintCommands.Reset();
     BlueprintNodeCommands.Reset();
     MaterialCommands.Reset();
+    NiagaraCommands.Reset();
     PCGCommands.Reset();
     ProjectCommands.Reset();
     UMGCommands.Reset();
@@ -431,6 +434,17 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("compile_and_save_material"))
             {
                 ResultJson = MaterialCommands->HandleCommand(CommandType, Params);
+            }
+            // Niagara Commands
+            else if (CommandType == TEXT("inspect_niagara_renderers") ||
+                     CommandType == TEXT("set_niagara_renderer_material") ||
+                     CommandType == TEXT("inspect_niagara_user_parameters") ||
+                     CommandType == TEXT("set_niagara_user_parameter") ||
+                     CommandType == TEXT("inspect_niagara_stack") ||
+                     CommandType == TEXT("inspect_niagara_module_inputs") ||
+                     CommandType == TEXT("set_niagara_module_input_value"))
+            {
+                ResultJson = NiagaraCommands->HandleCommand(CommandType, Params);
             }
             // PCG Graph Commands
             else if (CommandType == TEXT("resolve_pcg_graph") ||
