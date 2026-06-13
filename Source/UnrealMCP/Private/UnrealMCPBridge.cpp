@@ -419,6 +419,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("set_blueprint_pin_default") ||
                      CommandType == TEXT("add_blueprint_function_parameter") ||
                      CommandType == TEXT("add_blueprint_local_variable") ||
+                     CommandType == TEXT("set_blueprint_variable_metadata") ||
                      CommandType == TEXT("add_blueprint_variable"))
             {
                 ResultJson = BlueprintNodeCommands->HandleCommand(CommandType, Params);
@@ -467,7 +468,9 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("connect_pcg_nodes") ||
                      CommandType == TEXT("set_pcg_node_setting") ||
                      CommandType == TEXT("compile_or_notify_pcg_graph") ||
-                     CommandType == TEXT("save_pcg_graph"))
+                     CommandType == TEXT("save_pcg_graph") ||
+                     CommandType == TEXT("set_spline_component_points") ||
+                     CommandType == TEXT("refresh_pcg_components"))
             {
                 ResultJson = PCGCommands->HandleCommand(CommandType, Params);
             }

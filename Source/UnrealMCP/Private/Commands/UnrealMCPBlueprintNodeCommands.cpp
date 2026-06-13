@@ -2252,6 +2252,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     {
         return HandleAddBlueprintVariable(Params);
     }
+    else if (CommandType == TEXT("set_blueprint_variable_metadata"))
+    {
+        return HandleSetBlueprintVariableMetadata(Params);
+    }
     else if (CommandType == TEXT("add_blueprint_event_dispatcher"))
     {
         return HandleAddBlueprintEventDispatcher(Params);
@@ -3287,6 +3291,110 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintVaria
     ResultObj->SetStringField(TEXT("variable_type"), VariableType);
     ResultObj->SetStringField(TEXT("default_value"), DefaultValue);
     ResultObj->SetObjectField(TEXT("pin_type"), PinTypeToJson(PinType));
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintVariableMetadata(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    FString VariableName;
+    if (!Params->TryGetStringField(TEXT("variable_name"), VariableName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'variable_name' parameter"));
+    }
+
+    const TSharedPtr<FJsonObject>* MetadataObject = nullptr;
+    if (!Params->TryGetObjectField(TEXT("metadata"), MetadataObject) || !MetadataObject || !MetadataObject->IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing or invalid 'metadata' object"));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    FBPVariableDescription* TargetVariable = nullptr;
+    const FName TargetVariableName(*VariableName);
+    for (FBPVariableDescription& Variable : Blueprint->NewVariables)
+    {
+        if (Variable.VarName == TargetVariableName)
+        {
+            TargetVariable = &Variable;
+            break;
+        }
+    }
+    if (!TargetVariable)
+    {
+        for (FBPVariableDescription& Variable : Blueprint->GeneratedVariables)
+        {
+            if (Variable.VarName == TargetVariableName)
+            {
+                TargetVariable = &Variable;
+                break;
+            }
+        }
+    }
+    if (!TargetVariable)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint variable not found: %s"), *VariableName));
+    }
+
+    TSharedPtr<FJsonObject> AppliedMetadata = MakeShared<FJsonObject>();
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& MetadataPair : (*MetadataObject)->Values)
+    {
+        FString MetadataValue;
+        if (MetadataPair.Value->Type == EJson::String)
+        {
+            MetadataValue = MetadataPair.Value->AsString();
+        }
+        else if (MetadataPair.Value->Type == EJson::Boolean)
+        {
+            MetadataValue = MetadataPair.Value->AsBool() ? TEXT("true") : TEXT("false");
+        }
+        else if (MetadataPair.Value->Type == EJson::Number)
+        {
+            MetadataValue = FString::SanitizeFloat(MetadataPair.Value->AsNumber());
+        }
+        else
+        {
+            continue;
+        }
+
+        const FName MetadataKey(*MetadataPair.Key);
+        TargetVariable->SetMetaData(MetadataKey, MetadataValue);
+        FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, MetadataKey, MetadataValue);
+        AppliedMetadata->SetStringField(MetadataPair.Key, MetadataValue);
+    }
+
+    if (AppliedMetadata->Values.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No supported metadata values were provided"));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+    TSharedPtr<FJsonObject> VerifiedMetadata = MakeShared<FJsonObject>();
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& MetadataPair : AppliedMetadata->Values)
+    {
+        FString VerifiedValue;
+        if (FBlueprintEditorUtils::GetBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, FName(*MetadataPair.Key), VerifiedValue))
+        {
+            VerifiedMetadata->SetStringField(MetadataPair.Key, VerifiedValue);
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+    ResultObj->SetStringField(TEXT("variable_name"), VariableName);
+    ResultObj->SetObjectField(TEXT("metadata"), AppliedMetadata);
+    ResultObj->SetObjectField(TEXT("verified_metadata"), VerifiedMetadata);
     return ResultObj;
 }
 
