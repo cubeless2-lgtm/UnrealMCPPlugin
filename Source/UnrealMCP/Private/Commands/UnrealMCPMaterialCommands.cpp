@@ -15,6 +15,7 @@
 #include "Materials/MaterialExpressionConstant2Vector.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionConstant4Vector.h"
+#include "Materials/MaterialExpressionComposite.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionExternalCodeBase.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
@@ -2555,6 +2556,98 @@ struct FMaterialFunctionExpansionStats
     TArray<FString> CreatedFunctionCallNodeIds;
 };
 
+struct FExpressionInputRestore
+{
+    FExpressionInput* TargetInput = nullptr;
+    FExpressionInput OriginalInput;
+};
+
+struct FMaterialFunctionExpansionBatchState
+{
+    TArray<UMaterialExpression*> CreatedExpressions;
+    TArray<FExpressionInputRestore> InputRestores;
+    TArray<UMaterialExpressionMaterialFunctionCall*> FunctionCallsToDelete;
+};
+
+void RecordInputRestore(TArray<FExpressionInputRestore>& InputRestores, FExpressionInput& Input)
+{
+    for (const FExpressionInputRestore& Restore : InputRestores)
+    {
+        if (Restore.TargetInput == &Input)
+        {
+            return;
+        }
+    }
+
+    FExpressionInputRestore Restore;
+    Restore.TargetInput = &Input;
+    Restore.OriginalInput = Input;
+    InputRestores.Add(Restore);
+}
+
+void RestoreExpressionInputs(TArray<FExpressionInputRestore>& InputRestores)
+{
+    for (int32 Index = InputRestores.Num() - 1; Index >= 0; --Index)
+    {
+        if (InputRestores[Index].TargetInput)
+        {
+            *InputRestores[Index].TargetInput = InputRestores[Index].OriginalInput;
+        }
+    }
+
+    InputRestores.Reset();
+}
+
+void ApplyInputReplacementPreservingTargetMetadata(FExpressionInput& TargetInput, const FExpressionInput& ReplacementInput)
+{
+    const FName OriginalInputName = TargetInput.InputName;
+    const bool bTargetHadMask = TargetInput.Mask != 0;
+    const int32 OriginalMask = TargetInput.Mask;
+    const int32 OriginalMaskR = TargetInput.MaskR;
+    const int32 OriginalMaskG = TargetInput.MaskG;
+    const int32 OriginalMaskB = TargetInput.MaskB;
+    const int32 OriginalMaskA = TargetInput.MaskA;
+
+    TargetInput = ReplacementInput;
+    TargetInput.InputName = OriginalInputName;
+
+    if (bTargetHadMask)
+    {
+        TargetInput.Mask = OriginalMask;
+        TargetInput.MaskR = OriginalMaskR;
+        TargetInput.MaskG = OriginalMaskG;
+        TargetInput.MaskB = OriginalMaskB;
+        TargetInput.MaskA = OriginalMaskA;
+    }
+}
+
+void CleanupCreatedMaterialExpressions(UMaterial* Material, TArray<UMaterialExpression*>& CreatedExpressions);
+
+void RollBackMaterialFunctionExpansionBatch(UMaterial* Material, FMaterialFunctionExpansionBatchState& BatchState)
+{
+    RestoreExpressionInputs(BatchState.InputRestores);
+    CleanupCreatedMaterialExpressions(Material, BatchState.CreatedExpressions);
+    BatchState.FunctionCallsToDelete.Reset();
+}
+
+void CommitMaterialFunctionExpansionBatch(UMaterial* Material, FMaterialFunctionExpansionBatchState& BatchState)
+{
+    if (Material)
+    {
+        for (UMaterialExpressionMaterialFunctionCall* FunctionCall : BatchState.FunctionCallsToDelete)
+        {
+            if (FunctionCall && FunctionCall->GetOuter() == Material)
+            {
+                UMaterialEditingLibrary::DeleteMaterialExpression(Material, FunctionCall);
+            }
+        }
+    }
+
+    BatchState.CreatedExpressions.Reset();
+    BatchState.InputRestores.Reset();
+    BatchState.FunctionCallsToDelete.Reset();
+}
+
 const FFunctionExpressionInput* FindFunctionCallInputById(
     const UMaterialExpressionMaterialFunctionCall* FunctionCall,
     const FGuid& InputId)
@@ -2706,6 +2799,7 @@ bool ResolveCopiedExpressionInput(
     const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
     const FVector2D& PastePositionOffset,
     TArray<UMaterialExpression*>& CreatedExpressions,
+    TArray<FExpressionInputRestore>& InputRestores,
     FExpressionInput& Input,
     FMaterialFunctionExpansionStats& Stats,
     TArray<FString>& Errors);
@@ -2717,6 +2811,7 @@ bool BuildFunctionInputReplacement(
     const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
     const FVector2D& PastePositionOffset,
     TArray<UMaterialExpression*>& CreatedExpressions,
+    TArray<FExpressionInputRestore>& InputRestores,
     FExpressionInput& OutInput,
     FMaterialFunctionExpansionStats& Stats,
     TArray<FString>& Errors)
@@ -2747,7 +2842,7 @@ bool BuildFunctionInputReplacement(
     if (FunctionInput->Preview.Expression)
     {
         OutInput = FunctionInput->Preview;
-        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, OutInput, Stats, Errors))
+        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, InputRestores, OutInput, Stats, Errors))
         {
             return true;
         }
@@ -2775,6 +2870,7 @@ bool ResolveCopiedExpressionInput(
     const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
     const FVector2D& PastePositionOffset,
     TArray<UMaterialExpression*>& CreatedExpressions,
+    TArray<FExpressionInputRestore>& InputRestores,
     FExpressionInput& Input,
     FMaterialFunctionExpansionStats& Stats,
     TArray<FString>& Errors)
@@ -2787,6 +2883,7 @@ bool ResolveCopiedExpressionInput(
 
     if (UMaterialExpression* const* CopiedExpression = CopiedExpressions.Find(SourceExpression))
     {
+        RecordInputRestore(InputRestores, Input);
         Input.Expression = *CopiedExpression;
         return true;
     }
@@ -2794,12 +2891,13 @@ bool ResolveCopiedExpressionInput(
     if (UMaterialExpressionFunctionInput* FunctionInput = Cast<UMaterialExpressionFunctionInput>(SourceExpression))
     {
         FExpressionInput ReplacementInput;
-        if (!BuildFunctionInputReplacement(Material, FunctionCall, FunctionInput, CopiedExpressions, PastePositionOffset, CreatedExpressions, ReplacementInput, Stats, Errors))
+        if (!BuildFunctionInputReplacement(Material, FunctionCall, FunctionInput, CopiedExpressions, PastePositionOffset, CreatedExpressions, InputRestores, ReplacementInput, Stats, Errors))
         {
             return false;
         }
 
-        Input = ReplacementInput;
+        RecordInputRestore(InputRestores, Input);
+        ApplyInputReplacementPreservingTargetMetadata(Input, ReplacementInput);
         ++Stats.RewiredFunctionInputCount;
         return true;
     }
@@ -2858,7 +2956,8 @@ void FindFunctionCallReferencedOutputIndices(
 int32 RewireFunctionCallConsumers(
     UMaterial* Material,
     UMaterialExpressionMaterialFunctionCall* FunctionCall,
-    const TArray<FExpandedOutputReplacement>& OutputReplacements)
+    const TArray<FExpandedOutputReplacement>& OutputReplacements,
+    TArray<FExpressionInputRestore>& InputRestores)
 {
     if (!Material || !FunctionCall)
     {
@@ -2866,7 +2965,7 @@ int32 RewireFunctionCallConsumers(
     }
 
     int32 RewiredCount = 0;
-    auto VisitInput = [FunctionCall, &OutputReplacements, &RewiredCount](FExpressionInput* Input)
+    auto VisitInput = [FunctionCall, &OutputReplacements, &InputRestores, &RewiredCount](FExpressionInput* Input)
     {
         if (!Input || Input->Expression != FunctionCall)
         {
@@ -2880,7 +2979,8 @@ int32 RewireFunctionCallConsumers(
         }
         if (OutputReplacements.IsValidIndex(OutputIndex) && OutputReplacements[OutputIndex].bValid)
         {
-            *Input = OutputReplacements[OutputIndex].Input;
+            RecordInputRestore(InputRestores, *Input);
+            ApplyInputReplacementPreservingTargetMetadata(*Input, OutputReplacements[OutputIndex].Input);
             ++RewiredCount;
         }
     };
@@ -2929,6 +3029,7 @@ bool ExpandFunctionCallIntoMaterial(
     UMaterial* Material,
     UMaterialExpressionMaterialFunctionCall* FunctionCall,
     FMaterialFunctionExpansionStats& Stats,
+    FMaterialFunctionExpansionBatchState& BatchState,
     TArray<FString>& Errors)
 {
     if (!Material || !FunctionCall || !FunctionCall->MaterialFunction)
@@ -2968,6 +3069,7 @@ bool ExpandFunctionCallIntoMaterial(
     const FVector2D PastePositionOffset = PastePosition - AveragePosition;
     TMap<UMaterialExpression*, UMaterialExpression*> CopiedExpressions;
     TArray<UMaterialExpression*> CreatedExpressions;
+    TArray<FExpressionInputRestore> LocalInputRestores;
     const int32 InitialErrorCount = Errors.Num();
 
     for (UMaterialExpression* SourceExpression : SourceExpressions)
@@ -2976,14 +3078,24 @@ bool ExpandFunctionCallIntoMaterial(
         if (!NewExpression)
         {
             Errors.Add(FString::Printf(TEXT("Failed to duplicate function expression '%s'."), *SourceExpression->GetPathName()));
+            RestoreExpressionInputs(LocalInputRestores);
             CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
             return false;
         }
 
+        CreatedExpressions.Add(NewExpression);
+        if (Cast<UMaterialExpressionComposite>(NewExpression))
+        {
+            Errors.Add(FString::Printf(TEXT("Composite expression '%s' is not supported by material function expansion."), *SourceExpression->GetPathName()));
+            RestoreExpressionInputs(LocalInputRestores);
+            CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
+            return false;
+        }
+
+        NewExpression->UpdateParameterGuid(true, true);
         NewExpression->MaterialExpressionEditorX = FMath::RoundToInt(SourceExpression->MaterialExpressionEditorX + PastePositionOffset.X);
         NewExpression->MaterialExpressionEditorY = FMath::RoundToInt(SourceExpression->MaterialExpressionEditorY + PastePositionOffset.Y);
         CopiedExpressions.Add(SourceExpression, NewExpression);
-        CreatedExpressions.Add(NewExpression);
         ++Stats.DuplicatedNodeCount;
         if (Cast<UMaterialExpressionMaterialFunctionCall>(NewExpression))
         {
@@ -3009,8 +3121,9 @@ bool ExpandFunctionCallIntoMaterial(
 
         for (FExpressionInputIterator It(NewExpression); It; ++It)
         {
-            if (!ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, *It.Input, Stats, Errors))
+            if (!ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, LocalInputRestores, *It.Input, Stats, Errors))
             {
+                RestoreExpressionInputs(LocalInputRestores);
                 CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
                 return false;
             }
@@ -3049,7 +3162,7 @@ bool ExpandFunctionCallIntoMaterial(
             continue;
         }
 
-        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, OutputInput, Stats, Errors))
+        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, LocalInputRestores, OutputInput, Stats, Errors))
         {
             OutputReplacements[OutputIndex].bValid = true;
             OutputReplacements[OutputIndex].Input = OutputInput;
@@ -3058,6 +3171,7 @@ bool ExpandFunctionCallIntoMaterial(
 
     if (Errors.Num() > InitialErrorCount)
     {
+        RestoreExpressionInputs(LocalInputRestores);
         CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
         return false;
     }
@@ -3067,14 +3181,16 @@ bool ExpandFunctionCallIntoMaterial(
         if (!OutputReplacements.IsValidIndex(ReferencedOutputIndex) || !OutputReplacements[ReferencedOutputIndex].bValid)
         {
             Errors.Add(FString::Printf(TEXT("Function call output index %d is referenced but has no valid expanded replacement."), ReferencedOutputIndex));
+            RestoreExpressionInputs(LocalInputRestores);
             CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
             return false;
         }
     }
 
-    Stats.RewiredConsumerCount += RewireFunctionCallConsumers(Material, FunctionCall, OutputReplacements);
-    UMaterialEditingLibrary::DeleteMaterialExpression(Material, FunctionCall);
-    CreatedExpressions.Reset();
+    Stats.RewiredConsumerCount += RewireFunctionCallConsumers(Material, FunctionCall, OutputReplacements, LocalInputRestores);
+    BatchState.CreatedExpressions.Append(CreatedExpressions);
+    BatchState.InputRestores.Append(LocalInputRestores);
+    BatchState.FunctionCallsToDelete.Add(FunctionCall);
     return true;
 }
 }
@@ -4031,6 +4147,8 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
     TArray<TSharedPtr<FJsonValue>> Expanded;
     TArray<TSharedPtr<FJsonValue>> Skipped;
     TArray<FString> Errors;
+    FMaterialFunctionExpansionBatchState BatchState;
+    TSet<FString> CompletedExpansionNodeIds;
     TSet<FString> FailedExpansionNodeIds;
     int32 ExpandedCount = 0;
     int32 PassesRun = 0;
@@ -4065,7 +4183,7 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
         TArray<FString> NextTargetNodeIds;
         for (const FString& CurrentNodeId : NodeIds)
         {
-            if (FailedExpansionNodeIds.Contains(CurrentNodeId))
+            if (CompletedExpansionNodeIds.Contains(CurrentNodeId) || FailedExpansionNodeIds.Contains(CurrentNodeId))
             {
                 continue;
             }
@@ -4112,7 +4230,7 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
 
             const int32 BeforeNodeCount = Target.Material->GetExpressions().Num();
             FMaterialFunctionExpansionStats ExpansionStats;
-            if (!ExpandFunctionCallIntoMaterial(Target.Material, FunctionCall, ExpansionStats, Errors))
+            if (!ExpandFunctionCallIntoMaterial(Target.Material, FunctionCall, ExpansionStats, BatchState, Errors))
             {
                 FailedExpansionNodeIds.Add(CurrentNodeId);
                 continue;
@@ -4139,6 +4257,7 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
 
             ++ExpandedCount;
             ++ExpandedThisPass;
+            CompletedExpansionNodeIds.Add(CurrentNodeId);
         }
 
         if (!bRecursive || ExpandedThisPass == 0)
@@ -4164,18 +4283,38 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
             else
             {
                 TArray<TSharedPtr<FJsonValue>> RemainingSkipped;
-                bHitMaxPasses = GetExpandableFunctionCallNodeIds(Target.Material, bExcludeEngineFunctions, RemainingSkipped).Num() > 0;
+                TArray<FString> RemainingNodeIds = GetExpandableFunctionCallNodeIds(Target.Material, bExcludeEngineFunctions, RemainingSkipped);
+                RemainingNodeIds.RemoveAll([&CompletedExpansionNodeIds, &FailedExpansionNodeIds](const FString& RemainingNodeId)
+                {
+                    return CompletedExpansionNodeIds.Contains(RemainingNodeId) || FailedExpansionNodeIds.Contains(RemainingNodeId);
+                });
+                bHitMaxPasses = RemainingNodeIds.Num() > 0;
             }
         }
     }
 
     bool bSaved = false;
+    bool bRolledBack = false;
+    const bool bPartialExpansionWithErrors = ExpandedCount > 0 && Errors.Num() > 0;
     if (ExpandedCount > 0)
     {
-        Target.MarkChanged();
-        if (bSave && (Errors.Num() == 0 || bAllowPartialSave))
+        if (bPartialExpansionWithErrors && !bAllowPartialSave)
         {
-            bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+            RollBackMaterialFunctionExpansionBatch(Target.Material, BatchState);
+            bRolledBack = true;
+            if (Package && !bWasDirty)
+            {
+                Package->SetDirtyFlag(false);
+            }
+        }
+        else
+        {
+            CommitMaterialFunctionExpansionBatch(Target.Material, BatchState);
+            Target.MarkChanged();
+            if (bSave && (Errors.Num() == 0 || bAllowPartialSave))
+            {
+                bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+            }
         }
     }
     else if (Package && !bWasDirty && Package->IsDirty())
@@ -4185,13 +4324,14 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunction
 
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
-    ResultObj->SetBoolField(TEXT("expanded"), ExpandedCount > 0);
+    ResultObj->SetBoolField(TEXT("expanded"), ExpandedCount > 0 && !bRolledBack);
     ResultObj->SetNumberField(TEXT("expanded_count"), ExpandedCount);
+    ResultObj->SetBoolField(TEXT("rolled_back"), bRolledBack);
     ResultObj->SetNumberField(TEXT("passes_run"), PassesRun);
     ResultObj->SetBoolField(TEXT("hit_max_passes"), bHitMaxPasses);
     ResultObj->SetBoolField(TEXT("exclude_engine_functions"), bExcludeEngineFunctions);
     ResultObj->SetBoolField(TEXT("allow_partial_save"), bAllowPartialSave);
-    ResultObj->SetBoolField(TEXT("partial_expansion_with_errors"), ExpandedCount > 0 && Errors.Num() > 0);
+    ResultObj->SetBoolField(TEXT("partial_expansion_with_errors"), bPartialExpansionWithErrors);
     ResultObj->SetNumberField(TEXT("initial_node_count"), InitialNodeCount);
     ResultObj->SetNumberField(TEXT("final_node_count"), Target.Material->GetExpressions().Num());
     ResultObj->SetNumberField(TEXT("initial_function_call_count"), InitialFunctionCallCount);
