@@ -25,4 +25,6 @@ private:
     TSharedPtr<FJsonObject> HandleDeleteMaterialNode(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleLayoutMaterialNodes(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCompileAndSaveMaterial(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleExpandMaterialFunctionCalls(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGetMaterialParameterCollectionValues(const TSharedPtr<FJsonObject>& Params);
 };

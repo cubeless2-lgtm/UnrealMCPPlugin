@@ -434,7 +434,9 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("connect_material_property") ||
                      CommandType == TEXT("delete_material_node") ||
                      CommandType == TEXT("layout_material_nodes") ||
-                     CommandType == TEXT("compile_and_save_material"))
+                     CommandType == TEXT("compile_and_save_material") ||
+                     CommandType == TEXT("expand_material_function_calls") ||
+                     CommandType == TEXT("get_material_parameter_collection_values"))
             {
                 ResultJson = MaterialCommands->HandleCommand(CommandType, Params);
             }

@@ -4,15 +4,22 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonValue.h"
 #include "Engine/Texture.h"
+#include "Engine/World.h"
+#include "Editor.h"
 #include "EditorAssetLibrary.h"
 #include "MaterialEditingLibrary.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpression.h"
+#include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant2Vector.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionConstant4Vector.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionExternalCodeBase.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
+#include "Materials/MaterialExpressionMakeMaterialAttributes.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionParameter.h"
@@ -25,6 +32,8 @@
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Materials/MaterialParameterCollectionInstance.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
 #include "RHIShaderPlatform.h"
@@ -2385,6 +2394,689 @@ TSharedPtr<FJsonObject> GraphSummaryToJson(const FMaterialGraphTarget& Target, b
     }
     return Object;
 }
+
+bool IsEngineOrScriptAssetPath(const FString& AssetPath)
+{
+    return AssetPath.StartsWith(TEXT("/Engine/")) ||
+        AssetPath.StartsWith(TEXT("/Script/"));
+}
+
+int32 CountMaterialFunctionCalls(UMaterial* Material)
+{
+    if (!Material)
+    {
+        return 0;
+    }
+
+    int32 Count = 0;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Material->GetExpressions())
+    {
+        if (Cast<UMaterialExpressionMaterialFunctionCall>(ExpressionPtr.Get()))
+        {
+            ++Count;
+        }
+    }
+    return Count;
+}
+
+TArray<FString> GetExpandableFunctionCallNodeIds(
+    UMaterial* Material,
+    bool bExcludeEngineFunctions,
+    TArray<TSharedPtr<FJsonValue>>& OutSkipped)
+{
+    TArray<FString> NodeIds;
+    if (!Material)
+    {
+        return NodeIds;
+    }
+
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Material->GetExpressions())
+    {
+        UMaterialExpressionMaterialFunctionCall* FunctionCall = Cast<UMaterialExpressionMaterialFunctionCall>(ExpressionPtr.Get());
+        if (!FunctionCall)
+        {
+            continue;
+        }
+
+        UMaterialFunctionInterface* MaterialFunction = FunctionCall->MaterialFunction;
+        const FString FunctionPath = MaterialFunction ? MaterialFunction->GetPathName() : FString();
+        if (!MaterialFunction)
+        {
+            TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+            AddExpressionReferenceFields(SkippedObject, FunctionCall, TEXT(""));
+            SkippedObject->SetStringField(TEXT("reason"), TEXT("missing_material_function"));
+            OutSkipped.Add(MakeShared<FJsonValueObject>(SkippedObject));
+            continue;
+        }
+
+        if (bExcludeEngineFunctions && IsEngineOrScriptAssetPath(FunctionPath))
+        {
+            TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+            AddExpressionReferenceFields(SkippedObject, FunctionCall, TEXT(""));
+            SkippedObject->SetStringField(TEXT("function"), FunctionPath);
+            SkippedObject->SetStringField(TEXT("reason"), TEXT("engine_or_script_function"));
+            OutSkipped.Add(MakeShared<FJsonValueObject>(SkippedObject));
+            continue;
+        }
+
+        NodeIds.Add(GetExpressionId(FunctionCall));
+    }
+
+    return NodeIds;
+}
+
+UWorld* GetEditorOrPIEWorld()
+{
+    if (!GEditor)
+    {
+        return nullptr;
+    }
+
+    for (const FWorldContext& WorldContext : GEditor->GetWorldContexts())
+    {
+        if (WorldContext.World() && WorldContext.WorldType == EWorldType::PIE)
+        {
+            return WorldContext.World();
+        }
+    }
+
+    return GEditor->GetEditorWorldContext().World();
+}
+
+FString GetWorldTypeName(const UWorld* World)
+{
+    if (!World)
+    {
+        return TEXT("");
+    }
+
+    switch (World->WorldType)
+    {
+    case EWorldType::Editor:
+        return TEXT("Editor");
+    case EWorldType::PIE:
+        return TEXT("PIE");
+    case EWorldType::Game:
+        return TEXT("Game");
+    case EWorldType::GamePreview:
+        return TEXT("GamePreview");
+    case EWorldType::EditorPreview:
+        return TEXT("EditorPreview");
+    case EWorldType::Inactive:
+        return TEXT("Inactive");
+    default:
+        return TEXT("Unknown");
+    }
+}
+
+bool ShouldIncludeNamedParameter(const TSet<FName>& ParameterFilter, const FName& ParameterName)
+{
+    return ParameterFilter.Num() == 0 || ParameterFilter.Contains(ParameterName);
+}
+
+TSet<FName> GetOptionalParameterNameFilter(const TSharedPtr<FJsonObject>& Params)
+{
+    TSet<FName> ParameterFilter;
+    const TArray<TSharedPtr<FJsonValue>>* ParameterNames = nullptr;
+    if (!Params->TryGetArrayField(TEXT("parameter_names"), ParameterNames))
+    {
+        return ParameterFilter;
+    }
+
+    for (const TSharedPtr<FJsonValue>& Value : *ParameterNames)
+    {
+        if (!Value.IsValid())
+        {
+            continue;
+        }
+
+        const FString Name = Value->AsString().TrimStartAndEnd();
+        if (!Name.IsEmpty())
+        {
+            ParameterFilter.Add(FName(*Name));
+        }
+    }
+
+    return ParameterFilter;
+}
+
+struct FExpandedOutputReplacement
+{
+    bool bValid = false;
+    FExpressionInput Input;
+};
+
+struct FMaterialFunctionExpansionStats
+{
+    int32 DuplicatedNodeCount = 0;
+    int32 PreviewDefaultNodeCount = 0;
+    int32 RewiredFunctionInputCount = 0;
+    int32 RewiredConsumerCount = 0;
+    TArray<FString> CreatedFunctionCallNodeIds;
+};
+
+const FFunctionExpressionInput* FindFunctionCallInputById(
+    const UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    const FGuid& InputId)
+{
+    if (!FunctionCall)
+    {
+        return nullptr;
+    }
+
+    for (const FFunctionExpressionInput& FunctionInput : FunctionCall->FunctionInputs)
+    {
+        if (FunctionInput.ExpressionInputId == InputId)
+        {
+            return &FunctionInput;
+        }
+    }
+
+    return nullptr;
+}
+
+void CollectFunctionIoExpressions(
+    UMaterialFunctionInterface* MaterialFunction,
+    TMap<FGuid, UMaterialExpressionFunctionInput*>& OutInputsById,
+    TMap<FGuid, UMaterialExpressionFunctionOutput*>& OutOutputsById)
+{
+    if (!MaterialFunction)
+    {
+        return;
+    }
+
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : MaterialFunction->GetExpressions())
+    {
+        UMaterialExpression* Expression = ExpressionPtr.Get();
+        if (!Expression)
+        {
+            continue;
+        }
+
+        if (UMaterialExpressionFunctionInput* FunctionInput = Cast<UMaterialExpressionFunctionInput>(Expression))
+        {
+            OutInputsById.Add(FunctionInput->Id, FunctionInput);
+        }
+        else if (UMaterialExpressionFunctionOutput* FunctionOutput = Cast<UMaterialExpressionFunctionOutput>(Expression))
+        {
+            OutOutputsById.Add(FunctionOutput->Id, FunctionOutput);
+        }
+    }
+}
+
+UMaterialExpression* CreatePreviewDefaultExpression(
+    UMaterial* Material,
+    const UMaterialExpressionFunctionInput* FunctionInput,
+    const FVector2D& PastePositionOffset,
+    TArray<UMaterialExpression*>& CreatedExpressions,
+    FMaterialFunctionExpansionStats& Stats)
+{
+    if (!Material || !FunctionInput)
+    {
+        return nullptr;
+    }
+
+    const int32 NodeX = FMath::RoundToInt(FunctionInput->MaterialExpressionEditorX + PastePositionOffset.X);
+    const int32 NodeY = FMath::RoundToInt(FunctionInput->MaterialExpressionEditorY + PastePositionOffset.Y);
+
+    switch (FunctionInput->InputType.GetValue())
+    {
+    case FunctionInput_Scalar:
+    {
+        UMaterialExpressionConstant* Constant = Cast<UMaterialExpressionConstant>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant::StaticClass(), NodeX, NodeY));
+        if (Constant)
+        {
+            Constant->R = FunctionInput->PreviewValue.X;
+            CreatedExpressions.Add(Constant);
+            ++Stats.PreviewDefaultNodeCount;
+        }
+        return Constant;
+    }
+    case FunctionInput_Vector2:
+    {
+        UMaterialExpressionConstant2Vector* Constant = Cast<UMaterialExpressionConstant2Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant2Vector::StaticClass(), NodeX, NodeY));
+        if (Constant)
+        {
+            Constant->R = FunctionInput->PreviewValue.X;
+            Constant->G = FunctionInput->PreviewValue.Y;
+            CreatedExpressions.Add(Constant);
+            ++Stats.PreviewDefaultNodeCount;
+        }
+        return Constant;
+    }
+    case FunctionInput_Vector3:
+    {
+        UMaterialExpressionConstant3Vector* Constant = Cast<UMaterialExpressionConstant3Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant3Vector::StaticClass(), NodeX, NodeY));
+        if (Constant)
+        {
+            Constant->Constant = FLinearColor(FunctionInput->PreviewValue);
+            CreatedExpressions.Add(Constant);
+            ++Stats.PreviewDefaultNodeCount;
+        }
+        return Constant;
+    }
+    case FunctionInput_Vector4:
+    {
+        UMaterialExpressionConstant4Vector* Constant = Cast<UMaterialExpressionConstant4Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant4Vector::StaticClass(), NodeX, NodeY));
+        if (Constant)
+        {
+            Constant->Constant = FLinearColor(FunctionInput->PreviewValue);
+            CreatedExpressions.Add(Constant);
+            ++Stats.PreviewDefaultNodeCount;
+        }
+        return Constant;
+    }
+    case FunctionInput_MaterialAttributes:
+    {
+        UMaterialExpressionMakeMaterialAttributes* MakeAttributes = Cast<UMaterialExpressionMakeMaterialAttributes>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionMakeMaterialAttributes::StaticClass(), NodeX, NodeY));
+        if (!MakeAttributes)
+        {
+            return nullptr;
+        }
+
+        CreatedExpressions.Add(MakeAttributes);
+        ++Stats.PreviewDefaultNodeCount;
+
+        UMaterialExpressionConstant3Vector* EmissivePreview = Cast<UMaterialExpressionConstant3Vector>(
+            UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionConstant3Vector::StaticClass(), NodeX - 240, NodeY));
+        if (EmissivePreview)
+        {
+            EmissivePreview->Constant = FLinearColor(FunctionInput->PreviewValue);
+            MakeAttributes->EmissiveColor.Expression = EmissivePreview;
+            MakeAttributes->EmissiveColor.OutputIndex = 0;
+            CreatedExpressions.Add(EmissivePreview);
+            ++Stats.PreviewDefaultNodeCount;
+        }
+
+        return MakeAttributes;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+bool ResolveCopiedExpressionInput(
+    UMaterial* Material,
+    const UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
+    const FVector2D& PastePositionOffset,
+    TArray<UMaterialExpression*>& CreatedExpressions,
+    FExpressionInput& Input,
+    FMaterialFunctionExpansionStats& Stats,
+    TArray<FString>& Errors);
+
+bool BuildFunctionInputReplacement(
+    UMaterial* Material,
+    const UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    const UMaterialExpressionFunctionInput* FunctionInput,
+    const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
+    const FVector2D& PastePositionOffset,
+    TArray<UMaterialExpression*>& CreatedExpressions,
+    FExpressionInput& OutInput,
+    FMaterialFunctionExpansionStats& Stats,
+    TArray<FString>& Errors)
+{
+    if (!FunctionInput)
+    {
+        Errors.Add(TEXT("Function input expression was missing while expanding material function call."));
+        return false;
+    }
+
+    if (const FFunctionExpressionInput* FunctionCallInput = FindFunctionCallInputById(FunctionCall, FunctionInput->Id))
+    {
+        if (FunctionCallInput->Input.Expression)
+        {
+            OutInput = FunctionCallInput->Input;
+            return true;
+        }
+    }
+
+    if (!FunctionInput->bUsePreviewValueAsDefault)
+    {
+        Errors.Add(FString::Printf(
+            TEXT("Function input '%s' is unconnected and does not use preview as default."),
+            *FunctionInput->InputName.ToString()));
+        return false;
+    }
+
+    if (FunctionInput->Preview.Expression)
+    {
+        OutInput = FunctionInput->Preview;
+        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, OutInput, Stats, Errors))
+        {
+            return true;
+        }
+    }
+
+    UMaterialExpression* PreviewExpression = CreatePreviewDefaultExpression(Material, FunctionInput, PastePositionOffset, CreatedExpressions, Stats);
+    if (!PreviewExpression)
+    {
+        Errors.Add(FString::Printf(
+            TEXT("Function input '%s' requires unsupported preview default type %d."),
+            *FunctionInput->InputName.ToString(),
+            static_cast<int32>(FunctionInput->InputType.GetValue())));
+        return false;
+    }
+
+    OutInput = FExpressionInput();
+    OutInput.Expression = PreviewExpression;
+    OutInput.OutputIndex = 0;
+    return true;
+}
+
+bool ResolveCopiedExpressionInput(
+    UMaterial* Material,
+    const UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    const TMap<UMaterialExpression*, UMaterialExpression*>& CopiedExpressions,
+    const FVector2D& PastePositionOffset,
+    TArray<UMaterialExpression*>& CreatedExpressions,
+    FExpressionInput& Input,
+    FMaterialFunctionExpansionStats& Stats,
+    TArray<FString>& Errors)
+{
+    UMaterialExpression* SourceExpression = Input.Expression;
+    if (!SourceExpression)
+    {
+        return true;
+    }
+
+    if (UMaterialExpression* const* CopiedExpression = CopiedExpressions.Find(SourceExpression))
+    {
+        Input.Expression = *CopiedExpression;
+        return true;
+    }
+
+    if (UMaterialExpressionFunctionInput* FunctionInput = Cast<UMaterialExpressionFunctionInput>(SourceExpression))
+    {
+        FExpressionInput ReplacementInput;
+        if (!BuildFunctionInputReplacement(Material, FunctionCall, FunctionInput, CopiedExpressions, PastePositionOffset, CreatedExpressions, ReplacementInput, Stats, Errors))
+        {
+            return false;
+        }
+
+        Input = ReplacementInput;
+        ++Stats.RewiredFunctionInputCount;
+        return true;
+    }
+
+    Errors.Add(FString::Printf(
+        TEXT("Expression input still points to uncopied function expression '%s'."),
+        *SourceExpression->GetPathName()));
+    return false;
+}
+
+void FindFunctionCallReferencedOutputIndices(
+    UMaterial* Material,
+    UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    TSet<int32>& OutReferencedOutputIndices)
+{
+    if (!Material || !FunctionCall)
+    {
+        return;
+    }
+
+    auto VisitInput = [FunctionCall, &OutReferencedOutputIndices](FExpressionInput* Input)
+    {
+        if (!Input || Input->Expression != FunctionCall)
+        {
+            return;
+        }
+
+        int32 OutputIndex = Input->OutputIndex;
+        if (!FunctionCall->FunctionOutputs.IsValidIndex(OutputIndex) && FunctionCall->FunctionOutputs.Num() == 1)
+        {
+            OutputIndex = 0;
+        }
+        OutReferencedOutputIndices.Add(OutputIndex);
+    };
+
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Material->GetExpressions())
+    {
+        UMaterialExpression* Expression = ExpressionPtr.Get();
+        if (!Expression)
+        {
+            continue;
+        }
+
+        for (FExpressionInputIterator It(Expression); It; ++It)
+        {
+            VisitInput(It.Input);
+        }
+    }
+
+    for (int32 PropertyIndex = 0; PropertyIndex < MP_MAX; ++PropertyIndex)
+    {
+        VisitInput(Material->GetExpressionInputForProperty(static_cast<EMaterialProperty>(PropertyIndex)));
+    }
+}
+
+int32 RewireFunctionCallConsumers(
+    UMaterial* Material,
+    UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    const TArray<FExpandedOutputReplacement>& OutputReplacements)
+{
+    if (!Material || !FunctionCall)
+    {
+        return 0;
+    }
+
+    int32 RewiredCount = 0;
+    auto VisitInput = [FunctionCall, &OutputReplacements, &RewiredCount](FExpressionInput* Input)
+    {
+        if (!Input || Input->Expression != FunctionCall)
+        {
+            return;
+        }
+
+        int32 OutputIndex = Input->OutputIndex;
+        if (!OutputReplacements.IsValidIndex(OutputIndex) && OutputReplacements.Num() == 1)
+        {
+            OutputIndex = 0;
+        }
+        if (OutputReplacements.IsValidIndex(OutputIndex) && OutputReplacements[OutputIndex].bValid)
+        {
+            *Input = OutputReplacements[OutputIndex].Input;
+            ++RewiredCount;
+        }
+    };
+
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Material->GetExpressions())
+    {
+        UMaterialExpression* Expression = ExpressionPtr.Get();
+        if (!Expression)
+        {
+            continue;
+        }
+
+        for (FExpressionInputIterator It(Expression); It; ++It)
+        {
+            VisitInput(It.Input);
+        }
+    }
+
+    for (int32 PropertyIndex = 0; PropertyIndex < MP_MAX; ++PropertyIndex)
+    {
+        VisitInput(Material->GetExpressionInputForProperty(static_cast<EMaterialProperty>(PropertyIndex)));
+    }
+
+    return RewiredCount;
+}
+
+void CleanupCreatedMaterialExpressions(UMaterial* Material, TArray<UMaterialExpression*>& CreatedExpressions)
+{
+    if (!Material)
+    {
+        return;
+    }
+
+    for (int32 Index = CreatedExpressions.Num() - 1; Index >= 0; --Index)
+    {
+        if (CreatedExpressions[Index])
+        {
+            UMaterialEditingLibrary::DeleteMaterialExpression(Material, CreatedExpressions[Index]);
+        }
+    }
+
+    CreatedExpressions.Reset();
+}
+
+bool ExpandFunctionCallIntoMaterial(
+    UMaterial* Material,
+    UMaterialExpressionMaterialFunctionCall* FunctionCall,
+    FMaterialFunctionExpansionStats& Stats,
+    TArray<FString>& Errors)
+{
+    if (!Material || !FunctionCall || !FunctionCall->MaterialFunction)
+    {
+        Errors.Add(TEXT("Missing material, function call, or material function while expanding."));
+        return false;
+    }
+
+    UMaterialFunctionInterface* MaterialFunction = FunctionCall->MaterialFunction;
+    TMap<FGuid, UMaterialExpressionFunctionInput*> FunctionInputsById;
+    TMap<FGuid, UMaterialExpressionFunctionOutput*> FunctionOutputsById;
+    CollectFunctionIoExpressions(MaterialFunction, FunctionInputsById, FunctionOutputsById);
+
+    TArray<UMaterialExpression*> SourceExpressions;
+    FVector2D AveragePosition = FVector2D::ZeroVector;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : MaterialFunction->GetExpressions())
+    {
+        UMaterialExpression* SourceExpression = ExpressionPtr.Get();
+        if (!SourceExpression ||
+            Cast<UMaterialExpressionFunctionInput>(SourceExpression) ||
+            Cast<UMaterialExpressionFunctionOutput>(SourceExpression))
+        {
+            continue;
+        }
+
+        SourceExpressions.Add(SourceExpression);
+        AveragePosition.X += SourceExpression->MaterialExpressionEditorX;
+        AveragePosition.Y += SourceExpression->MaterialExpressionEditorY;
+    }
+
+    if (SourceExpressions.Num() > 0)
+    {
+        AveragePosition /= SourceExpressions.Num();
+    }
+
+    const FVector2D PastePosition(FunctionCall->MaterialExpressionEditorX, FunctionCall->MaterialExpressionEditorY);
+    const FVector2D PastePositionOffset = PastePosition - AveragePosition;
+    TMap<UMaterialExpression*, UMaterialExpression*> CopiedExpressions;
+    TArray<UMaterialExpression*> CreatedExpressions;
+    const int32 InitialErrorCount = Errors.Num();
+
+    for (UMaterialExpression* SourceExpression : SourceExpressions)
+    {
+        UMaterialExpression* NewExpression = UMaterialEditingLibrary::DuplicateMaterialExpression(Material, nullptr, SourceExpression);
+        if (!NewExpression)
+        {
+            Errors.Add(FString::Printf(TEXT("Failed to duplicate function expression '%s'."), *SourceExpression->GetPathName()));
+            CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
+            return false;
+        }
+
+        NewExpression->MaterialExpressionEditorX = FMath::RoundToInt(SourceExpression->MaterialExpressionEditorX + PastePositionOffset.X);
+        NewExpression->MaterialExpressionEditorY = FMath::RoundToInt(SourceExpression->MaterialExpressionEditorY + PastePositionOffset.Y);
+        CopiedExpressions.Add(SourceExpression, NewExpression);
+        CreatedExpressions.Add(NewExpression);
+        ++Stats.DuplicatedNodeCount;
+        if (Cast<UMaterialExpressionMaterialFunctionCall>(NewExpression))
+        {
+            Stats.CreatedFunctionCallNodeIds.Add(GetExpressionId(NewExpression));
+        }
+    }
+
+    for (UMaterialExpression* NewExpression : CreatedExpressions)
+    {
+        if (NewExpression)
+        {
+            NewExpression->PostCopyNode(CreatedExpressions);
+        }
+    }
+
+    for (const TPair<UMaterialExpression*, UMaterialExpression*>& Pair : CopiedExpressions)
+    {
+        UMaterialExpression* NewExpression = Pair.Value;
+        if (!NewExpression)
+        {
+            continue;
+        }
+
+        for (FExpressionInputIterator It(NewExpression); It; ++It)
+        {
+            if (!ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, *It.Input, Stats, Errors))
+            {
+                CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
+                return false;
+            }
+        }
+    }
+
+    TSet<int32> ReferencedOutputIndices;
+    FindFunctionCallReferencedOutputIndices(Material, FunctionCall, ReferencedOutputIndices);
+    const bool bRequireAllOutputs = ReferencedOutputIndices.Num() == 0;
+
+    TArray<FExpandedOutputReplacement> OutputReplacements;
+    OutputReplacements.SetNum(FunctionCall->FunctionOutputs.Num());
+    for (int32 OutputIndex = 0; OutputIndex < FunctionCall->FunctionOutputs.Num(); ++OutputIndex)
+    {
+        if (!bRequireAllOutputs && !ReferencedOutputIndices.Contains(OutputIndex))
+        {
+            continue;
+        }
+
+        const FFunctionExpressionOutput& FunctionCallOutput = FunctionCall->FunctionOutputs[OutputIndex];
+        UMaterialExpressionFunctionOutput* FunctionOutput = FunctionCallOutput.ExpressionOutput;
+        if (!FunctionOutput)
+        {
+            FunctionOutput = FunctionOutputsById.FindRef(FunctionCallOutput.ExpressionOutputId);
+        }
+        if (!FunctionOutput)
+        {
+            Errors.Add(FString::Printf(TEXT("Function output index %d could not be resolved."), OutputIndex));
+            continue;
+        }
+
+        FExpressionInput OutputInput = FunctionOutput->A;
+        if (!OutputInput.Expression)
+        {
+            Errors.Add(FString::Printf(TEXT("Function output '%s' is not connected."), *FunctionOutput->OutputName.ToString()));
+            continue;
+        }
+
+        if (ResolveCopiedExpressionInput(Material, FunctionCall, CopiedExpressions, PastePositionOffset, CreatedExpressions, OutputInput, Stats, Errors))
+        {
+            OutputReplacements[OutputIndex].bValid = true;
+            OutputReplacements[OutputIndex].Input = OutputInput;
+        }
+    }
+
+    if (Errors.Num() > InitialErrorCount)
+    {
+        CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
+        return false;
+    }
+
+    for (int32 ReferencedOutputIndex : ReferencedOutputIndices)
+    {
+        if (!OutputReplacements.IsValidIndex(ReferencedOutputIndex) || !OutputReplacements[ReferencedOutputIndex].bValid)
+        {
+            Errors.Add(FString::Printf(TEXT("Function call output index %d is referenced but has no valid expanded replacement."), ReferencedOutputIndex));
+            CleanupCreatedMaterialExpressions(Material, CreatedExpressions);
+            return false;
+        }
+    }
+
+    Stats.RewiredConsumerCount += RewireFunctionCallConsumers(Material, FunctionCall, OutputReplacements);
+    UMaterialEditingLibrary::DeleteMaterialExpression(Material, FunctionCall);
+    CreatedExpressions.Reset();
+    return true;
+}
 }
 
 FUnrealMCPMaterialCommands::FUnrealMCPMaterialCommands()
@@ -2436,6 +3128,14 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString&
     if (CommandType == TEXT("compile_and_save_material"))
     {
         return HandleCompileAndSaveMaterial(Params);
+    }
+    if (CommandType == TEXT("expand_material_function_calls"))
+    {
+        return HandleExpandMaterialFunctionCalls(Params);
+    }
+    if (CommandType == TEXT("get_material_parameter_collection_values"))
+    {
+        return HandleGetMaterialParameterCollectionValues(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown material command: %s"), *CommandType));
@@ -3265,5 +3965,350 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCompileAndSaveMaterial
     ResultObj->SetBoolField(TEXT("saved"), bSaved);
     ResultObj->SetBoolField(TEXT("was_dirty_before_compile"), bWasDirty);
     ResultObj->SetBoolField(TEXT("dirty_after_compile"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleExpandMaterialFunctionCalls(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    FString NodeId;
+    Params->TryGetStringField(TEXT("node_id"), NodeId);
+    NodeId.TrimStartAndEndInline();
+
+    bool bRecursive = true;
+    if (Params->HasField(TEXT("recursive")))
+    {
+        bRecursive = Params->GetBoolField(TEXT("recursive"));
+    }
+
+    bool bExcludeEngineFunctions = true;
+    if (Params->HasField(TEXT("exclude_engine_functions")))
+    {
+        bExcludeEngineFunctions = Params->GetBoolField(TEXT("exclude_engine_functions"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    bool bAllowPartialSave = false;
+    if (Params->HasField(TEXT("allow_partial_save")))
+    {
+        bAllowPartialSave = Params->GetBoolField(TEXT("allow_partial_save"));
+    }
+
+    int32 MaxPasses = bRecursive ? 8 : 1;
+    double MaxPassesValue = 0.0;
+    if (Params->TryGetNumberField(TEXT("max_passes"), MaxPassesValue))
+    {
+        MaxPasses = FMath::Clamp(static_cast<int32>(MaxPassesValue), 1, 64);
+    }
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, TEXT("material"), Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    if (!Target.Material)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("expand_material_function_calls currently supports Material assets only"));
+    }
+
+    UPackage* Package = Target.Asset ? Target.Asset->GetOutermost() : nullptr;
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+    const int32 InitialNodeCount = Target.Material->GetExpressions().Num();
+    const int32 InitialFunctionCallCount = CountMaterialFunctionCalls(Target.Material);
+
+    TArray<TSharedPtr<FJsonValue>> Expanded;
+    TArray<TSharedPtr<FJsonValue>> Skipped;
+    TArray<FString> Errors;
+    TSet<FString> FailedExpansionNodeIds;
+    int32 ExpandedCount = 0;
+    int32 PassesRun = 0;
+    bool bHitMaxPasses = false;
+    const bool bTargetedExpansion = !NodeId.IsEmpty();
+    TArray<FString> PendingTargetNodeIds;
+    if (bTargetedExpansion)
+    {
+        PendingTargetNodeIds.Add(NodeId);
+    }
+
+    for (int32 PassIndex = 0; PassIndex < MaxPasses; ++PassIndex)
+    {
+        ++PassesRun;
+
+        TArray<FString> NodeIds;
+        if (bTargetedExpansion)
+        {
+            NodeIds = MoveTemp(PendingTargetNodeIds);
+        }
+        else
+        {
+            NodeIds = GetExpandableFunctionCallNodeIds(Target.Material, bExcludeEngineFunctions, Skipped);
+        }
+
+        if (NodeIds.Num() == 0)
+        {
+            break;
+        }
+
+        int32 ExpandedThisPass = 0;
+        TArray<FString> NextTargetNodeIds;
+        for (const FString& CurrentNodeId : NodeIds)
+        {
+            if (FailedExpansionNodeIds.Contains(CurrentNodeId))
+            {
+                continue;
+            }
+
+            UMaterialExpression* Expression = nullptr;
+            FString FindError;
+            if (!FindExpressionById(Target, CurrentNodeId, Expression, FindError))
+            {
+                Errors.Add(FindError);
+                FailedExpansionNodeIds.Add(CurrentNodeId);
+                continue;
+            }
+
+            UMaterialExpressionMaterialFunctionCall* FunctionCall = Cast<UMaterialExpressionMaterialFunctionCall>(Expression);
+            if (!FunctionCall)
+            {
+                TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+                AddExpressionReferenceFields(SkippedObject, Expression, TEXT(""));
+                SkippedObject->SetStringField(TEXT("reason"), TEXT("not_a_material_function_call"));
+                Skipped.Add(MakeShared<FJsonValueObject>(SkippedObject));
+                continue;
+            }
+
+            UMaterialFunctionInterface* MaterialFunction = FunctionCall->MaterialFunction;
+            const FString FunctionPath = MaterialFunction ? MaterialFunction->GetPathName() : FString();
+            if (!MaterialFunction)
+            {
+                TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+                AddExpressionReferenceFields(SkippedObject, FunctionCall, TEXT(""));
+                SkippedObject->SetStringField(TEXT("reason"), TEXT("missing_material_function"));
+                Skipped.Add(MakeShared<FJsonValueObject>(SkippedObject));
+                continue;
+            }
+
+            if (bExcludeEngineFunctions && IsEngineOrScriptAssetPath(FunctionPath))
+            {
+                TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+                AddExpressionReferenceFields(SkippedObject, FunctionCall, TEXT(""));
+                SkippedObject->SetStringField(TEXT("function"), FunctionPath);
+                SkippedObject->SetStringField(TEXT("reason"), TEXT("engine_or_script_function"));
+                Skipped.Add(MakeShared<FJsonValueObject>(SkippedObject));
+                continue;
+            }
+
+            const int32 BeforeNodeCount = Target.Material->GetExpressions().Num();
+            FMaterialFunctionExpansionStats ExpansionStats;
+            if (!ExpandFunctionCallIntoMaterial(Target.Material, FunctionCall, ExpansionStats, Errors))
+            {
+                FailedExpansionNodeIds.Add(CurrentNodeId);
+                continue;
+            }
+            const int32 AfterNodeCount = Target.Material->GetExpressions().Num();
+
+            TSharedPtr<FJsonObject> ExpandedObject = MakeShared<FJsonObject>();
+            ExpandedObject->SetNumberField(TEXT("pass"), PassIndex + 1);
+            ExpandedObject->SetStringField(TEXT("requested_node_id"), CurrentNodeId);
+            ExpandedObject->SetStringField(TEXT("function"), FunctionPath);
+            ExpandedObject->SetNumberField(TEXT("node_count_before"), BeforeNodeCount);
+            ExpandedObject->SetNumberField(TEXT("node_count_after"), AfterNodeCount);
+            ExpandedObject->SetNumberField(TEXT("duplicated_node_count"), ExpansionStats.DuplicatedNodeCount);
+            ExpandedObject->SetNumberField(TEXT("preview_default_node_count"), ExpansionStats.PreviewDefaultNodeCount);
+            ExpandedObject->SetNumberField(TEXT("rewired_function_input_count"), ExpansionStats.RewiredFunctionInputCount);
+            ExpandedObject->SetNumberField(TEXT("rewired_consumer_count"), ExpansionStats.RewiredConsumerCount);
+            ExpandedObject->SetArrayField(TEXT("created_function_call_node_ids"), StringArrayToJson(ExpansionStats.CreatedFunctionCallNodeIds));
+            Expanded.Add(MakeShared<FJsonValueObject>(ExpandedObject));
+
+            if (bTargetedExpansion && bRecursive)
+            {
+                NextTargetNodeIds.Append(ExpansionStats.CreatedFunctionCallNodeIds);
+            }
+
+            ++ExpandedCount;
+            ++ExpandedThisPass;
+        }
+
+        if (!bRecursive || ExpandedThisPass == 0)
+        {
+            break;
+        }
+
+        if (bTargetedExpansion)
+        {
+            PendingTargetNodeIds = MoveTemp(NextTargetNodeIds);
+            if (PendingTargetNodeIds.Num() == 0)
+            {
+                break;
+            }
+        }
+
+        if (PassIndex + 1 == MaxPasses)
+        {
+            if (bTargetedExpansion)
+            {
+                bHitMaxPasses = PendingTargetNodeIds.Num() > 0;
+            }
+            else
+            {
+                TArray<TSharedPtr<FJsonValue>> RemainingSkipped;
+                bHitMaxPasses = GetExpandableFunctionCallNodeIds(Target.Material, bExcludeEngineFunctions, RemainingSkipped).Num() > 0;
+            }
+        }
+    }
+
+    bool bSaved = false;
+    if (ExpandedCount > 0)
+    {
+        Target.MarkChanged();
+        if (bSave && (Errors.Num() == 0 || bAllowPartialSave))
+        {
+            bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+        }
+    }
+    else if (Package && !bWasDirty && Package->IsDirty())
+    {
+        Package->SetDirtyFlag(false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetBoolField(TEXT("expanded"), ExpandedCount > 0);
+    ResultObj->SetNumberField(TEXT("expanded_count"), ExpandedCount);
+    ResultObj->SetNumberField(TEXT("passes_run"), PassesRun);
+    ResultObj->SetBoolField(TEXT("hit_max_passes"), bHitMaxPasses);
+    ResultObj->SetBoolField(TEXT("exclude_engine_functions"), bExcludeEngineFunctions);
+    ResultObj->SetBoolField(TEXT("allow_partial_save"), bAllowPartialSave);
+    ResultObj->SetBoolField(TEXT("partial_expansion_with_errors"), ExpandedCount > 0 && Errors.Num() > 0);
+    ResultObj->SetNumberField(TEXT("initial_node_count"), InitialNodeCount);
+    ResultObj->SetNumberField(TEXT("final_node_count"), Target.Material->GetExpressions().Num());
+    ResultObj->SetNumberField(TEXT("initial_function_call_count"), InitialFunctionCallCount);
+    ResultObj->SetNumberField(TEXT("final_function_call_count"), CountMaterialFunctionCalls(Target.Material));
+    ResultObj->SetArrayField(TEXT("expanded_nodes"), Expanded);
+    ResultObj->SetArrayField(TEXT("skipped_nodes"), Skipped);
+    ResultObj->SetArrayField(TEXT("errors"), StringArrayToJson(Errors));
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_expand"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_expand"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleGetMaterialParameterCollectionValues(const TSharedPtr<FJsonObject>& Params)
+{
+    FString CollectionPath;
+    if (!Params->TryGetStringField(TEXT("collection_path"), CollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'collection_path' parameter"));
+    }
+
+    bool bIncludeAssetDefaults = true;
+    if (Params->HasField(TEXT("include_asset_defaults")))
+    {
+        bIncludeAssetDefaults = Params->GetBoolField(TEXT("include_asset_defaults"));
+    }
+
+    bool bIncludeRuntime = true;
+    if (Params->HasField(TEXT("include_runtime")))
+    {
+        bIncludeRuntime = Params->GetBoolField(TEXT("include_runtime"));
+    }
+
+    UMaterialParameterCollection* Collection = Cast<UMaterialParameterCollection>(LoadObjectValue(CollectionPath));
+    if (!Collection)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Material Parameter Collection not found: %s"), *CollectionPath));
+    }
+
+    UWorld* World = bIncludeRuntime ? GetEditorOrPIEWorld() : nullptr;
+    UMaterialParameterCollectionInstance* Instance = (World && bIncludeRuntime) ? World->GetParameterCollectionInstance(Collection) : nullptr;
+    const TSet<FName> ParameterFilter = GetOptionalParameterNameFilter(Params);
+
+    TArray<TSharedPtr<FJsonValue>> ScalarValues;
+    for (const FCollectionScalarParameter& Parameter : Collection->ScalarParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, Parameter.ParameterName))
+        {
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> ParameterObject = MakeShared<FJsonObject>();
+        ParameterObject->SetStringField(TEXT("name"), Parameter.ParameterName.ToString());
+        ParameterObject->SetStringField(TEXT("id"), Parameter.Id.ToString(EGuidFormats::DigitsWithHyphens));
+
+        if (bIncludeAssetDefaults)
+        {
+            ParameterObject->SetNumberField(TEXT("asset_default"), Parameter.DefaultValue);
+        }
+
+        bool bRuntimeResolved = false;
+        float RuntimeValue = 0.0f;
+        if (Instance)
+        {
+            bRuntimeResolved = Instance->GetScalarParameterValue(Parameter.ParameterName, RuntimeValue);
+        }
+        ParameterObject->SetBoolField(TEXT("runtime_resolved"), bRuntimeResolved);
+        if (bRuntimeResolved)
+        {
+            ParameterObject->SetNumberField(TEXT("runtime_value"), RuntimeValue);
+        }
+
+        ScalarValues.Add(MakeShared<FJsonValueObject>(ParameterObject));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> VectorValues;
+    for (const FCollectionVectorParameter& Parameter : Collection->VectorParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, Parameter.ParameterName))
+        {
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> ParameterObject = MakeShared<FJsonObject>();
+        ParameterObject->SetStringField(TEXT("name"), Parameter.ParameterName.ToString());
+        ParameterObject->SetStringField(TEXT("id"), Parameter.Id.ToString(EGuidFormats::DigitsWithHyphens));
+
+        if (bIncludeAssetDefaults)
+        {
+            ParameterObject->SetObjectField(TEXT("asset_default"), LinearColorToJson(Parameter.DefaultValue));
+        }
+
+        bool bRuntimeResolved = false;
+        FLinearColor RuntimeValue = FLinearColor::Transparent;
+        if (Instance)
+        {
+            bRuntimeResolved = Instance->GetVectorParameterValue(Parameter.ParameterName, RuntimeValue);
+        }
+        ParameterObject->SetBoolField(TEXT("runtime_resolved"), bRuntimeResolved);
+        if (bRuntimeResolved)
+        {
+            ParameterObject->SetObjectField(TEXT("runtime_value"), LinearColorToJson(RuntimeValue));
+        }
+
+        VectorValues.Add(MakeShared<FJsonValueObject>(ParameterObject));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("collection"), Collection->GetPathName());
+    ResultObj->SetBoolField(TEXT("include_asset_defaults"), bIncludeAssetDefaults);
+    ResultObj->SetBoolField(TEXT("include_runtime"), bIncludeRuntime);
+    ResultObj->SetBoolField(TEXT("has_world"), World != nullptr);
+    ResultObj->SetStringField(TEXT("world_type"), GetWorldTypeName(World));
+    ResultObj->SetBoolField(TEXT("has_runtime_instance"), Instance != nullptr);
+    ResultObj->SetArrayField(TEXT("scalars"), ScalarValues);
+    ResultObj->SetArrayField(TEXT("vectors"), VectorValues);
+    ResultObj->SetNumberField(TEXT("scalar_count"), ScalarValues.Num());
+    ResultObj->SetNumberField(TEXT("vector_count"), VectorValues.Num());
     return ResultObj;
 }
