@@ -10,6 +10,7 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialExpression.h"
 #include "Materials/MaterialExpressionCustom.h"
+#include "Materials/MaterialExpressionExternalCodeBase.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
@@ -946,6 +947,39 @@ UClass* FindMaterialExpressionClass(const FString& ExpressionClassName)
     }
 
     return nullptr;
+}
+
+bool ShouldDeferImmediateMaterialExpressionUpdate(const UMaterialExpression* Expression)
+{
+    if (!Expression)
+    {
+        return true;
+    }
+
+    // External-code expressions, such as SkyAtmosphere nodes, can require editor
+    // graph/compiler state that is not fully initialized immediately after creation.
+    return Expression->IsA<UMaterialExpressionCustom>() ||
+        Expression->IsA<UMaterialExpressionExternalCodeBase>();
+}
+
+void RefreshExpressionNodeSafe(UMaterialExpression* Expression)
+{
+    if (!Expression)
+    {
+        return;
+    }
+
+#if WITH_EDITORONLY_DATA
+    // UMaterialExpression::RefreshNode dereferences GraphNode unconditionally.
+    // GraphNode only exists while the material editor has this graph open, so
+    // calling RefreshNode on an expression created headlessly (MCP, scripts)
+    // crashes the editor with an access violation. Skip it when there is no
+    // graph node; MarkChanged/PostEditChange still propagates the change.
+    if (Expression->GraphNode)
+    {
+        Expression->RefreshNode(true);
+    }
+#endif
 }
 
 FString GetExpressionKey(const UMaterialExpression* Expression)
@@ -2722,11 +2756,12 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialNode(const 
         }
     }
 
-    if (!Target.HasUnconnectedCustomInputs())
+    const bool bDeferImmediateUpdate = ShouldDeferImmediateMaterialExpressionUpdate(Expression);
+    if (!bDeferImmediateUpdate && !Target.HasUnconnectedCustomInputs())
     {
-        Expression->RefreshNode(true);
+        RefreshExpressionNodeSafe(Expression);
     }
-    Target.MarkChanged();
+    Target.MarkChanged(!bDeferImmediateUpdate);
 
     TSharedPtr<FJsonObject> ResultObj = ExpressionToJson(Expression, true, Target.GetExpressions());
     ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
@@ -2908,7 +2943,7 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialNodePropert
 
     if (!Target.HasUnconnectedCustomInputs())
     {
-        Expression->RefreshNode(true);
+        RefreshExpressionNodeSafe(Expression);
     }
     Target.MarkChanged(Cast<UMaterialExpressionCustom>(Expression) == nullptr);
 

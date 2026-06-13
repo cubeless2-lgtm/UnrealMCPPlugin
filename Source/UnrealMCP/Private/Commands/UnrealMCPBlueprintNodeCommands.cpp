@@ -3639,11 +3639,25 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintCusto
     const FName CustomEventFName(*CustomEventName);
     TArray<UK2Node_CustomEvent*> ExistingCustomEvents;
     FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_CustomEvent>(Blueprint, ExistingCustomEvents);
-    for (const UK2Node_CustomEvent* ExistingCustomEvent : ExistingCustomEvents)
+    for (UK2Node_CustomEvent* ExistingCustomEvent : ExistingCustomEvents)
     {
         if (ExistingCustomEvent && ExistingCustomEvent->CustomFunctionName == CustomEventFName)
         {
-            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Custom event already exists: %s"), *CustomEventName));
+            // Reuse the existing custom event node; apply call_in_editor update if requested.
+            bool bExistingCallInEditor = false;
+            if (Params->TryGetBoolField(TEXT("call_in_editor"), bExistingCallInEditor))
+            {
+                ExistingCustomEvent->Modify();
+                ExistingCustomEvent->bCallInEditor = bExistingCallInEditor;
+                ExistingCustomEvent->ReconstructNode();
+                FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+            }
+            TSharedPtr<FJsonObject> ExistingResultObj = NodeToJson(ExistingCustomEvent, true);
+            ExistingResultObj->SetStringField(TEXT("custom_event_name"), CustomEventName);
+            ExistingResultObj->SetBoolField(TEXT("reused_existing"), true);
+            ExistingResultObj->SetBoolField(TEXT("call_in_editor"), ExistingCustomEvent->bCallInEditor);
+            AddGraphField(ExistingResultObj, Blueprint, ExistingCustomEvent->GetGraph());
+            return ExistingResultObj;
         }
     }
 
@@ -3691,6 +3705,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintCusto
     if (!CustomEventNode)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create custom event node: %s"), *CustomEventName));
+    }
+
+    bool bCallInEditor = false;
+    if (Params->TryGetBoolField(TEXT("call_in_editor"), bCallInEditor) && bCallInEditor)
+    {
+        CustomEventNode->bCallInEditor = true;
     }
 
     CustomEventNode->ReconstructNode();

@@ -371,9 +371,10 @@ UK2Node_Event* FUnrealMCPCommonUtils::CreateEventNode(UEdGraph* Graph, const FSt
         EventNode->NodePosX = Position.X;
         EventNode->NodePosY = Position.Y;
         Graph->AddNode(EventNode, true);
+        EventNode->CreateNewGuid();
         EventNode->PostPlacedNewNode();
         EventNode->AllocateDefaultPins();
-        UE_LOG(LogTemp, Display, TEXT("Created new event node with name %s (ID: %s)"), 
+        UE_LOG(LogTemp, Display, TEXT("Created new event node with name %s (ID: %s)"),
             *EventName, *EventNode->NodeGuid.ToString());
     }
     else
@@ -417,10 +418,12 @@ UK2Node_VariableGet* FUnrealMCPCommonUtils::CreateVariableGetNode(UEdGraph* Grap
     
     if (Property)
     {
-        VariableGetNode->VariableReference.SetFromField<FProperty>(Property, false);
+        const bool bSelfContext = Property->GetOwnerClass() && Blueprint->GeneratedClass && Blueprint->GeneratedClass->IsChildOf(Property->GetOwnerClass());
+        VariableGetNode->VariableReference.SetFromField<FProperty>(Property, bSelfContext);
         VariableGetNode->NodePosX = Position.X;
         VariableGetNode->NodePosY = Position.Y;
         Graph->AddNode(VariableGetNode, true);
+        VariableGetNode->CreateNewGuid();
         VariableGetNode->PostPlacedNewNode();
         VariableGetNode->AllocateDefaultPins();
 
@@ -462,10 +465,12 @@ UK2Node_VariableSet* FUnrealMCPCommonUtils::CreateVariableSetNode(UEdGraph* Grap
     
     if (Property)
     {
-        VariableSetNode->VariableReference.SetFromField<FProperty>(Property, false);
+        const bool bSelfContext = Property->GetOwnerClass() && Blueprint->GeneratedClass && Blueprint->GeneratedClass->IsChildOf(Property->GetOwnerClass());
+        VariableSetNode->VariableReference.SetFromField<FProperty>(Property, bSelfContext);
         VariableSetNode->NodePosX = Position.X;
         VariableSetNode->NodePosY = Position.Y;
         Graph->AddNode(VariableSetNode, true);
+        VariableSetNode->CreateNewGuid();
         VariableSetNode->PostPlacedNewNode();
         VariableSetNode->AllocateDefaultPins();
 
