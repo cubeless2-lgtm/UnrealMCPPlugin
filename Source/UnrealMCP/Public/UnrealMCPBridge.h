@@ -70,4 +70,4 @@ private:
 	TSharedPtr<FUnrealMCPPCGCommands> PCGCommands;
 	TSharedPtr<FUnrealMCPProjectCommands> ProjectCommands;
 	TSharedPtr<FUnrealMCPUMGCommands> UMGCommands;
-}; 
+};

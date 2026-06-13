@@ -66,5 +66,5 @@ void FUnrealMCPModule::RegisterMenus()
 }
 
 #undef LOCTEXT_NAMESPACE
-	
-IMPLEMENT_MODULE(FUnrealMCPModule, UnrealMCP) 
+
+IMPLEMENT_MODULE(FUnrealMCPModule, UnrealMCP)

@@ -679,7 +679,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleSampleNiagaraSystemInPreviewLab(Params);
     }
-    
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
 }
 
@@ -923,7 +923,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorsInLevel(const T
 {
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     TArray<TSharedPtr<FJsonValue>> ActorArray;
     for (AActor* Actor : AllActors)
     {
@@ -932,10 +932,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorsInLevel(const T
             ActorArray.Add(FUnrealMCPCommonUtils::ActorToJson(Actor));
         }
     }
-    
+
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetArrayField(TEXT("actors"), ActorArray);
-    
+
     return ResultObj;
 }
 
@@ -946,10 +946,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const T
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'pattern' parameter"));
     }
-    
+
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     TArray<TSharedPtr<FJsonValue>> MatchingActors;
     for (AActor* Actor : AllActors)
     {
@@ -958,10 +958,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFindActorsByName(const T
             MatchingActors.Add(FUnrealMCPCommonUtils::ActorToJson(Actor));
         }
     }
-    
+
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetArrayField(TEXT("actors"), MatchingActors);
-    
+
     return ResultObj;
 }
 
@@ -1071,23 +1071,23 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleDeleteActor(const TShare
 
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     for (AActor* Actor : AllActors)
     {
         if (Actor && Actor->GetName() == ActorName)
         {
             // Store actor info before deletion for the response
             TSharedPtr<FJsonObject> ActorInfo = FUnrealMCPCommonUtils::ActorToJsonObject(Actor);
-            
+
             // Delete the actor
             Actor->Destroy();
-            
+
             TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
             ResultObj->SetObjectField(TEXT("deleted_actor"), ActorInfo);
             return ResultObj;
         }
     }
-    
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Actor not found: %s"), *ActorName));
 }
 
@@ -1104,7 +1104,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorTransform(const 
     AActor* TargetActor = nullptr;
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     for (AActor* Actor : AllActors)
     {
         if (Actor && Actor->GetName() == ActorName)
@@ -1155,7 +1155,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetActorProperties(const
     AActor* TargetActor = nullptr;
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     for (AActor* Actor : AllActors)
     {
         if (Actor && Actor->GetName() == ActorName)
@@ -1187,7 +1187,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const T
     AActor* TargetActor = nullptr;
     TArray<AActor*> AllActors;
     UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-    
+
     for (AActor* Actor : AllActors)
     {
         if (Actor && Actor->GetName() == ActorName)
@@ -1214,9 +1214,9 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const T
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'property_value' parameter"));
     }
-    
+
     TSharedPtr<FJsonValue> PropertyValue = Params->Values.FindRef(TEXT("property_value"));
-    
+
     // Set the property using our utility function
     FString ErrorMessage;
     if (FUnrealMCPCommonUtils::SetObjectProperty(TargetActor, PropertyName, PropertyValue, ErrorMessage))
@@ -1226,7 +1226,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSetActorProperty(const T
         ResultObj->SetStringField(TEXT("actor"), ActorName);
         ResultObj->SetStringField(TEXT("property"), PropertyName);
         ResultObj->SetBoolField(TEXT("success"), true);
-        
+
         // Also include the full actor details
         ResultObj->SetObjectField(TEXT("actor_details"), FUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true));
         return ResultObj;
@@ -1359,7 +1359,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleFocusViewport(const TSha
         AActor* TargetActor = nullptr;
         TArray<AActor*> AllActors;
         UGameplayStatics::GetAllActorsOfClass(GWorld, AActor::StaticClass(), AllActors);
-        
+
         for (AActor* Actor : AllActors)
         {
             if (Actor && Actor->GetName() == TargetActorName)
@@ -1409,7 +1409,7 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSh
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'filepath' parameter"));
     }
-    
+
     // Ensure the file path has a proper extension
     if (!FilePath.EndsWith(TEXT(".png")))
     {
@@ -1422,12 +1422,12 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSh
         FViewport* Viewport = GEditor->GetActiveViewport();
         TArray<FColor> Bitmap;
         FIntRect ViewportRect(0, 0, Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y);
-        
+
         if (Viewport->ReadPixels(Bitmap, FReadSurfaceDataFlags(), ViewportRect))
         {
             TArray<uint8> CompressedBitmap;
             FImageUtils::CompressImageArray(Viewport->GetSizeXY().X, Viewport->GetSizeXY().Y, Bitmap, CompressedBitmap);
-            
+
             if (FFileHelper::SaveArrayToFile(CompressedBitmap, *FilePath))
             {
                 TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -1436,9 +1436,9 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSh
             }
         }
     }
-    
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to take screenshot"));
-} 
+}
 
 TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetNiagaraPreviewLabState(const TSharedPtr<FJsonObject>& Params)
 {
