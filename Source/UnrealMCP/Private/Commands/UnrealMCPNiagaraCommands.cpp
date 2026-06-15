@@ -3,9 +3,13 @@
 
 #include "AssetCompilingManager.h"
 #include "EditorAssetLibrary.h"
+#include "Engine/TextureRenderTarget.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "HAL/PlatformProcess.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/PackageName.h"
+#include "NiagaraDataInterface.h"
+#include "NiagaraDataInterfaceRenderTarget2D.h"
 #include "NiagaraDecalRendererProperties.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
@@ -14,17 +18,23 @@
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeInput.h"
 #include "NiagaraNodeOutput.h"
+#include "NiagaraParameterBinding.h"
 #include "NiagaraParameterMapHistory.h"
 #include "NiagaraRibbonRendererProperties.h"
 #include "NiagaraScratchPadContainer.h"
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
+#include "NiagaraSimulationStageBase.h"
+#include "NiagaraSimulationStageCompileData.h"
 #include "NiagaraSpriteRendererProperties.h"
 #include "NiagaraSystem.h"
 #include "NiagaraTypes.h"
 #include "NiagaraVolumeRendererProperties.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "ViewModels/Stack/NiagaraParameterHandle.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 
@@ -37,7 +47,7 @@ FString NormalizeNiagaraObjectPathForLoad(const FString& ObjectPath)
     FString NormalizedPath = FPackageName::ExportTextPathToObjectPath(ObjectPath).TrimStartAndEnd();
     NormalizedPath.TrimQuotesInline();
 
-    if ((NormalizedPath.StartsWith(TEXT("/Game/")) || NormalizedPath.StartsWith(TEXT("/Engine/"))) && !NormalizedPath.Contains(TEXT(".")))
+    if (NormalizedPath.StartsWith(TEXT("/")) && !NormalizedPath.StartsWith(TEXT("/Script/")) && !NormalizedPath.Contains(TEXT(".")))
     {
         const FString AssetName = FPackageName::GetShortName(NormalizedPath);
         NormalizedPath = FString::Printf(TEXT("%s.%s"), *NormalizedPath, *AssetName);
@@ -76,6 +86,16 @@ TSharedPtr<FJsonValue> NumberArrayToJson(std::initializer_list<double> Values)
         JsonValues.Add(MakeShared<FJsonValueNumber>(Value));
     }
     return MakeShared<FJsonValueArray>(JsonValues);
+}
+
+TArray<TSharedPtr<FJsonValue>> IntArrayToJsonValues(std::initializer_list<int32> Values)
+{
+    TArray<TSharedPtr<FJsonValue>> JsonValues;
+    for (int32 Value : Values)
+    {
+        JsonValues.Add(MakeShared<FJsonValueNumber>(Value));
+    }
+    return JsonValues;
 }
 
 TSharedPtr<FJsonValue> NiagaraVariableDataToJsonValue(const FNiagaraVariable& Variable)
@@ -159,6 +179,109 @@ FString NiagaraScriptUsageName(ENiagaraScriptUsage Usage)
         return Enum->GetNameStringByValue(static_cast<int64>(Usage));
     }
     return FString::FromInt(static_cast<int32>(Usage));
+}
+
+template<typename TEnum>
+FString NiagaraEnumValueName(TEnum Value)
+{
+    if (const UEnum* Enum = StaticEnum<TEnum>())
+    {
+        return Enum->GetNameStringByValue(static_cast<int64>(Value));
+    }
+    return FString::FromInt(static_cast<int32>(Value));
+}
+
+FString NiagaraEnumValueName(ENiagaraIterationSource Value)
+{
+    switch (Value)
+    {
+    case ENiagaraIterationSource::Particles:
+        return TEXT("Particles");
+    case ENiagaraIterationSource::DataInterface:
+        return TEXT("DataInterface");
+    case ENiagaraIterationSource::DirectSet:
+        return TEXT("DirectSet");
+    default:
+        return FString::FromInt(static_cast<int32>(Value));
+    }
+}
+
+FString NiagaraEnumValueName(ENiagaraGpuDispatchType Value)
+{
+    switch (Value)
+    {
+    case ENiagaraGpuDispatchType::OneD:
+        return TEXT("OneD");
+    case ENiagaraGpuDispatchType::TwoD:
+        return TEXT("TwoD");
+    case ENiagaraGpuDispatchType::ThreeD:
+        return TEXT("ThreeD");
+    case ENiagaraGpuDispatchType::Custom:
+        return TEXT("Custom");
+    default:
+        return FString::FromInt(static_cast<int32>(Value));
+    }
+}
+
+FString NiagaraEnumValueName(ENiagaraDirectDispatchElementType Value)
+{
+    switch (Value)
+    {
+    case ENiagaraDirectDispatchElementType::NumThreads:
+        return TEXT("NumThreads");
+    case ENiagaraDirectDispatchElementType::NumThreadsNoClipping:
+        return TEXT("NumThreadsNoClipping");
+    case ENiagaraDirectDispatchElementType::NumGroups:
+        return TEXT("NumGroups");
+    default:
+        return FString::FromInt(static_cast<int32>(Value));
+    }
+}
+
+FString NiagaraEnumValueName(ENiagaraSimStageExecuteBehavior Value)
+{
+    switch (Value)
+    {
+    case ENiagaraSimStageExecuteBehavior::Always:
+        return TEXT("Always");
+    case ENiagaraSimStageExecuteBehavior::OnSimulationReset:
+        return TEXT("OnSimulationReset");
+    case ENiagaraSimStageExecuteBehavior::NotOnSimulationReset:
+        return TEXT("NotOnSimulationReset");
+    default:
+        return FString::FromInt(static_cast<int32>(Value));
+    }
+}
+
+FString TextureRenderTargetFormatName(ETextureRenderTargetFormat Format)
+{
+    switch (Format)
+    {
+    case RTF_R8:
+        return TEXT("RTF_R8");
+    case RTF_RG8:
+        return TEXT("RTF_RG8");
+    case RTF_RGBA8:
+        return TEXT("RTF_RGBA8");
+    case RTF_RGBA8_SRGB:
+        return TEXT("RTF_RGBA8_SRGB");
+    case RTF_R16f:
+        return TEXT("RTF_R16f");
+    case RTF_RG16f:
+        return TEXT("RTF_RG16f");
+    case RTF_RGBA16f:
+        return TEXT("RTF_RGBA16f");
+    case RTF_R32f:
+        return TEXT("RTF_R32f");
+    case RTF_RG32f:
+        return TEXT("RTF_RG32f");
+    case RTF_RGBA32f:
+        return TEXT("RTF_RGBA32f");
+    case RTF_RGB10A2:
+        return TEXT("RTF_RGB10A2");
+    default:
+        return FString::FromInt(static_cast<int32>(Format));
+    }
 }
 
 bool TryParseNiagaraScriptUsage(const FString& Value, ENiagaraScriptUsage& OutUsage)
@@ -272,6 +395,14 @@ TSharedPtr<FJsonObject> NiagaraVariableToJsonObject(const FNiagaraVariableBase& 
     TSharedPtr<FJsonObject> VariableObject = MakeShared<FJsonObject>();
     VariableObject->SetStringField(TEXT("name"), Variable.GetName().ToString());
     VariableObject->SetStringField(TEXT("type"), NiagaraTypeName(Variable.GetType()));
+    VariableObject->SetBoolField(TEXT("type_is_valid"), Variable.GetType().IsValid());
+    VariableObject->SetBoolField(TEXT("type_is_data_interface"), Variable.GetType().IsDataInterface());
+    VariableObject->SetBoolField(TEXT("type_is_uobject"), Variable.GetType().IsUObject());
+    if (UClass* TypeClass = Variable.GetType().GetClass())
+    {
+        VariableObject->SetStringField(TEXT("type_class"), TypeClass->GetName());
+        VariableObject->SetStringField(TEXT("type_class_path"), TypeClass->GetPathName());
+    }
     return VariableObject;
 }
 
@@ -316,6 +447,128 @@ TSharedPtr<FJsonObject> NiagaraVariableWithDataToJsonObject(const FNiagaraVariab
     VariableObject->SetNumberField(TEXT("data_size_bytes"), Variable.GetAllocatedSizeInBytes());
     VariableObject->SetField(TEXT("value"), NiagaraVariableDataToJsonValue(Variable));
     return VariableObject;
+}
+
+TSharedPtr<FJsonObject> NiagaraAttributeBindingToJsonObject(const FNiagaraVariableAttributeBinding& Binding)
+{
+    TSharedPtr<FJsonObject> BindingObject = MakeShared<FJsonObject>();
+    BindingObject->SetBoolField(TEXT("is_valid"), Binding.IsValid());
+    BindingObject->SetBoolField(TEXT("is_particle_binding"), Binding.IsParticleBinding());
+    BindingObject->SetBoolField(TEXT("binding_exists_on_source"), Binding.DoesBindingExistOnSource());
+    BindingObject->SetBoolField(TEXT("can_bind_to_host_parameter_map"), Binding.CanBindToHostParameterMap());
+    BindingObject->SetStringField(TEXT("binding_source_mode"), NiagaraEnumValueName(Binding.GetBindingSourceMode()));
+    BindingObject->SetObjectField(TEXT("param_map_bindable_variable"), NiagaraVariableToJsonObject(Binding.GetParamMapBindableVariable()));
+    BindingObject->SetObjectField(TEXT("data_set_bindable_variable"), NiagaraVariableToJsonObject(Binding.GetDataSetBindableVariable()));
+#if WITH_EDITORONLY_DATA
+    BindingObject->SetStringField(TEXT("display_name"), Binding.GetName().ToString());
+    BindingObject->SetStringField(TEXT("default_value_string"), Binding.GetDefaultValueString());
+#endif
+    return BindingObject;
+}
+
+TSharedPtr<FJsonObject> NiagaraDataInterfaceBindingToJsonObject(const FNiagaraVariableDataInterfaceBinding& Binding)
+{
+    TSharedPtr<FJsonObject> BindingObject = MakeShared<FJsonObject>();
+    BindingObject->SetObjectField(TEXT("bound_variable"), NiagaraVariableWithDataToJsonObject(Binding.BoundVariable));
+    BindingObject->SetBoolField(TEXT("is_valid"), Binding.BoundVariable.GetType().IsDataInterface());
+    return BindingObject;
+}
+
+TSharedPtr<FJsonObject> NiagaraParameterBindingToJsonObject(FNiagaraParameterBinding& Binding)
+{
+    TSharedPtr<FJsonObject> BindingObject = MakeShared<FJsonObject>();
+    BindingObject->SetObjectField(TEXT("resolved_parameter"), NiagaraVariableToJsonObject(Binding.ResolvedParameter));
+#if WITH_EDITORONLY_DATA
+    BindingObject->SetObjectField(TEXT("aliased_parameter"), NiagaraVariableToJsonObject(Binding.AliasedParameter));
+    BindingObject->SetObjectField(TEXT("default_aliased_parameter"), NiagaraVariableWithDataToJsonObject(Binding.GetDefaultAliasedParameter()));
+    BindingObject->SetObjectField(TEXT("default_resolved_parameter"), NiagaraVariableWithDataToJsonObject(Binding.GetDefaultResolvedParameter()));
+    BindingObject->SetBoolField(TEXT("is_set_to_default"), Binding.IsSetToDefault());
+    BindingObject->SetStringField(TEXT("display_string"), Binding.ToString());
+    BindingObject->SetBoolField(TEXT("allow_user_parameters"), Binding.AllowUserParameters());
+    BindingObject->SetBoolField(TEXT("allow_system_parameters"), Binding.AllowSystemParameters());
+    BindingObject->SetBoolField(TEXT("allow_emitter_parameters"), Binding.AllowEmitterParameters());
+    BindingObject->SetBoolField(TEXT("allow_particle_parameters"), Binding.AllowParticleParameters());
+    BindingObject->SetBoolField(TEXT("allow_static_variables"), Binding.AllowStaticVariables());
+#endif
+    return BindingObject;
+}
+
+TSharedPtr<FJsonObject> NiagaraParameterBindingWithValueToJsonObject(FNiagaraParameterBindingWithValue& Binding)
+{
+    TSharedPtr<FJsonObject> BindingObject = NiagaraParameterBindingToJsonObject(Binding);
+    const TConstArrayView<uint8> DefaultValueBytes = Binding.GetDefaultValueArray();
+    BindingObject->SetNumberField(TEXT("default_value_byte_count"), DefaultValueBytes.Num());
+
+    if (DefaultValueBytes.Num() > 0)
+    {
+        FNiagaraVariable DefaultValueVariable(Binding.ResolvedParameter);
+#if WITH_EDITORONLY_DATA
+        const FNiagaraVariable& DefaultAliasedParameter = Binding.GetDefaultAliasedParameter();
+        if (DefaultAliasedParameter.GetType().IsValid())
+        {
+            DefaultValueVariable = DefaultAliasedParameter;
+        }
+#endif
+        if (DefaultValueVariable.GetType().IsValid() &&
+            DefaultValueVariable.GetType().GetSize() == DefaultValueBytes.Num())
+        {
+            DefaultValueVariable.SetData(DefaultValueBytes.GetData());
+            BindingObject->SetField(TEXT("default_value"), NiagaraVariableDataToJsonValue(DefaultValueVariable));
+            BindingObject->SetStringField(TEXT("default_value_decode_status"), TEXT("decoded"));
+        }
+        else
+        {
+            BindingObject->SetStringField(TEXT("default_value_decode_status"), TEXT("type_size_mismatch"));
+        }
+    }
+    else
+    {
+        BindingObject->SetStringField(TEXT("default_value_decode_status"), TEXT("no_default_value_bytes"));
+    }
+
+    return BindingObject;
+}
+
+TSharedPtr<FJsonObject> NiagaraSimStageCompileDataToJsonObject(const FNiagaraSimulationStageCompilationData& CompileData)
+{
+    TSharedPtr<FJsonObject> CompileObject = MakeShared<FJsonObject>();
+    CompileObject->SetStringField(TEXT("stage_guid"), CompileData.StageGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    CompileObject->SetStringField(TEXT("stage_name"), CompileData.StageName.ToString());
+    CompileObject->SetStringField(TEXT("enabled_binding"), CompileData.EnabledBinding.ToString());
+    CompileObject->SetArrayField(TEXT("element_count"), IntArrayToJsonValues({
+        CompileData.ElementCount.X,
+        CompileData.ElementCount.Y,
+        CompileData.ElementCount.Z
+    }));
+    CompileObject->SetStringField(TEXT("element_count_x_binding"), CompileData.ElementCountXBinding.ToString());
+    CompileObject->SetStringField(TEXT("element_count_y_binding"), CompileData.ElementCountYBinding.ToString());
+    CompileObject->SetStringField(TEXT("element_count_z_binding"), CompileData.ElementCountZBinding.ToString());
+    CompileObject->SetNumberField(TEXT("num_iterations"), CompileData.NumIterations);
+    CompileObject->SetStringField(TEXT("num_iterations_binding"), CompileData.NumIterationsBinding.ToString());
+    CompileObject->SetStringField(TEXT("iteration_source_type"), NiagaraEnumValueName(CompileData.IterationSourceType));
+    CompileObject->SetStringField(TEXT("iteration_data_interface"), CompileData.IterationDataInterface.ToString());
+    CompileObject->SetStringField(TEXT("iteration_direct_binding"), CompileData.IterationDirectBinding.ToString());
+    CompileObject->SetStringField(TEXT("execute_behavior"), NiagaraEnumValueName(CompileData.ExecuteBehavior));
+    CompileObject->SetBoolField(TEXT("partial_particle_update"), CompileData.PartialParticleUpdate);
+    CompileObject->SetBoolField(TEXT("particle_iteration_state_enabled"), CompileData.bParticleIterationStateEnabled);
+    CompileObject->SetStringField(TEXT("particle_iteration_state_binding"), CompileData.ParticleIterationStateBinding.ToString());
+    CompileObject->SetArrayField(TEXT("particle_iteration_state_range"), IntArrayToJsonValues({
+        CompileData.ParticleIterationStateRange.X,
+        CompileData.ParticleIterationStateRange.Y
+    }));
+    CompileObject->SetBoolField(TEXT("gpu_dispatch_force_linear"), CompileData.bGpuDispatchForceLinear);
+    CompileObject->SetStringField(TEXT("direct_dispatch_type"), NiagaraEnumValueName(CompileData.DirectDispatchType));
+    CompileObject->SetStringField(TEXT("direct_dispatch_element_type"), NiagaraEnumValueName(CompileData.DirectDispatchElementType));
+    CompileObject->SetBoolField(TEXT("override_gpu_dispatch_num_threads"), CompileData.bOverrideGpuDispatchNumThreads);
+    CompileObject->SetArrayField(TEXT("override_gpu_dispatch_num_threads_value"), IntArrayToJsonValues({
+        CompileData.OverrideGpuDispatchNumThreads.X,
+        CompileData.OverrideGpuDispatchNumThreads.Y,
+        CompileData.OverrideGpuDispatchNumThreads.Z
+    }));
+    CompileObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_x_binding"), NiagaraVariableToJsonObject(CompileData.OverrideGpuDispatchNumThreadsXBinding));
+    CompileObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_y_binding"), NiagaraVariableToJsonObject(CompileData.OverrideGpuDispatchNumThreadsYBinding));
+    CompileObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_z_binding"), NiagaraVariableToJsonObject(CompileData.OverrideGpuDispatchNumThreadsZBinding));
+    return CompileObject;
 }
 
 TArray<TSharedPtr<FJsonValue>> NiagaraVariablesToJson(const TArray<FNiagaraVariable>& Variables)
@@ -1335,6 +1588,9 @@ int32 NiagaraInputControlPriority(const FString& ControlKind, const FString& Fun
 }
 
 TSharedPtr<FJsonObject> BuildFunctionCallJson(const UNiagaraNodeFunctionCall* FunctionCall, int32 NodeIndex, bool bIncludePins);
+TSharedPtr<FJsonObject> BuildRenderTargetObjectJson(const UObject* Object);
+TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(const UNiagaraDataInterface* DataInterface, UNiagaraSystem* System = nullptr);
+const UObject* GetObjectPropertyForInspection(const UObject* Object, const FName PropertyName);
 
 bool IsLowSignalNiagaraInputPinName(const FString& PinName)
 {
@@ -1444,6 +1700,162 @@ FNiagaraVariable BuildRapidIterationParameterForInput(
     const FNiagaraParameterHandle AliasedHandle = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(ModuleHandle, FunctionCall);
     FNiagaraVariable AliasedVariable(InputVariable.GetType(), AliasedHandle.GetParameterHandleString());
     return FNiagaraUtilities::ConvertVariableToRapidIterationConstantName(AliasedVariable, *EmitterName, ScriptUsage);
+}
+
+FNiagaraParameterHandle BuildAliasedModuleParameterHandleForInput(
+    const UNiagaraNodeFunctionCall* FunctionCall,
+    const FNiagaraVariable& InputVariable)
+{
+    if (!FunctionCall)
+    {
+        return FNiagaraParameterHandle();
+    }
+
+    const FNiagaraParameterHandle InputHandle(InputVariable.GetName());
+    const FNiagaraParameterHandle ModuleHandle = InputHandle.IsModuleHandle()
+        ? InputHandle
+        : FNiagaraParameterHandle::CreateModuleParameterHandle(InputVariable.GetName());
+    return FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(ModuleHandle, FunctionCall);
+}
+
+bool NiagaraModuleInputNameMatches(const FNiagaraVariable& Candidate, const FString& InputName)
+{
+    const FString CandidateName = Candidate.GetName().ToString();
+    FString ShortName = CandidateName;
+    ShortName.RemoveFromStart(TEXT("Module."));
+    return CandidateName.Equals(InputName, ESearchCase::IgnoreCase) ||
+        ShortName.Equals(InputName, ESearchCase::IgnoreCase);
+}
+
+bool NiagaraUserParameterNameMatches(const FNiagaraVariable& Candidate, const FString& UserParameterName)
+{
+    const FString CandidateName = Candidate.GetName().ToString();
+    FString CandidateShortName = CandidateName;
+    CandidateShortName.RemoveFromStart(TEXT("User."));
+    FString RequestedShortName = UserParameterName;
+    RequestedShortName.RemoveFromStart(TEXT("User."));
+    return CandidateName.Equals(UserParameterName, ESearchCase::IgnoreCase) ||
+        CandidateShortName.Equals(RequestedShortName, ESearchCase::IgnoreCase);
+}
+
+UEdGraphPin* FindNiagaraStackFunctionInputOverridePin(
+    const UNiagaraNodeFunctionCall* FunctionCall,
+    const FNiagaraParameterHandle& AliasedInputHandle)
+{
+    if (!FunctionCall)
+    {
+        return nullptr;
+    }
+
+    UEdGraph* Graph = FunctionCall->GetGraph();
+    if (!Graph)
+    {
+        return nullptr;
+    }
+
+    const FName TargetPinName = AliasedInputHandle.GetParameterHandleString();
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (!Node || !Node->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapSet")))
+        {
+            continue;
+        }
+
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (Pin && Pin->Direction == EGPD_Input && Pin->PinName == TargetPinName)
+            {
+                return Pin;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+bool ValidateLinkedNiagaraDataInterfaceInputNode(UEdGraphPin& OverridePin, FString& OutError)
+{
+    if (OverridePin.LinkedTo.Num() == 0)
+    {
+        return true;
+    }
+
+    if (OverridePin.LinkedTo.Num() != 1)
+    {
+        OutError = FString::Printf(TEXT("Expected one linked override value node, found %d"), OverridePin.LinkedTo.Num());
+        return false;
+    }
+
+    UEdGraphPin* LinkedPin = OverridePin.LinkedTo[0];
+    UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+    UEdGraph* Graph = LinkedNode ? LinkedNode->GetGraph() : nullptr;
+    if (!LinkedNode || !Graph)
+    {
+        OutError = TEXT("Linked override value node or graph is invalid");
+        return false;
+    }
+
+    const bool bIsSupportedOverrideValueNode =
+        LinkedNode->IsA<UNiagaraNodeInput>() ||
+        LinkedNode->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapGet"));
+    if (!bIsSupportedOverrideValueNode)
+    {
+        OutError = FString::Printf(
+            TEXT("Existing override value node '%s' is not a direct Niagara data input or parameter-map-get node; refusing to rewrite an unsupported graph shape"),
+            *LinkedNode->GetName());
+        return false;
+    }
+    if (LinkedPin->LinkedTo.Num() != 1 || LinkedPin->LinkedTo[0] != &OverridePin)
+    {
+        OutError = FString::Printf(
+            TEXT("Existing override value node '%s' output is shared by multiple graph links; refusing to remove it"),
+            *LinkedNode->GetName());
+        return false;
+    }
+    for (const UEdGraphPin* Pin : LinkedNode->Pins)
+    {
+        if (!Pin || Pin == LinkedPin || Pin->Direction != EGPD_Output)
+        {
+            continue;
+        }
+        if (Pin->LinkedTo.Num() > 0)
+        {
+            OutError = FString::Printf(
+                TEXT("Existing override value node '%s' has additional linked outputs; refusing to remove it"),
+                *LinkedNode->GetName());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool ClearLinkedNiagaraDataInterfaceInputNode(UEdGraphPin& OverridePin, FString& OutError)
+{
+    if (!ValidateLinkedNiagaraDataInterfaceInputNode(OverridePin, OutError))
+    {
+        return false;
+    }
+
+    if (OverridePin.LinkedTo.Num() == 0)
+    {
+        return true;
+    }
+
+    UEdGraphPin* LinkedPin = OverridePin.LinkedTo[0];
+    UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+    UEdGraph* Graph = LinkedNode ? LinkedNode->GetGraph() : nullptr;
+    if (!LinkedNode || !Graph)
+    {
+        OutError = TEXT("Linked override value node or graph is invalid");
+        return false;
+    }
+
+    Graph->Modify();
+    LinkedNode->Modify();
+    OverridePin.BreakAllPinLinks(true);
+    Graph->RemoveNode(LinkedNode);
+    return true;
 }
 
 TSharedPtr<FJsonObject> BuildResolvedStackInputJson(
@@ -1704,6 +2116,8 @@ TSharedPtr<FJsonObject> BuildInputNodeJson(const UNiagaraNodeInput* InputNode)
     InputObject->SetBoolField(TEXT("is_required"), InputNode->IsRequired());
     InputObject->SetBoolField(TEXT("is_hidden"), InputNode->IsHidden());
     InputObject->SetBoolField(TEXT("can_auto_bind"), InputNode->CanAutoBind());
+    InputObject->SetObjectField(TEXT("object_asset"), BuildRenderTargetObjectJson(GetObjectPropertyForInspection(InputNode, TEXT("ObjectAsset"))));
+    InputObject->SetObjectField(TEXT("data_interface"), BuildDataInterfaceInspectionJson(Cast<UNiagaraDataInterface>(GetObjectPropertyForInspection(InputNode, TEXT("DataInterface")))));
     InputObject->SetArrayField(TEXT("control_hints"), StringsToJson(BuildNiagaraControlHints(InputNode->Input.GetName().ToString())));
     return InputObject;
 }
@@ -1722,6 +2136,189 @@ TSharedPtr<FJsonObject> BuildOutputNodeJson(const UNiagaraNodeOutput* OutputNode
     OutputObject->SetStringField(TEXT("usage_id"), OutputNode->GetUsageId().ToString(EGuidFormats::DigitsWithHyphens));
     OutputObject->SetArrayField(TEXT("outputs"), NiagaraVariablesToJson(OutputNode->GetOutputs()));
     return OutputObject;
+}
+
+TSharedPtr<FJsonObject> BuildUObjectReferenceJson(const UObject* Object)
+{
+    TSharedPtr<FJsonObject> ObjectJson = MakeShared<FJsonObject>();
+    ObjectJson->SetBoolField(TEXT("is_valid"), Object != nullptr);
+    if (!Object)
+    {
+        return ObjectJson;
+    }
+
+    ObjectJson->SetStringField(TEXT("name"), Object->GetName());
+    ObjectJson->SetStringField(TEXT("path"), Object->GetPathName());
+    ObjectJson->SetStringField(TEXT("class"), Object->GetClass() ? Object->GetClass()->GetName() : FString());
+    ObjectJson->SetStringField(TEXT("class_path"), Object->GetClass() ? Object->GetClass()->GetPathName() : FString());
+    ObjectJson->SetStringField(TEXT("outer_path"), Object->GetOuter() ? Object->GetOuter()->GetPathName() : FString());
+    return ObjectJson;
+}
+
+TSharedPtr<FJsonObject> BuildRenderTargetObjectJson(const UObject* Object)
+{
+    TSharedPtr<FJsonObject> ObjectJson = BuildUObjectReferenceJson(Object);
+    const UTextureRenderTarget* RenderTarget = Cast<UTextureRenderTarget>(Object);
+    ObjectJson->SetBoolField(TEXT("is_texture_render_target"), RenderTarget != nullptr);
+    if (RenderTarget)
+    {
+        ObjectJson->SetNumberField(TEXT("target_gamma"), RenderTarget->TargetGamma);
+        ObjectJson->SetBoolField(TEXT("can_create_uav"), RenderTarget->bCanCreateUAV != 0);
+        ObjectJson->SetBoolField(TEXT("needs_two_copies"), RenderTarget->bNeedsTwoCopies != 0);
+    }
+
+    const UTextureRenderTarget2D* RenderTarget2D = Cast<UTextureRenderTarget2D>(Object);
+    ObjectJson->SetBoolField(TEXT("is_texture_render_target_2d"), RenderTarget2D != nullptr);
+    if (RenderTarget2D)
+    {
+        ObjectJson->SetNumberField(TEXT("size_x"), RenderTarget2D->SizeX);
+        ObjectJson->SetNumberField(TEXT("size_y"), RenderTarget2D->SizeY);
+        ObjectJson->SetStringField(TEXT("render_target_format"), TextureRenderTargetFormatName(RenderTarget2D->RenderTargetFormat));
+
+        TArray<TSharedPtr<FJsonValue>> ClearColorValues;
+        ClearColorValues.Add(MakeShared<FJsonValueNumber>(RenderTarget2D->ClearColor.R));
+        ClearColorValues.Add(MakeShared<FJsonValueNumber>(RenderTarget2D->ClearColor.G));
+        ClearColorValues.Add(MakeShared<FJsonValueNumber>(RenderTarget2D->ClearColor.B));
+        ClearColorValues.Add(MakeShared<FJsonValueNumber>(RenderTarget2D->ClearColor.A));
+        ObjectJson->SetArrayField(TEXT("clear_color"), ClearColorValues);
+    }
+    return ObjectJson;
+}
+
+const UObject* GetObjectPropertyForInspection(const UObject* Object, const FName PropertyName)
+{
+    const FObjectPropertyBase* Property = Object
+        ? FindFProperty<FObjectPropertyBase>(Object->GetClass(), PropertyName)
+        : nullptr;
+    return Property ? Property->GetObjectPropertyValue_InContainer(Object) : nullptr;
+}
+
+TSharedPtr<FJsonObject> BuildObjectPropertySnapshotJson(const UObject* Object, int32 MaxProperties = 120)
+{
+    TSharedPtr<FJsonObject> SnapshotJson = MakeShared<FJsonObject>();
+    TArray<TSharedPtr<FJsonValue>> PropertyValues;
+    int32 PropertyCount = 0;
+    const int32 SafeMaxProperties = FMath::Clamp(MaxProperties, 0, 500);
+
+    if (Object)
+    {
+        for (TFieldIterator<FProperty> It(Object->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
+        {
+            const FProperty* Property = *It;
+            if (!Property)
+            {
+                continue;
+            }
+
+            ++PropertyCount;
+            if (PropertyValues.Num() >= SafeMaxProperties)
+            {
+                continue;
+            }
+
+            FString ValueText;
+            Property->ExportText_InContainer(0, ValueText, Object, Object, const_cast<UObject*>(Object), PPF_None);
+
+            TSharedPtr<FJsonObject> PropertyJson = MakeShared<FJsonObject>();
+            PropertyJson->SetStringField(TEXT("name"), Property->GetName());
+            PropertyJson->SetStringField(TEXT("cpp_type"), Property->GetCPPType());
+            PropertyJson->SetStringField(TEXT("value"), ValueText);
+            PropertyJson->SetBoolField(TEXT("is_transient"), Property->HasAnyPropertyFlags(CPF_Transient));
+            PropertyJson->SetBoolField(TEXT("is_editable"), Property->HasAnyPropertyFlags(CPF_Edit));
+            PropertyValues.Add(MakeShared<FJsonValueObject>(PropertyJson));
+        }
+    }
+
+    SnapshotJson->SetNumberField(TEXT("property_count"), PropertyCount);
+    SnapshotJson->SetBoolField(TEXT("properties_truncated"), PropertyCount > PropertyValues.Num());
+    SnapshotJson->SetArrayField(TEXT("properties"), PropertyValues);
+    return SnapshotJson;
+}
+
+TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(const UNiagaraDataInterface* DataInterface, UNiagaraSystem* System)
+{
+    TSharedPtr<FJsonObject> DataInterfaceJson = BuildUObjectReferenceJson(DataInterface);
+    DataInterfaceJson->SetBoolField(TEXT("is_data_interface"), DataInterface != nullptr);
+    DataInterfaceJson->SetBoolField(TEXT("is_render_target_2d_data_interface"), DataInterface && DataInterface->IsA<UNiagaraDataInterfaceRenderTarget2D>());
+    DataInterfaceJson->SetObjectField(TEXT("properties"), BuildObjectPropertySnapshotJson(DataInterface));
+
+    const UNiagaraDataInterfaceRenderTarget2D* RenderTargetDataInterface = Cast<UNiagaraDataInterfaceRenderTarget2D>(DataInterface);
+    if (RenderTargetDataInterface)
+    {
+        const FNiagaraVariable& UserParameter = RenderTargetDataInterface->RenderTargetUserParameter.Parameter;
+        DataInterfaceJson->SetBoolField(TEXT("inherit_user_parameter_settings"), RenderTargetDataInterface->bInheritUserParameterSettings);
+        DataInterfaceJson->SetObjectField(TEXT("render_target_user_parameter"), NiagaraVariableToJsonObject(UserParameter));
+        DataInterfaceJson->SetStringField(TEXT("render_target_user_parameter_name"), UserParameter.GetName().ToString());
+        DataInterfaceJson->SetBoolField(TEXT("has_render_target_user_parameter"), UserParameter.IsValid());
+
+        const UObject* UserParameterObject = nullptr;
+        if (System && UserParameter.IsValid())
+        {
+            UserParameterObject = System->GetExposedParameters().GetUObject(UserParameter).Get();
+        }
+        DataInterfaceJson->SetObjectField(TEXT("user_parameter_object"), BuildRenderTargetObjectJson(UserParameterObject));
+    }
+    return DataInterfaceJson;
+}
+
+TSharedPtr<FJsonObject> BuildNiagaraDataInterfaceOverrideJson(
+    const UEdGraphPin* OverridePin,
+    UNiagaraSystem* System)
+{
+    TSharedPtr<FJsonObject> OverrideJson = MakeShared<FJsonObject>();
+    OverrideJson->SetBoolField(TEXT("has_override_pin"), OverridePin != nullptr);
+    if (!OverridePin)
+    {
+        OverrideJson->SetNumberField(TEXT("link_count"), 0);
+        return OverrideJson;
+    }
+
+    OverrideJson->SetStringField(TEXT("pin_name"), OverridePin->PinName.ToString());
+    OverrideJson->SetStringField(TEXT("pin_type_category"), OverridePin->PinType.PinCategory.ToString());
+    OverrideJson->SetStringField(TEXT("default_value"), OverridePin->DefaultValue);
+    OverrideJson->SetStringField(TEXT("default_object"), NiagaraObjectPathOrEmpty(OverridePin->DefaultObject));
+    OverrideJson->SetNumberField(TEXT("link_count"), OverridePin->LinkedTo.Num());
+
+    if (OverridePin->LinkedTo.Num() != 1)
+    {
+        OverrideJson->SetBoolField(TEXT("has_single_linked_value"), false);
+        return OverrideJson;
+    }
+
+    OverrideJson->SetBoolField(TEXT("has_single_linked_value"), true);
+
+    const UEdGraphPin* LinkedPin = OverridePin->LinkedTo[0];
+    const UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+    TSharedPtr<FJsonObject> LinkedNodeJson = MakeShared<FJsonObject>();
+    LinkedNodeJson->SetBoolField(TEXT("is_valid"), LinkedNode != nullptr);
+    if (LinkedNode)
+    {
+        LinkedNodeJson->SetStringField(TEXT("node_name"), LinkedNode->GetName());
+        LinkedNodeJson->SetStringField(TEXT("node_guid"), LinkedNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+        LinkedNodeJson->SetStringField(TEXT("node_class"), LinkedNode->GetClass() ? LinkedNode->GetClass()->GetName() : FString());
+        LinkedNodeJson->SetStringField(TEXT("node_class_path"), LinkedNode->GetClass() ? LinkedNode->GetClass()->GetPathName() : FString());
+    }
+    if (LinkedPin)
+    {
+        LinkedNodeJson->SetStringField(TEXT("linked_pin_name"), LinkedPin->PinName.ToString());
+        LinkedNodeJson->SetStringField(TEXT("linked_pin_type_category"), LinkedPin->PinType.PinCategory.ToString());
+        LinkedNodeJson->SetNumberField(TEXT("linked_pin_link_count"), LinkedPin->LinkedTo.Num());
+    }
+    OverrideJson->SetObjectField(TEXT("linked_node"), LinkedNodeJson);
+
+    const UNiagaraNodeInput* InputNode = Cast<UNiagaraNodeInput>(LinkedNode);
+    OverrideJson->SetBoolField(TEXT("linked_node_is_input_node"), InputNode != nullptr);
+    if (!InputNode)
+    {
+        return OverrideJson;
+    }
+
+    OverrideJson->SetObjectField(TEXT("input_node"), BuildInputNodeJson(InputNode));
+    OverrideJson->SetObjectField(TEXT("object_asset"), BuildRenderTargetObjectJson(GetObjectPropertyForInspection(InputNode, TEXT("ObjectAsset"))));
+
+    const UNiagaraDataInterface* DataInterface = Cast<UNiagaraDataInterface>(GetObjectPropertyForInspection(InputNode, TEXT("DataInterface")));
+    OverrideJson->SetObjectField(TEXT("data_interface"), BuildDataInterfaceInspectionJson(DataInterface, System));
+    return OverrideJson;
 }
 
 TSharedPtr<FJsonObject> BuildGraphAnalysisJson(
@@ -1985,6 +2582,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCommand(const FString& 
     {
         return HandleInspectNiagaraCompileStatus(Params);
     }
+    if (CommandType == TEXT("inspect_niagara_simulation_stages"))
+    {
+        return HandleInspectNiagaraSimulationStages(Params);
+    }
     if (CommandType == TEXT("inspect_niagara_scratch_pad_interface"))
     {
         return HandleInspectNiagaraScratchPadInterface(Params);
@@ -2005,9 +2606,17 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCommand(const FString& 
     {
         return HandleInspectNiagaraModuleInputs(Params);
     }
+    if (CommandType == TEXT("inspect_niagara_data_interface_overrides"))
+    {
+        return HandleInspectNiagaraDataInterfaceOverrides(Params);
+    }
     if (CommandType == TEXT("create_niagara_module_input_override"))
     {
         return HandleCreateNiagaraModuleInputOverride(Params);
+    }
+    if (CommandType == TEXT("set_niagara_render_target2d_module_input"))
+    {
+        return HandleSetNiagaraRenderTarget2DModuleInput(Params);
     }
     if (CommandType == TEXT("set_niagara_module_inputs_batch"))
     {
@@ -2745,6 +3354,171 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraCompileSt
     Result->SetBoolField(TEXT("has_errors"), ErrorCount > 0);
     Result->SetBoolField(TEXT("has_warnings"), WarningCount > 0);
     Result->SetArrayField(TEXT("scripts"), ScriptValues);
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraSimulationStages(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bIncludeCompileData = true;
+    Params->TryGetBoolField(TEXT("include_compile_data"), bIncludeCompileData);
+
+    bool bIncludeScriptCompileStatus = true;
+    Params->TryGetBoolField(TEXT("include_script_compile_status"), bIncludeScriptCompileStatus);
+
+    int32 MaxStages = 128;
+    Params->TryGetNumberField(TEXT("max_stages"), MaxStages);
+    MaxStages = FMath::Clamp(MaxStages, 0, 1024);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> EmitterValues;
+    int32 TotalStageCount = 0;
+    int32 IncludedStageCount = 0;
+    bool bStagesTruncated = false;
+
+    int32 EmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        TSharedPtr<FJsonObject> EmitterObject = MakeShared<FJsonObject>();
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        EmitterObject->SetStringField(TEXT("name"), EmitterName);
+        EmitterObject->SetNumberField(TEXT("emitter_index"), EmitterIndex);
+        EmitterObject->SetBoolField(TEXT("enabled"), EmitterHandle.GetIsEnabled());
+
+        TArray<TSharedPtr<FJsonValue>> StageValues;
+        if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+        {
+            EmitterObject->SetStringField(TEXT("sim_target"), NiagaraEnumValueName(EmitterData->SimTarget));
+            const TArray<UNiagaraSimulationStageBase*>& SimulationStages = EmitterData->GetSimulationStages();
+            EmitterObject->SetNumberField(TEXT("simulation_stage_count"), SimulationStages.Num());
+            TotalStageCount += SimulationStages.Num();
+
+            for (int32 StageIndex = 0; StageIndex < SimulationStages.Num(); ++StageIndex)
+            {
+                UNiagaraSimulationStageBase* Stage = SimulationStages[StageIndex];
+                if (!Stage)
+                {
+                    continue;
+                }
+                if (IncludedStageCount >= MaxStages)
+                {
+                    bStagesTruncated = true;
+                    break;
+                }
+
+                TSharedPtr<FJsonObject> StageObject = MakeShared<FJsonObject>();
+                StageObject->SetNumberField(TEXT("stage_index"), StageIndex);
+                StageObject->SetStringField(TEXT("stage_name"), Stage->SimulationStageName.ToString());
+                StageObject->SetStringField(TEXT("stage_path"), Stage->GetPathName());
+                StageObject->SetStringField(TEXT("stage_class"), Stage->GetClass() ? Stage->GetClass()->GetName() : FString());
+                StageObject->SetBoolField(TEXT("enabled"), Stage->bEnabled != 0);
+                StageObject->SetStringField(TEXT("script_path"), Stage->Script ? Stage->Script->GetPathName() : FString());
+
+                if (bIncludeScriptCompileStatus)
+                {
+                    StageObject->SetObjectField(
+                        TEXT("script_compile_status"),
+                        BuildNiagaraScriptCompileStatusJson(
+                            Stage->Script,
+                            FString::Printf(TEXT("emitter:%d:stage:%d"), EmitterIndex, StageIndex),
+                            EmitterName,
+                            StageIndex));
+                }
+
+                if (UNiagaraSimulationStageGeneric* GenericStage = Cast<UNiagaraSimulationStageGeneric>(Stage))
+                {
+                    StageObject->SetBoolField(TEXT("is_generic_stage"), true);
+                    StageObject->SetStringField(TEXT("iteration_source"), NiagaraEnumValueName(GenericStage->IterationSource));
+                    StageObject->SetStringField(TEXT("execute_behavior"), NiagaraEnumValueName(GenericStage->ExecuteBehavior));
+                    StageObject->SetBoolField(TEXT("disable_partial_particle_update"), GenericStage->bDisablePartialParticleUpdate != 0);
+                    StageObject->SetBoolField(TEXT("particle_iteration_state_enabled"), GenericStage->bParticleIterationStateEnabled != 0);
+                    StageObject->SetArrayField(TEXT("particle_iteration_state_range"), IntArrayToJsonValues({
+                        GenericStage->ParticleIterationStateRange.X,
+                        GenericStage->ParticleIterationStateRange.Y
+                    }));
+                    StageObject->SetBoolField(TEXT("gpu_dispatch_force_linear"), GenericStage->bGpuDispatchForceLinear != 0);
+                    StageObject->SetBoolField(TEXT("override_gpu_dispatch_num_threads"), GenericStage->bOverrideGpuDispatchNumThreads != 0);
+                    StageObject->SetStringField(TEXT("direct_dispatch_type"), NiagaraEnumValueName(GenericStage->DirectDispatchType));
+                    StageObject->SetStringField(TEXT("direct_dispatch_element_type"), NiagaraEnumValueName(GenericStage->DirectDispatchElementType));
+
+                    StageObject->SetObjectField(TEXT("enabled_binding"), NiagaraAttributeBindingToJsonObject(GenericStage->EnabledBinding));
+                    StageObject->SetObjectField(TEXT("data_interface"), NiagaraDataInterfaceBindingToJsonObject(GenericStage->DataInterface));
+                    StageObject->SetObjectField(TEXT("particle_iteration_state_binding"), NiagaraAttributeBindingToJsonObject(GenericStage->ParticleIterationStateBinding));
+                    StageObject->SetObjectField(TEXT("num_iterations"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->NumIterations));
+                    StageObject->SetObjectField(TEXT("element_count_x"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->ElementCountX));
+                    StageObject->SetObjectField(TEXT("element_count_y"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->ElementCountY));
+                    StageObject->SetObjectField(TEXT("element_count_z"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->ElementCountZ));
+                    StageObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_x"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->OverrideGpuDispatchNumThreadsX));
+                    StageObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_y"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->OverrideGpuDispatchNumThreadsY));
+                    StageObject->SetObjectField(TEXT("override_gpu_dispatch_num_threads_z"), NiagaraParameterBindingWithValueToJsonObject(GenericStage->OverrideGpuDispatchNumThreadsZ));
+
+#if WITH_EDITORONLY_DATA
+                    if (bIncludeCompileData)
+                    {
+                        TArray<FNiagaraSimulationStageCompilationData> CompilationData;
+                        const bool bFilledCompilationData = GenericStage->FillCompilationData(CompilationData);
+                        TArray<TSharedPtr<FJsonValue>> CompileDataValues;
+                        for (const FNiagaraSimulationStageCompilationData& CompileData : CompilationData)
+                        {
+                            CompileDataValues.Add(MakeShared<FJsonValueObject>(NiagaraSimStageCompileDataToJsonObject(CompileData)));
+                        }
+                        StageObject->SetBoolField(TEXT("filled_compile_data"), bFilledCompilationData);
+                        StageObject->SetNumberField(TEXT("compile_data_count"), CompileDataValues.Num());
+                        StageObject->SetArrayField(TEXT("compile_data"), CompileDataValues);
+                    }
+#else
+                    StageObject->SetBoolField(TEXT("compile_data_unavailable"), bIncludeCompileData);
+#endif
+                }
+                else
+                {
+                    StageObject->SetBoolField(TEXT("is_generic_stage"), false);
+                    StageObject->SetStringField(TEXT("inspection_note"), TEXT("Only generic simulation-stage fields are expanded"));
+                }
+
+                StageValues.Add(MakeShared<FJsonValueObject>(StageObject));
+                ++IncludedStageCount;
+            }
+        }
+        else
+        {
+            EmitterObject->SetNumberField(TEXT("simulation_stage_count"), 0);
+            EmitterObject->SetStringField(TEXT("inspection_error"), TEXT("Emitter data unavailable"));
+        }
+
+        EmitterObject->SetArrayField(TEXT("simulation_stages"), StageValues);
+        EmitterObject->SetNumberField(TEXT("included_simulation_stage_count"), StageValues.Num());
+        EmitterValues.Add(MakeShared<FJsonValueObject>(EmitterObject));
+        ++EmitterIndex;
+
+        if (bStagesTruncated)
+        {
+            break;
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetBoolField(TEXT("read_only"), true);
+    Result->SetBoolField(TEXT("include_compile_data"), bIncludeCompileData);
+    Result->SetBoolField(TEXT("include_script_compile_status"), bIncludeScriptCompileStatus);
+    Result->SetNumberField(TEXT("max_stages"), MaxStages);
+    Result->SetNumberField(TEXT("emitter_count"), System->GetEmitterHandles().Num());
+    Result->SetNumberField(TEXT("simulation_stage_count"), TotalStageCount);
+    Result->SetNumberField(TEXT("included_simulation_stage_count"), IncludedStageCount);
+    Result->SetBoolField(TEXT("stages_truncated"), bStagesTruncated);
+    Result->SetArrayField(TEXT("emitters"), EmitterValues);
     return Result;
 }
 
@@ -4069,6 +4843,219 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraModuleInp
     return Result;
 }
 
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraDataInterfaceOverrides(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    FString TargetInputName;
+    Params->TryGetStringField(TEXT("input_name"), TargetInputName);
+
+    int32 TargetEmitterIndex = INDEX_NONE;
+    int32 TargetModuleIndex = INDEX_NONE;
+    FString TargetEmitterName;
+    FString TargetModuleName;
+    FString TargetModuleGuid;
+    Params->TryGetNumberField(TEXT("emitter_index"), TargetEmitterIndex);
+    Params->TryGetNumberField(TEXT("module_index"), TargetModuleIndex);
+    Params->TryGetStringField(TEXT("emitter_name"), TargetEmitterName);
+    Params->TryGetStringField(TEXT("module_name"), TargetModuleName);
+    Params->TryGetStringField(TEXT("module_node_guid"), TargetModuleGuid);
+
+    int32 MaxModules = 200;
+    Params->TryGetNumberField(TEXT("max_modules"), MaxModules);
+    MaxModules = FMath::Clamp(MaxModules, 0, 1000);
+
+    int32 MaxInputsPerModule = 64;
+    Params->TryGetNumberField(TEXT("max_inputs_per_module"), MaxInputsPerModule);
+    MaxInputsPerModule = FMath::Clamp(MaxInputsPerModule, 0, 200);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> EmitterValues;
+    int32 TotalScannedModuleCount = 0;
+    int32 TotalMatchedModuleCount = 0;
+    int32 TotalIncludedModuleCount = 0;
+    int32 TotalDataInterfaceInputCount = 0;
+    int32 TotalOverriddenInputCount = 0;
+
+    int32 CurrentEmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        const bool bEmitterMatches =
+            (TargetEmitterIndex == INDEX_NONE || TargetEmitterIndex == CurrentEmitterIndex) &&
+            (TargetEmitterName.IsEmpty() || TargetEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase));
+
+        if (!bEmitterMatches)
+        {
+            ++CurrentEmitterIndex;
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> EmitterObject = MakeShared<FJsonObject>();
+        EmitterObject->SetStringField(TEXT("name"), EmitterName);
+        EmitterObject->SetNumberField(TEXT("emitter_index"), CurrentEmitterIndex);
+        EmitterObject->SetBoolField(TEXT("enabled"), EmitterHandle.GetIsEnabled());
+
+        TArray<TSharedPtr<FJsonValue>> ModuleValues;
+        int32 EmitterScannedModuleCount = 0;
+        int32 EmitterMatchedModuleCount = 0;
+        int32 EmitterDataInterfaceInputCount = 0;
+        int32 EmitterOverriddenInputCount = 0;
+        bool bModulesTruncated = false;
+
+        if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+        {
+            const FVersionedNiagaraEmitter OwningEmitter = EmitterHandle.GetInstance();
+            const TArray<UNiagaraNodeFunctionCall*> FunctionCalls = CollectSortedNiagaraFunctionCalls(EmitterData->GraphSource);
+            EmitterScannedModuleCount = FunctionCalls.Num();
+            TotalScannedModuleCount += FunctionCalls.Num();
+
+            for (int32 ModuleIndex = 0; ModuleIndex < FunctionCalls.Num(); ++ModuleIndex)
+            {
+                UNiagaraNodeFunctionCall* FunctionCall = FunctionCalls[ModuleIndex];
+                if (!FunctionCall)
+                {
+                    continue;
+                }
+
+                FString FunctionName = FunctionCall->GetFunctionName();
+                if (FunctionName.IsEmpty())
+                {
+                    FunctionName = FunctionCall->Signature.GetNameString();
+                }
+                const FString FunctionGuid = FunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+                const bool bModuleMatches =
+                    (TargetModuleIndex == INDEX_NONE || TargetModuleIndex == ModuleIndex) &&
+                    (TargetModuleName.IsEmpty() || TargetModuleName.Equals(FunctionName, ESearchCase::IgnoreCase)) &&
+                    (TargetModuleGuid.IsEmpty() || TargetModuleGuid.Equals(FunctionGuid, ESearchCase::IgnoreCase));
+
+                if (!bModuleMatches)
+                {
+                    continue;
+                }
+
+                const ENiagaraScriptUsage OutputUsage = FNiagaraStackGraphUtilities::GetOutputNodeUsage(*FunctionCall);
+                FCompileConstantResolver ConstantResolver(OwningEmitter, OutputUsage, FunctionCall->DebugState);
+
+                TArray<FNiagaraVariable> InputVariables;
+                TSet<FNiagaraVariable> HiddenVariables;
+                FNiagaraStackGraphUtilities::GetStackFunctionInputs(
+                    *FunctionCall,
+                    InputVariables,
+                    HiddenVariables,
+                    ConstantResolver,
+                    FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly,
+                    true);
+
+                TArray<TSharedPtr<FJsonValue>> DataInterfaceInputValues;
+                int32 ModuleDataInterfaceInputCount = 0;
+                int32 ModuleOverriddenInputCount = 0;
+                bool bInputsTruncated = false;
+                for (const FNiagaraVariable& InputVariable : InputVariables)
+                {
+                    if (!InputVariable.GetType().IsDataInterface())
+                    {
+                        continue;
+                    }
+                    if (!TargetInputName.IsEmpty() && !NiagaraModuleInputNameMatches(InputVariable, TargetInputName))
+                    {
+                        continue;
+                    }
+
+                    ++ModuleDataInterfaceInputCount;
+                    ++EmitterDataInterfaceInputCount;
+                    ++TotalDataInterfaceInputCount;
+
+                    const FNiagaraParameterHandle AliasedInputHandle = BuildAliasedModuleParameterHandleForInput(FunctionCall, InputVariable);
+                    const UEdGraphPin* OverridePin = FindNiagaraStackFunctionInputOverridePin(FunctionCall, AliasedInputHandle);
+                    const int32 LinkCount = OverridePin ? OverridePin->LinkedTo.Num() : 0;
+                    if (LinkCount > 0)
+                    {
+                        ++ModuleOverriddenInputCount;
+                        ++EmitterOverriddenInputCount;
+                        ++TotalOverriddenInputCount;
+                    }
+
+                    if (DataInterfaceInputValues.Num() >= MaxInputsPerModule)
+                    {
+                        bInputsTruncated = true;
+                        continue;
+                    }
+
+                    TSharedPtr<FJsonObject> InputObject = MakeShared<FJsonObject>();
+                    InputObject->SetObjectField(TEXT("variable"), NiagaraVariableToJsonObject(InputVariable));
+                    InputObject->SetStringField(TEXT("input_name"), InputVariable.GetName().ToString());
+                    InputObject->SetStringField(TEXT("input_type"), NiagaraTypeName(InputVariable.GetType()));
+                    InputObject->SetBoolField(TEXT("is_hidden"), HiddenVariables.Contains(InputVariable));
+                    InputObject->SetStringField(TEXT("aliased_input_handle"), AliasedInputHandle.GetParameterHandleString().ToString());
+                    InputObject->SetBoolField(TEXT("has_override_pin"), OverridePin != nullptr);
+                    InputObject->SetNumberField(TEXT("override_link_count"), LinkCount);
+                    InputObject->SetObjectField(TEXT("override"), BuildNiagaraDataInterfaceOverrideJson(OverridePin, System));
+                    DataInterfaceInputValues.Add(MakeShared<FJsonValueObject>(InputObject));
+                }
+
+                if (ModuleDataInterfaceInputCount == 0)
+                {
+                    continue;
+                }
+
+                ++EmitterMatchedModuleCount;
+                ++TotalMatchedModuleCount;
+
+                if (ModuleValues.Num() >= MaxModules)
+                {
+                    bModulesTruncated = true;
+                    continue;
+                }
+
+                TSharedPtr<FJsonObject> ModuleObject = BuildFunctionCallJson(FunctionCall, ModuleIndex, false);
+                ModuleObject->SetStringField(TEXT("emitter_name"), EmitterName);
+                ModuleObject->SetNumberField(TEXT("emitter_index"), CurrentEmitterIndex);
+                ModuleObject->SetNumberField(TEXT("data_interface_input_count"), ModuleDataInterfaceInputCount);
+                ModuleObject->SetNumberField(TEXT("overridden_input_count"), ModuleOverriddenInputCount);
+                ModuleObject->SetBoolField(TEXT("data_interface_inputs_truncated"), bInputsTruncated);
+                ModuleObject->SetArrayField(TEXT("data_interface_inputs"), DataInterfaceInputValues);
+                ModuleValues.Add(MakeShared<FJsonValueObject>(ModuleObject));
+                ++TotalIncludedModuleCount;
+            }
+        }
+
+        EmitterObject->SetNumberField(TEXT("scanned_module_count"), EmitterScannedModuleCount);
+        EmitterObject->SetNumberField(TEXT("matched_module_count"), EmitterMatchedModuleCount);
+        EmitterObject->SetNumberField(TEXT("data_interface_input_count"), EmitterDataInterfaceInputCount);
+        EmitterObject->SetNumberField(TEXT("overridden_input_count"), EmitterOverriddenInputCount);
+        EmitterObject->SetBoolField(TEXT("modules_truncated"), bModulesTruncated);
+        EmitterObject->SetArrayField(TEXT("modules"), ModuleValues);
+        EmitterValues.Add(MakeShared<FJsonValueObject>(EmitterObject));
+
+        ++CurrentEmitterIndex;
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetBoolField(TEXT("read_only"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("input_name_filter"), TargetInputName);
+    Result->SetNumberField(TEXT("emitter_count"), System->GetEmitterHandles().Num());
+    Result->SetNumberField(TEXT("scanned_module_count"), TotalScannedModuleCount);
+    Result->SetNumberField(TEXT("matched_module_count"), TotalMatchedModuleCount);
+    Result->SetNumberField(TEXT("included_module_count"), TotalIncludedModuleCount);
+    Result->SetNumberField(TEXT("data_interface_input_count"), TotalDataInterfaceInputCount);
+    Result->SetNumberField(TEXT("overridden_input_count"), TotalOverriddenInputCount);
+    Result->SetStringField(TEXT("authoring_status"), TEXT("read_only; inspects Data Interface override graph nodes and user-parameter object bindings without compiling or saving"));
+    Result->SetArrayField(TEXT("emitters"), EmitterValues);
+    return Result;
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputValue(const TSharedPtr<FJsonObject>& Params)
 {
     FString SystemPath;
@@ -4502,6 +5489,324 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCreateNiagaraModuleInpu
     Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
     Result->SetBoolField(TEXT("saved"), bSaved);
     Result->SetStringField(TEXT("write_scope"), TEXT("new_or_explicitly_overwritten_rapid_iteration_parameter"));
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRenderTarget2DModuleInput(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SystemPath;
+    FString InputName;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("input_name"), InputName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'input_name' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara RenderTarget2D module input outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    FString UserParameterName = TEXT("User.RT_IF_Deform");
+    Params->TryGetStringField(TEXT("user_parameter_name"), UserParameterName);
+    UserParameterName.TrimStartAndEndInline();
+    if (UserParameterName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'user_parameter_name' cannot be empty"));
+    }
+    if (!UserParameterName.StartsWith(TEXT("User.")))
+    {
+        UserParameterName = FString::Printf(TEXT("User.%s"), *UserParameterName);
+    }
+
+    FString RenderTargetAssetPath;
+    Params->TryGetStringField(TEXT("render_target_asset_path"), RenderTargetAssetPath);
+    RenderTargetAssetPath.TrimStartAndEndInline();
+
+    bool bInheritUserParameterSettings = true;
+    Params->TryGetBoolField(TEXT("inherit_user_parameter_settings"), bInheritUserParameterSettings);
+
+    bool bOverwriteExisting = false;
+    Params->TryGetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    int32 TargetEmitterIndex = INDEX_NONE;
+    int32 TargetModuleIndex = INDEX_NONE;
+    FString TargetEmitterName;
+    FString TargetModuleName;
+    FString TargetModuleGuid;
+    Params->TryGetNumberField(TEXT("emitter_index"), TargetEmitterIndex);
+    Params->TryGetNumberField(TEXT("module_index"), TargetModuleIndex);
+    Params->TryGetStringField(TEXT("emitter_name"), TargetEmitterName);
+    Params->TryGetStringField(TEXT("module_name"), TargetModuleName);
+    Params->TryGetStringField(TEXT("module_node_guid"), TargetModuleGuid);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UTextureRenderTarget* RenderTargetAsset = nullptr;
+    if (!RenderTargetAssetPath.IsEmpty())
+    {
+        RenderTargetAsset = LoadObject<UTextureRenderTarget>(nullptr, *NormalizeNiagaraObjectPathForLoad(RenderTargetAssetPath));
+        if (!RenderTargetAsset)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load render target asset: %s"), *RenderTargetAssetPath));
+        }
+    }
+
+    UNiagaraNodeFunctionCall* MatchedFunctionCall = nullptr;
+    FVersionedNiagaraEmitterData* MatchedEmitterData = nullptr;
+    FVersionedNiagaraEmitter MatchedOwningEmitter;
+    FString MatchedEmitterName;
+    FString MatchedModuleName;
+    int32 MatchedEmitterIndex = INDEX_NONE;
+    int32 MatchedModuleIndex = INDEX_NONE;
+
+    int32 CurrentEmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        const bool bEmitterMatches =
+            (TargetEmitterIndex == INDEX_NONE || TargetEmitterIndex == CurrentEmitterIndex) &&
+            (TargetEmitterName.IsEmpty() || TargetEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase));
+
+        if (bEmitterMatches)
+        {
+            if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+            {
+                const TArray<UNiagaraNodeFunctionCall*> FunctionCalls = CollectSortedNiagaraFunctionCalls(EmitterData->GraphSource);
+                for (int32 ModuleIndex = 0; ModuleIndex < FunctionCalls.Num(); ++ModuleIndex)
+                {
+                    UNiagaraNodeFunctionCall* FunctionCall = FunctionCalls[ModuleIndex];
+                    if (!FunctionCall)
+                    {
+                        continue;
+                    }
+
+                    FString FunctionName = FunctionCall->GetFunctionName();
+                    if (FunctionName.IsEmpty())
+                    {
+                        FunctionName = FunctionCall->Signature.GetNameString();
+                    }
+                    const FString FunctionGuid = FunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+                    const bool bModuleMatches =
+                        (TargetModuleIndex == INDEX_NONE || TargetModuleIndex == ModuleIndex) &&
+                        (TargetModuleName.IsEmpty() || TargetModuleName.Equals(FunctionName, ESearchCase::IgnoreCase)) &&
+                        (TargetModuleGuid.IsEmpty() || TargetModuleGuid.Equals(FunctionGuid, ESearchCase::IgnoreCase));
+
+                    if (bModuleMatches)
+                    {
+                        MatchedFunctionCall = FunctionCall;
+                        MatchedEmitterData = EmitterData;
+                        MatchedOwningEmitter = EmitterHandle.GetInstance();
+                        MatchedEmitterName = EmitterName;
+                        MatchedModuleName = FunctionName;
+                        MatchedEmitterIndex = CurrentEmitterIndex;
+                        MatchedModuleIndex = ModuleIndex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (MatchedFunctionCall)
+        {
+            break;
+        }
+        ++CurrentEmitterIndex;
+    }
+
+    if (!MatchedFunctionCall || !MatchedEmitterData)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching Niagara module was found"));
+    }
+
+    const ENiagaraScriptUsage OutputUsage = FNiagaraStackGraphUtilities::GetOutputNodeUsage(*MatchedFunctionCall);
+    FCompileConstantResolver ConstantResolver(MatchedOwningEmitter, OutputUsage, MatchedFunctionCall->DebugState);
+    TArray<FNiagaraVariable> InputVariables;
+    TSet<FNiagaraVariable> HiddenVariables;
+    FNiagaraStackGraphUtilities::GetStackFunctionInputs(
+        *MatchedFunctionCall,
+        InputVariables,
+        HiddenVariables,
+        ConstantResolver,
+        FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly,
+        true);
+
+    FNiagaraVariable* MatchedInputVariable = InputVariables.FindByPredicate(
+        [&InputName](const FNiagaraVariable& Candidate)
+        {
+            return NiagaraModuleInputNameMatches(Candidate, InputName);
+        });
+
+    if (!MatchedInputVariable)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching module input was found: %s"), *InputName));
+    }
+
+    const FNiagaraTypeDefinition InputType = MatchedInputVariable->GetType();
+    UClass* InputDataInterfaceClass = InputType.GetClass();
+    if (!InputType.IsDataInterface() ||
+        !InputDataInterfaceClass ||
+        !InputDataInterfaceClass->IsChildOf(UNiagaraDataInterfaceRenderTarget2D::StaticClass()))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input '%s' is not a RenderTarget2D data interface. Actual type: %s"),
+                *MatchedInputVariable->GetName().ToString(),
+                *NiagaraTypeName(InputType)));
+    }
+
+    FNiagaraVariable UserRenderTargetParameter(FNiagaraTypeDefinition::GetUTextureRenderTargetDef(), FName(*UserParameterName));
+    FNiagaraUserRedirectionParameterStore& UserParameterStore = System->GetExposedParameters();
+
+    bool bUserParameterAlreadyExisted = false;
+    TArray<FNiagaraVariable> UserParameters;
+    UserParameterStore.GetUserParameters(UserParameters);
+    for (const FNiagaraVariable& Candidate : UserParameters)
+    {
+        if (NiagaraUserParameterNameMatches(Candidate, UserParameterName))
+        {
+            bUserParameterAlreadyExisted = true;
+            if (Candidate.GetType() != FNiagaraTypeDefinition::GetUTextureRenderTargetDef())
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Existing user parameter '%s' has incompatible type: %s"),
+                        *UserParameterName,
+                        *NiagaraTypeName(Candidate.GetType())));
+            }
+            break;
+        }
+    }
+
+    const FNiagaraParameterHandle AliasedInputHandle = BuildAliasedModuleParameterHandleForInput(MatchedFunctionCall, *MatchedInputVariable);
+
+    UEdGraphPin* ExistingOverridePin = FindNiagaraStackFunctionInputOverridePin(MatchedFunctionCall, AliasedInputHandle);
+    const int32 PreviousLinkCount = ExistingOverridePin ? ExistingOverridePin->LinkedTo.Num() : 0;
+    if (PreviousLinkCount > 0 && !bOverwriteExisting)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("RenderTarget2D module input override already exists for %s. Use overwrite_existing=true to replace it."),
+                *MatchedInputVariable->GetName().ToString()));
+    }
+    if (PreviousLinkCount > 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("RenderTarget2D module input override for %s has %d links; refusing to overwrite an unexpected graph shape."),
+                *MatchedInputVariable->GetName().ToString(),
+                PreviousLinkCount));
+    }
+    if (PreviousLinkCount == 1 && ExistingOverridePin)
+    {
+        FString ValidateError;
+        if (!ValidateLinkedNiagaraDataInterfaceInputNode(*ExistingOverridePin, ValidateError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ValidateError);
+        }
+    }
+
+    System->Modify();
+
+    if (!bUserParameterAlreadyExisted)
+    {
+        if (!UserParameterStore.AddParameter(UserRenderTargetParameter, true, true))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to add Niagara user parameter: %s"), *UserRenderTargetParameter.GetName().ToString()));
+        }
+    }
+
+    MatchedFunctionCall->Modify();
+
+    UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+        *MatchedFunctionCall,
+        AliasedInputHandle,
+        InputType,
+        FGuid(),
+        FGuid());
+
+    if (PreviousLinkCount == 1)
+    {
+        FString ClearError;
+        if (!ClearLinkedNiagaraDataInterfaceInputNode(OverridePin, ClearError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ClearError);
+        }
+    }
+
+    UNiagaraDataInterface* CreatedDataInterface = nullptr;
+    FNiagaraStackGraphUtilities::SetDataInterfaceValueForFunctionInput(
+        OverridePin,
+        UNiagaraDataInterfaceRenderTarget2D::StaticClass(),
+        AliasedInputHandle.GetParameterHandleString().ToString(),
+        CreatedDataInterface);
+
+    UNiagaraDataInterfaceRenderTarget2D* RenderTargetDataInterface = Cast<UNiagaraDataInterfaceRenderTarget2D>(CreatedDataInterface);
+    if (!RenderTargetDataInterface)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara RenderTarget2D data interface override"));
+    }
+
+    RenderTargetDataInterface->Modify();
+    RenderTargetDataInterface->bInheritUserParameterSettings = bInheritUserParameterSettings;
+    RenderTargetDataInterface->RenderTargetUserParameter.Parameter = UserRenderTargetParameter;
+    if (RenderTargetAsset)
+    {
+        UserParameterStore.SetUObject(RenderTargetAsset, UserRenderTargetParameter);
+    }
+
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after RenderTarget2D module input update"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("emitter_name"), MatchedEmitterName);
+    Result->SetNumberField(TEXT("emitter_index"), MatchedEmitterIndex);
+    Result->SetStringField(TEXT("module_name"), MatchedModuleName);
+    Result->SetStringField(TEXT("module_node_guid"), MatchedFunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("module_index"), MatchedModuleIndex);
+    Result->SetStringField(TEXT("input_name"), MatchedInputVariable->GetName().ToString());
+    Result->SetStringField(TEXT("input_type"), NiagaraTypeName(InputType));
+    Result->SetStringField(TEXT("aliased_input_handle"), AliasedInputHandle.GetParameterHandleString().ToString());
+    Result->SetStringField(TEXT("user_parameter_name"), UserRenderTargetParameter.GetName().ToString());
+    Result->SetBoolField(TEXT("user_parameter_created"), !bUserParameterAlreadyExisted);
+    Result->SetStringField(TEXT("render_target_asset"), RenderTargetAsset ? RenderTargetAsset->GetPathName() : FString());
+    Result->SetBoolField(TEXT("inherit_user_parameter_settings"), bInheritUserParameterSettings);
+    Result->SetStringField(TEXT("data_interface_class"), RenderTargetDataInterface->GetClass()->GetName());
+    Result->SetStringField(TEXT("data_interface_user_parameter_name"), RenderTargetDataInterface->RenderTargetUserParameter.Parameter.GetName().ToString());
+    Result->SetBoolField(TEXT("data_interface_inherit_user_parameter_settings"), RenderTargetDataInterface->bInheritUserParameterSettings);
+    Result->SetNumberField(TEXT("previous_override_link_count"), PreviousLinkCount);
+    Result->SetBoolField(TEXT("overwrote_existing"), PreviousLinkCount > 0);
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("render_target2d_data_interface_module_input"));
     return Result;
 }
 

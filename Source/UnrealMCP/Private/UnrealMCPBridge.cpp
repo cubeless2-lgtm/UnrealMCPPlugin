@@ -450,12 +450,15 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("inspect_niagara_stack") ||
                      CommandType == TEXT("inspect_niagara_graph") ||
                      CommandType == TEXT("inspect_niagara_compile_status") ||
+                     CommandType == TEXT("inspect_niagara_simulation_stages") ||
                      CommandType == TEXT("inspect_niagara_scratch_pad_interface") ||
                      CommandType == TEXT("duplicate_or_attach_emitter_from_source") ||
                      CommandType == TEXT("create_or_duplicate_scratch_pad_module") ||
                      CommandType == TEXT("add_scratch_pad_module_to_stack") ||
                      CommandType == TEXT("inspect_niagara_module_inputs") ||
+                     CommandType == TEXT("inspect_niagara_data_interface_overrides") ||
                      CommandType == TEXT("create_niagara_module_input_override") ||
+                     CommandType == TEXT("set_niagara_render_target2d_module_input") ||
                      CommandType == TEXT("set_niagara_module_inputs_batch") ||
                      CommandType == TEXT("set_niagara_module_input_value"))
             {

@@ -26,12 +26,15 @@ private:
     TSharedPtr<FJsonObject> HandleInspectNiagaraStack(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraGraph(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraCompileStatus(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleInspectNiagaraSimulationStages(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraScratchPadInterface(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleDuplicateOrAttachEmitterFromSource(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCreateOrDuplicateScratchPadModule(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAddScratchPadModuleToStack(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraModuleInputs(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleInspectNiagaraDataInterfaceOverrides(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCreateNiagaraModuleInputOverride(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetNiagaraRenderTarget2DModuleInput(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputsBatch(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputValue(const TSharedPtr<FJsonObject>& Params);
 
