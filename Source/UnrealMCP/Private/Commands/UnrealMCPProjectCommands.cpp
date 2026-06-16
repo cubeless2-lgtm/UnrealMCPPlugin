@@ -49,6 +49,7 @@
 #include "Materials/MaterialExpression.h"
 #include "Materials/MaterialExpressionComment.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionTextureBase.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialInstance.h"
@@ -3285,6 +3286,7 @@ void CopyFreshMaterialFunctionSettings(UMaterialFunction* SourceFunction, UMater
 
 bool CloneMaterialExpressionsIntoFreshGraph(UObject* SourceObject, UObject* TargetObject, FString& OutDetail)
 {
+    UMaterial* SourceMaterial = Cast<UMaterial>(SourceObject);
     UMaterial* TargetMaterial = Cast<UMaterial>(TargetObject);
     UMaterialFunction* TargetFunction = Cast<UMaterialFunction>(TargetObject);
     if (!SourceObject || !TargetObject || (!TargetMaterial && !TargetFunction))
@@ -3303,6 +3305,7 @@ bool CloneMaterialExpressionsIntoFreshGraph(UObject* SourceObject, UObject* Targ
 
     TargetCollection->Empty();
     TMap<UMaterialExpression*, UMaterialExpression*> SourceToTargetExpressionMap;
+    TMap<UObject*, UObject*> ExpressionReplacementMap;
 
     for (const TObjectPtr<UMaterialExpression>& SourceExpressionPtr : SourceCollection->Expressions)
     {
@@ -3337,6 +3340,7 @@ bool CloneMaterialExpressionsIntoFreshGraph(UObject* SourceObject, UObject* Targ
         NewExpression->Function = TargetFunction;
         TargetCollection->AddExpression(NewExpression);
         SourceToTargetExpressionMap.Add(SourceExpression, NewExpression);
+        ExpressionReplacementMap.Add(SourceExpression, NewExpression);
     }
 
     for (const TObjectPtr<UMaterialExpression>& TargetExpressionPtr : TargetCollection->Expressions)
@@ -3358,6 +3362,48 @@ bool CloneMaterialExpressionsIntoFreshGraph(UObject* SourceObject, UObject* Targ
                 else if (InputExpression->IsIn(SourceObject))
                 {
                     It->Expression = nullptr;
+                }
+            }
+        }
+
+        if (UMaterialExpressionNamedRerouteUsage* NewNamedRerouteUsage = Cast<UMaterialExpressionNamedRerouteUsage>(NewExpression))
+        {
+            UMaterialExpressionNamedRerouteDeclaration* SourceDeclaration = NewNamedRerouteUsage->Declaration;
+            if (SourceDeclaration)
+            {
+                if (UMaterialExpression** NewDeclaration = SourceToTargetExpressionMap.Find(SourceDeclaration))
+                {
+                    NewNamedRerouteUsage->Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(*NewDeclaration);
+                }
+                else if (SourceDeclaration->IsIn(SourceObject))
+                {
+                    NewNamedRerouteUsage->Declaration = nullptr;
+                }
+            }
+        }
+    }
+
+    if (SourceMaterial && TargetMaterial)
+    {
+        for (int32 PropertyIndex = 0; PropertyIndex < static_cast<int32>(MP_MAX); ++PropertyIndex)
+        {
+            FExpressionInput* SourceInput = SourceMaterial->GetExpressionInputForProperty(static_cast<EMaterialProperty>(PropertyIndex));
+            FExpressionInput* TargetInput = TargetMaterial->GetExpressionInputForProperty(static_cast<EMaterialProperty>(PropertyIndex));
+            if (!SourceInput || !TargetInput)
+            {
+                continue;
+            }
+
+            *TargetInput = *SourceInput;
+            if (TargetInput->Expression)
+            {
+                if (UMaterialExpression** NewInputExpression = SourceToTargetExpressionMap.Find(TargetInput->Expression))
+                {
+                    TargetInput->Expression = *NewInputExpression;
+                }
+                else if (TargetInput->Expression->IsIn(SourceObject))
+                {
+                    TargetInput->Expression = nullptr;
                 }
             }
         }
@@ -3387,6 +3433,20 @@ bool CloneMaterialExpressionsIntoFreshGraph(UObject* SourceObject, UObject* Targ
         NewComment->Material = TargetMaterial;
         NewComment->Function = TargetFunction;
         TargetCollection->AddComment(NewComment);
+    }
+
+    if (ExpressionReplacementMap.Num() > 0)
+    {
+        TargetObject->Modify();
+        FArchiveReplaceObjectRef<UObject> ReplaceAr(
+            TargetObject,
+            ExpressionReplacementMap,
+            EArchiveReplaceObjectFlags::IgnoreOuterRef |
+            EArchiveReplaceObjectFlags::IgnoreArchetypeRef);
+        if (ReplaceAr.GetCount() > 0)
+        {
+            TargetObject->MarkPackageDirty();
+        }
     }
 
     return true;

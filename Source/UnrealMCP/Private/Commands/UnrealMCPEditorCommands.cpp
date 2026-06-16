@@ -209,8 +209,11 @@ namespace
 
         ViewportClient->Invalidate();
         Viewport->Invalidate();
-        for (int32 DrawIndex = 0; DrawIndex < FMath::Clamp(RedrawCount, 0, 3); ++DrawIndex)
+        const int32 ClampedRedrawCount = FMath::Clamp(RedrawCount, 0, 20);
+        for (int32 DrawIndex = 0; DrawIndex < ClampedRedrawCount; ++DrawIndex)
         {
+            ViewportClient->Invalidate();
+            Viewport->Invalidate();
             Viewport->Draw(false);
         }
 
@@ -247,7 +250,7 @@ namespace
         ResultObj->SetNumberField(TEXT("pixel_count"), Bitmap.Num());
         ResultObj->SetNumberField(TEXT("compressed_byte_count"), static_cast<double>(CompressedBitmap.Num()));
         ResultObj->SetNumberField(TEXT("file_size_bytes"), static_cast<double>(IFileManager::Get().FileSize(*FilePath)));
-        ResultObj->SetNumberField(TEXT("redraw_count"), FMath::Clamp(RedrawCount, 0, 3));
+        ResultObj->SetNumberField(TEXT("redraw_count"), FMath::Clamp(RedrawCount, 0, 20));
         ResultObj->SetArrayField(TEXT("view_location"), EditorVectorToJsonArray(ViewportClient->GetViewLocation()));
         ResultObj->SetArrayField(TEXT("view_rotation"), EditorRotatorToJsonArray(ViewportClient->GetViewRotation()));
         ResultObj->SetBoolField(TEXT("is_perspective"), ViewportClient->IsPerspective());

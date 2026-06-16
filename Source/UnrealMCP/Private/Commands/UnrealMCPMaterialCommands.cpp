@@ -2,12 +2,14 @@
 #include "Commands/UnrealMCPCommonUtils.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Containers/Ticker.h"
 #include "Dom/JsonValue.h"
 #include "Engine/Texture.h"
 #include "Engine/World.h"
 #include "Editor.h"
 #include "EditorAssetLibrary.h"
 #include "MaterialEditingLibrary.h"
+#include "MaterialCachedData.h"
 #include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpression.h"
@@ -16,6 +18,7 @@
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionConstant4Vector.h"
 #include "Materials/MaterialExpressionComposite.h"
+#include "Materials/MaterialExpressionCollectionParameter.h"
 #include "Materials/MaterialExpressionCustom.h"
 #include "Materials/MaterialExpressionExternalCodeBase.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
@@ -25,9 +28,11 @@
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionParameter.h"
 #include "Materials/MaterialExpressionRerouteBase.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionStaticBoolParameter.h"
 #include "Materials/MaterialExpressionTextureBase.h"
 #include "Materials/MaterialExpressionTextureSample.h"
+#include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialFunctionInterface.h"
 #include "Materials/MaterialInstanceConstant.h"
@@ -35,17 +40,41 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Materials/MaterialParameterCollectionInstance.h"
+#include "Misc/Guid.h"
 #include "Misc/PackageName.h"
 #include "Modules/ModuleManager.h"
 #include "RHIShaderPlatform.h"
 #include "SceneTypes.h"
+#include "Serialization/ArchiveReplaceObjectRef.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectHash.h"
 
 namespace
 {
+struct FMPCSyncState
+{
+    bool bEnabled = false;
+    FString SourceCollectionPath;
+    FString TargetCollectionPath;
+    TSet<FName> ParameterFilter;
+    float IntervalSeconds = 0.1f;
+    float AccumulatedSeconds = 0.0f;
+    FTSTicker::FDelegateHandle TickerHandle;
+    TWeakObjectPtr<UMaterialParameterCollection> SourceCollection;
+    TWeakObjectPtr<UMaterialParameterCollection> TargetCollection;
+    TArray<FName> ScalarParameterNames;
+    TArray<FName> VectorParameterNames;
+    uint64 TickCount = 0;
+    int32 LastScalarCount = 0;
+    int32 LastVectorCount = 0;
+    FString LastError;
+};
+
+static FMPCSyncState GMPCSyncState;
+
 struct FMaterialGraphTarget
 {
     UObject* Asset = nullptr;
@@ -890,6 +919,50 @@ bool SetObjectPropertyValue(UObject* Object, const FString& PropertyName, const 
     if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
     {
         const FString StructName = StructProperty->Struct ? StructProperty->Struct->GetName() : FString();
+        if (StructName == TEXT("Guid"))
+        {
+            if (!Value.IsValid() || Value->Type != EJson::String)
+            {
+                OutError = FString::Printf(TEXT("Guid property requires string value: %s"), *PropertyName);
+                return false;
+            }
+
+            FString GuidText = Value->AsString().TrimStartAndEnd();
+            FGuid ParsedGuid;
+            bool bParsedGuid = FGuid::Parse(GuidText, ParsedGuid);
+            if (!bParsedGuid)
+            {
+                GuidText.RemoveFromStart(TEXT("{"));
+                GuidText.RemoveFromEnd(TEXT("}"));
+                GuidText.ReplaceInline(TEXT("-"), TEXT(""));
+                if (GuidText.Len() == 32)
+                {
+                    TCHAR* EndPtr = nullptr;
+                    const uint64 A = FCString::Strtoui64(*GuidText.Mid(0, 8), &EndPtr, 16);
+                    bParsedGuid = EndPtr && *EndPtr == TEXT('\0');
+                    const uint64 B = FCString::Strtoui64(*GuidText.Mid(8, 8), &EndPtr, 16);
+                    bParsedGuid = bParsedGuid && EndPtr && *EndPtr == TEXT('\0');
+                    const uint64 C = FCString::Strtoui64(*GuidText.Mid(16, 8), &EndPtr, 16);
+                    bParsedGuid = bParsedGuid && EndPtr && *EndPtr == TEXT('\0');
+                    const uint64 D = FCString::Strtoui64(*GuidText.Mid(24, 8), &EndPtr, 16);
+                    bParsedGuid = bParsedGuid && EndPtr && *EndPtr == TEXT('\0') &&
+                        A <= MAX_uint32 && B <= MAX_uint32 && C <= MAX_uint32 && D <= MAX_uint32;
+                    if (bParsedGuid)
+                    {
+                        ParsedGuid = FGuid(static_cast<uint32>(A), static_cast<uint32>(B), static_cast<uint32>(C), static_cast<uint32>(D));
+                    }
+                }
+            }
+
+            if (!bParsedGuid)
+            {
+                OutError = FString::Printf(TEXT("Invalid Guid value for property %s: %s"), *PropertyName, *Value->AsString());
+                return false;
+            }
+
+            *static_cast<FGuid*>(PropertyAddr) = ParsedGuid;
+            return true;
+        }
         if ((Value.IsValid() && (Value->Type == EJson::Array || Value->Type == EJson::Object)) &&
             (StructName == TEXT("LinearColor") || StructName == TEXT("Color") ||
              StructName == TEXT("Vector") || StructName == TEXT("Vector2D") || StructName == TEXT("Vector4")))
@@ -2541,6 +2614,377 @@ TSet<FName> GetOptionalParameterNameFilter(const TSharedPtr<FJsonObject>& Params
     return ParameterFilter;
 }
 
+const FCollectionScalarParameter* FindScalarParameterForCollectionNode(const UMaterialExpressionCollectionParameter* CollectionParameter)
+{
+    if (!CollectionParameter || !CollectionParameter->Collection)
+    {
+        return nullptr;
+    }
+
+    UMaterialParameterCollection* Collection = CollectionParameter->Collection;
+    for (const FCollectionScalarParameter& ScalarParameter : Collection->ScalarParameters)
+    {
+        if (ScalarParameter.Id == CollectionParameter->ParameterId)
+        {
+            return &ScalarParameter;
+        }
+    }
+
+    const FName ParameterName = CollectionParameter->ParameterName;
+    const FCollectionScalarParameter* NameMatch = nullptr;
+    for (const FCollectionScalarParameter& ScalarParameter : Collection->ScalarParameters)
+    {
+        if (ScalarParameter.ParameterName == ParameterName)
+        {
+            NameMatch = &ScalarParameter;
+            break;
+        }
+    }
+
+    const bool bVectorHasSameName = Collection->VectorParameters.ContainsByPredicate([ParameterName](const FCollectionVectorParameter& VectorParameter)
+    {
+        return VectorParameter.ParameterName == ParameterName;
+    });
+    return bVectorHasSameName ? nullptr : NameMatch;
+}
+
+const FCollectionVectorParameter* FindVectorParameterForCollectionNode(const UMaterialExpressionCollectionParameter* CollectionParameter)
+{
+    if (!CollectionParameter || !CollectionParameter->Collection)
+    {
+        return nullptr;
+    }
+
+    UMaterialParameterCollection* Collection = CollectionParameter->Collection;
+    for (const FCollectionVectorParameter& VectorParameter : Collection->VectorParameters)
+    {
+        if (VectorParameter.Id == CollectionParameter->ParameterId)
+        {
+            return &VectorParameter;
+        }
+    }
+
+    const FName ParameterName = CollectionParameter->ParameterName;
+    const FCollectionVectorParameter* NameMatch = nullptr;
+    for (const FCollectionVectorParameter& VectorParameter : Collection->VectorParameters)
+    {
+        if (VectorParameter.ParameterName == ParameterName)
+        {
+            NameMatch = &VectorParameter;
+            break;
+        }
+    }
+
+    const bool bScalarHasSameName = Collection->ScalarParameters.ContainsByPredicate([ParameterName](const FCollectionScalarParameter& ScalarParameter)
+    {
+        return ScalarParameter.ParameterName == ParameterName;
+    });
+    return bScalarHasSameName ? nullptr : NameMatch;
+}
+
+void StopMaterialParameterCollectionSyncInternal()
+{
+    if (GMPCSyncState.TickerHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(GMPCSyncState.TickerHandle);
+        GMPCSyncState.TickerHandle.Reset();
+    }
+    GMPCSyncState.bEnabled = false;
+    GMPCSyncState.AccumulatedSeconds = 0.0f;
+    GMPCSyncState.SourceCollection.Reset();
+    GMPCSyncState.TargetCollection.Reset();
+    GMPCSyncState.ScalarParameterNames.Reset();
+    GMPCSyncState.VectorParameterNames.Reset();
+}
+
+bool CopyMaterialParameterCollectionValues(
+    const FString& SourceCollectionPath,
+    const FString& TargetCollectionPath,
+    const TSet<FName>& ParameterFilter,
+    const bool bSetAssetDefaults,
+    int32& OutScalarCount,
+    int32& OutVectorCount,
+    FString& OutError)
+{
+    OutScalarCount = 0;
+    OutVectorCount = 0;
+    OutError.Reset();
+
+    UMaterialParameterCollection* SourceCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(SourceCollectionPath));
+    UMaterialParameterCollection* TargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(TargetCollectionPath));
+    if (!SourceCollection)
+    {
+        OutError = FString::Printf(TEXT("Source Material Parameter Collection not found: %s"), *SourceCollectionPath);
+        return false;
+    }
+    if (!TargetCollection)
+    {
+        OutError = FString::Printf(TEXT("Target Material Parameter Collection not found: %s"), *TargetCollectionPath);
+        return false;
+    }
+
+    UWorld* World = GetEditorOrPIEWorld();
+    if (!World)
+    {
+        OutError = TEXT("No editor or PIE world is available for MPC runtime sync.");
+        return false;
+    }
+
+    UMaterialParameterCollectionInstance* SourceInstance = World->GetParameterCollectionInstance(SourceCollection);
+    UMaterialParameterCollectionInstance* TargetInstance = World->GetParameterCollectionInstance(TargetCollection);
+    if (!SourceInstance || !TargetInstance)
+    {
+        OutError = FString::Printf(
+            TEXT("Missing MPC runtime instance. Source instance: %s, target instance: %s"),
+            SourceInstance ? TEXT("true") : TEXT("false"),
+            TargetInstance ? TEXT("true") : TEXT("false"));
+        return false;
+    }
+
+    bool bAssetDefaultsChanged = false;
+    auto ModifyTargetCollectionForAssetDefaults = [&]()
+    {
+        if (!bAssetDefaultsChanged)
+        {
+            TargetCollection->Modify();
+            bAssetDefaultsChanged = true;
+        }
+    };
+
+    for (const FCollectionScalarParameter& SourceParameter : SourceCollection->ScalarParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+
+        FCollectionScalarParameter* TargetParameter = TargetCollection->ScalarParameters.FindByPredicate(
+            [&SourceParameter](const FCollectionScalarParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+        if (!TargetParameter)
+        {
+            continue;
+        }
+
+        float Value = SourceParameter.DefaultValue;
+        SourceInstance->GetScalarParameterValue(SourceParameter.ParameterName, Value);
+        if (TargetInstance->SetScalarParameterValue(SourceParameter.ParameterName, Value))
+        {
+            ++OutScalarCount;
+        }
+        if (bSetAssetDefaults && !FMath::IsNearlyEqual(TargetParameter->DefaultValue, Value))
+        {
+            ModifyTargetCollectionForAssetDefaults();
+            TargetParameter->DefaultValue = Value;
+        }
+    }
+
+    for (const FCollectionVectorParameter& SourceParameter : SourceCollection->VectorParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+
+        FCollectionVectorParameter* TargetParameter = TargetCollection->VectorParameters.FindByPredicate(
+            [&SourceParameter](const FCollectionVectorParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+        if (!TargetParameter)
+        {
+            continue;
+        }
+
+        FLinearColor Value = SourceParameter.DefaultValue;
+        SourceInstance->GetVectorParameterValue(SourceParameter.ParameterName, Value);
+        if (TargetInstance->SetVectorParameterValue(SourceParameter.ParameterName, Value))
+        {
+            ++OutVectorCount;
+        }
+        if (bSetAssetDefaults && !TargetParameter->DefaultValue.Equals(Value))
+        {
+            ModifyTargetCollectionForAssetDefaults();
+            TargetParameter->DefaultValue = Value;
+        }
+    }
+
+    if (bAssetDefaultsChanged)
+    {
+        TargetCollection->PostEditChange();
+        TargetCollection->MarkPackageDirty();
+    }
+
+    return true;
+}
+
+void BuildMaterialParameterCollectionSyncCache(
+    UMaterialParameterCollection* SourceCollection,
+    UMaterialParameterCollection* TargetCollection,
+    const TSet<FName>& ParameterFilter)
+{
+    GMPCSyncState.SourceCollection = SourceCollection;
+    GMPCSyncState.TargetCollection = TargetCollection;
+    GMPCSyncState.ScalarParameterNames.Reset();
+    GMPCSyncState.VectorParameterNames.Reset();
+
+    if (!SourceCollection || !TargetCollection)
+    {
+        return;
+    }
+
+    for (const FCollectionScalarParameter& SourceParameter : SourceCollection->ScalarParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+        const bool bTargetHasParameter = TargetCollection->ScalarParameters.ContainsByPredicate(
+            [&SourceParameter](const FCollectionScalarParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+        if (bTargetHasParameter)
+        {
+            GMPCSyncState.ScalarParameterNames.Add(SourceParameter.ParameterName);
+        }
+    }
+
+    for (const FCollectionVectorParameter& SourceParameter : SourceCollection->VectorParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+        const bool bTargetHasParameter = TargetCollection->VectorParameters.ContainsByPredicate(
+            [&SourceParameter](const FCollectionVectorParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+        if (bTargetHasParameter)
+        {
+            GMPCSyncState.VectorParameterNames.Add(SourceParameter.ParameterName);
+        }
+    }
+}
+
+bool CopyCachedMaterialParameterCollectionRuntimeValues(int32& OutScalarCount, int32& OutVectorCount, FString& OutError)
+{
+    OutScalarCount = 0;
+    OutVectorCount = 0;
+    OutError.Reset();
+
+    UMaterialParameterCollection* SourceCollection = GMPCSyncState.SourceCollection.Get();
+    UMaterialParameterCollection* TargetCollection = GMPCSyncState.TargetCollection.Get();
+    if (!SourceCollection)
+    {
+        SourceCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(GMPCSyncState.SourceCollectionPath));
+        GMPCSyncState.SourceCollection = SourceCollection;
+    }
+    if (!TargetCollection)
+    {
+        TargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(GMPCSyncState.TargetCollectionPath));
+        GMPCSyncState.TargetCollection = TargetCollection;
+    }
+
+    if (!SourceCollection || !TargetCollection)
+    {
+        OutError = TEXT("Cached MPC sync collections are no longer available.");
+        return false;
+    }
+
+    UWorld* World = GetEditorOrPIEWorld();
+    if (!World)
+    {
+        OutError = TEXT("No editor or PIE world is available for cached MPC runtime sync.");
+        return false;
+    }
+
+    UMaterialParameterCollectionInstance* SourceInstance = World->GetParameterCollectionInstance(SourceCollection);
+    UMaterialParameterCollectionInstance* TargetInstance = World->GetParameterCollectionInstance(TargetCollection);
+    if (!SourceInstance || !TargetInstance)
+    {
+        OutError = TEXT("Missing MPC runtime instance for cached sync.");
+        return false;
+    }
+
+    for (const FName& ParameterName : GMPCSyncState.ScalarParameterNames)
+    {
+        float Value = 0.0f;
+        if (!SourceInstance->GetScalarParameterValue(ParameterName, Value))
+        {
+            if (const FCollectionScalarParameter* SourceParameter = SourceCollection->ScalarParameters.FindByPredicate(
+                [ParameterName](const FCollectionScalarParameter& Candidate)
+                {
+                    return Candidate.ParameterName == ParameterName;
+                }))
+            {
+                Value = SourceParameter->DefaultValue;
+            }
+        }
+
+        if (TargetInstance->SetScalarParameterValue(ParameterName, Value))
+        {
+            ++OutScalarCount;
+        }
+    }
+
+    for (const FName& ParameterName : GMPCSyncState.VectorParameterNames)
+    {
+        FLinearColor Value = FLinearColor::Transparent;
+        if (!SourceInstance->GetVectorParameterValue(ParameterName, Value))
+        {
+            if (const FCollectionVectorParameter* SourceParameter = SourceCollection->VectorParameters.FindByPredicate(
+                [ParameterName](const FCollectionVectorParameter& Candidate)
+                {
+                    return Candidate.ParameterName == ParameterName;
+                }))
+            {
+                Value = SourceParameter->DefaultValue;
+            }
+        }
+
+        if (TargetInstance->SetVectorParameterValue(ParameterName, Value))
+        {
+            ++OutVectorCount;
+        }
+    }
+
+    return true;
+}
+
+bool TickMaterialParameterCollectionSync(float DeltaTime)
+{
+    if (!GMPCSyncState.bEnabled)
+    {
+        return false;
+    }
+
+    GMPCSyncState.AccumulatedSeconds += DeltaTime;
+    if (GMPCSyncState.AccumulatedSeconds < GMPCSyncState.IntervalSeconds)
+    {
+        return true;
+    }
+    GMPCSyncState.AccumulatedSeconds = 0.0f;
+
+    int32 ScalarCount = 0;
+    int32 VectorCount = 0;
+    FString Error;
+    const bool bSynced = CopyCachedMaterialParameterCollectionRuntimeValues(ScalarCount, VectorCount, Error);
+
+    GMPCSyncState.LastScalarCount = ScalarCount;
+    GMPCSyncState.LastVectorCount = VectorCount;
+    GMPCSyncState.LastError = Error;
+    if (bSynced)
+    {
+        ++GMPCSyncState.TickCount;
+    }
+
+    return GMPCSyncState.bEnabled;
+}
+
 struct FExpandedOutputReplacement
 {
     bool bValid = false;
@@ -3199,6 +3643,11 @@ FUnrealMCPMaterialCommands::FUnrealMCPMaterialCommands()
 {
 }
 
+void FUnrealMCPMaterialCommands::StopMaterialParameterCollectionSync()
+{
+    StopMaterialParameterCollectionSyncInternal();
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString& CommandType, const TSharedPtr<FJsonObject>& Params)
 {
     if (CommandType == TEXT("resolve_material_graph"))
@@ -3212,6 +3661,26 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString&
     if (CommandType == TEXT("analyze_material_graph"))
     {
         return HandleAnalyzeMaterialGraph(Params);
+    }
+    if (CommandType == TEXT("list_material_collection_parameter_nodes"))
+    {
+        return HandleListMaterialCollectionParameterNodes(Params);
+    }
+    if (CommandType == TEXT("mirror_material_parameter_collection"))
+    {
+        return HandleMirrorMaterialParameterCollection(Params);
+    }
+    if (CommandType == TEXT("replace_material_collection_references"))
+    {
+        return HandleReplaceMaterialCollectionReferences(Params);
+    }
+    if (CommandType == TEXT("replace_material_collection_parameters"))
+    {
+        return HandleReplaceMaterialCollectionParameters(Params);
+    }
+    if (CommandType == TEXT("replace_material_texture_references"))
+    {
+        return HandleReplaceMaterialTextureReferences(Params);
     }
     if (CommandType == TEXT("add_material_node"))
     {
@@ -3245,6 +3714,10 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString&
     {
         return HandleCompileAndSaveMaterial(Params);
     }
+    if (CommandType == TEXT("refresh_material_cached_expression_data"))
+    {
+        return HandleRefreshMaterialCachedExpressionData(Params);
+    }
     if (CommandType == TEXT("expand_material_function_calls"))
     {
         return HandleExpandMaterialFunctionCalls(Params);
@@ -3252,6 +3725,14 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCommand(const FString&
     if (CommandType == TEXT("get_material_parameter_collection_values"))
     {
         return HandleGetMaterialParameterCollectionValues(Params);
+    }
+    if (CommandType == TEXT("set_material_parameter_collection_values"))
+    {
+        return HandleSetMaterialParameterCollectionValues(Params);
+    }
+    if (CommandType == TEXT("set_material_parameter_collection_sync"))
+    {
+        return HandleSetMaterialParameterCollectionSync(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown material command: %s"), *CommandType));
@@ -3489,6 +3970,1062 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAnalyzeMaterialGraph(c
         ResultObj->SetObjectField(TEXT("usage_hints"), UsageHintsToJson(Target.Asset, MaxReferencers));
     }
 
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleListMaterialCollectionParameterNodes(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    FString GraphType;
+    Params->TryGetStringField(TEXT("graph_type"), GraphType);
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, GraphType, Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> Nodes;
+    int32 MismatchedIdCount = 0;
+    int32 MissingCollectionParameterCount = 0;
+
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.GetExpressions())
+    {
+        UMaterialExpressionCollectionParameter* CollectionParameter = Cast<UMaterialExpressionCollectionParameter>(ExpressionPtr.Get());
+        if (!CollectionParameter)
+        {
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+        NodeObj->SetStringField(TEXT("node_id"), GetExpressionId(CollectionParameter));
+        NodeObj->SetStringField(TEXT("node_name"), CollectionParameter->GetName());
+        NodeObj->SetStringField(TEXT("object_path"), CollectionParameter->GetPathName());
+        NodeObj->SetStringField(TEXT("parameter_name"), CollectionParameter->ParameterName.ToString());
+        NodeObj->SetStringField(TEXT("parameter_id"), CollectionParameter->ParameterId.ToString(EGuidFormats::DigitsWithHyphens));
+        NodeObj->SetNumberField(TEXT("x"), CollectionParameter->MaterialExpressionEditorX);
+        NodeObj->SetNumberField(TEXT("y"), CollectionParameter->MaterialExpressionEditorY);
+
+        UMaterialParameterCollection* Collection = CollectionParameter->Collection;
+        NodeObj->SetStringField(TEXT("collection"), Collection ? Collection->GetPathName() : FString());
+
+        bool bFoundName = false;
+        bool bIdMatches = false;
+        FString CollectionParameterId;
+        FString CollectionParameterType;
+        const FName ParameterName = CollectionParameter->ParameterName;
+        if (Collection)
+        {
+            for (const FCollectionScalarParameter& ScalarParameter : Collection->ScalarParameters)
+            {
+                if (ScalarParameter.ParameterName == ParameterName)
+                {
+                    bFoundName = true;
+                    bIdMatches = ScalarParameter.Id == CollectionParameter->ParameterId;
+                    CollectionParameterId = ScalarParameter.Id.ToString(EGuidFormats::DigitsWithHyphens);
+                    CollectionParameterType = TEXT("scalar");
+                    break;
+                }
+            }
+
+            if (!bFoundName)
+            {
+                for (const FCollectionVectorParameter& VectorParameter : Collection->VectorParameters)
+                {
+                    if (VectorParameter.ParameterName == ParameterName)
+                    {
+                        bFoundName = true;
+                        bIdMatches = VectorParameter.Id == CollectionParameter->ParameterId;
+                        CollectionParameterId = VectorParameter.Id.ToString(EGuidFormats::DigitsWithHyphens);
+                        CollectionParameterType = TEXT("vector");
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!bFoundName)
+        {
+            ++MissingCollectionParameterCount;
+        }
+        else if (!bIdMatches)
+        {
+            ++MismatchedIdCount;
+        }
+
+        NodeObj->SetBoolField(TEXT("collection_parameter_found"), bFoundName);
+        NodeObj->SetBoolField(TEXT("parameter_id_matches_collection"), bIdMatches);
+        NodeObj->SetStringField(TEXT("collection_parameter_id"), CollectionParameterId);
+        NodeObj->SetStringField(TEXT("collection_parameter_type"), CollectionParameterType);
+        Nodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetStringField(TEXT("graph_type"), Target.GetGraphType());
+    ResultObj->SetNumberField(TEXT("collection_parameter_node_count"), Nodes.Num());
+    ResultObj->SetNumberField(TEXT("mismatched_id_count"), MismatchedIdCount);
+    ResultObj->SetNumberField(TEXT("missing_collection_parameter_count"), MissingCollectionParameterCount);
+    ResultObj->SetArrayField(TEXT("nodes"), Nodes);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleMirrorMaterialParameterCollection(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SourceCollectionPath;
+    if (!Params->TryGetStringField(TEXT("source_collection_path"), SourceCollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'source_collection_path' parameter"));
+    }
+
+    FString TargetCollectionPath;
+    if (!Params->TryGetStringField(TEXT("target_collection_path"), TargetCollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_collection_path' parameter"));
+    }
+
+    bool bCopyDefaults = true;
+    if (Params->HasField(TEXT("copy_defaults")))
+    {
+        bCopyDefaults = Params->GetBoolField(TEXT("copy_defaults"));
+    }
+
+    bool bPreserveIds = true;
+    if (Params->HasField(TEXT("preserve_ids")))
+    {
+        bPreserveIds = Params->GetBoolField(TEXT("preserve_ids"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    UMaterialParameterCollection* SourceCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(SourceCollectionPath));
+    UMaterialParameterCollection* TargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(TargetCollectionPath));
+    if (!SourceCollection)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Source Material Parameter Collection not found: %s"), *SourceCollectionPath));
+    }
+    if (!TargetCollection)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Target Material Parameter Collection not found: %s"), *TargetCollectionPath));
+    }
+
+    const TSet<FName> ParameterFilter = GetOptionalParameterNameFilter(Params);
+    UPackage* Package = TargetCollection->GetOutermost();
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+
+    TArray<TSharedPtr<FJsonValue>> MirroredScalars;
+    TArray<TSharedPtr<FJsonValue>> MirroredVectors;
+    TArray<TSharedPtr<FJsonValue>> Warnings;
+    int32 AddedScalarCount = 0;
+    int32 UpdatedScalarDefaultCount = 0;
+    int32 UpdatedScalarIdCount = 0;
+    int32 AddedVectorCount = 0;
+    int32 UpdatedVectorDefaultCount = 0;
+    int32 UpdatedVectorIdCount = 0;
+
+    bool bTargetCollectionModified = false;
+    auto ModifyTargetCollection = [&]()
+    {
+        if (!bTargetCollectionModified)
+        {
+            TargetCollection->Modify();
+            bTargetCollectionModified = true;
+        }
+    };
+
+    for (const FCollectionScalarParameter& SourceParameter : SourceCollection->ScalarParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+
+        FCollectionScalarParameter* TargetParameter = TargetCollection->ScalarParameters.FindByPredicate(
+            [&SourceParameter](const FCollectionScalarParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+
+        const bool bAdded = TargetParameter == nullptr;
+        if (!TargetParameter)
+        {
+            ModifyTargetCollection();
+            FCollectionScalarParameter NewParameter = SourceParameter;
+            if (!bPreserveIds)
+            {
+                NewParameter.Id = FGuid::NewGuid();
+            }
+            TargetCollection->ScalarParameters.Add(NewParameter);
+            TargetParameter = &TargetCollection->ScalarParameters.Last();
+            ++AddedScalarCount;
+        }
+        else
+        {
+            if (bPreserveIds && TargetParameter->Id != SourceParameter.Id)
+            {
+                const bool bIdConflict = TargetCollection->ScalarParameters.ContainsByPredicate(
+                    [&SourceParameter](const FCollectionScalarParameter& Candidate)
+                    {
+                        return Candidate.Id == SourceParameter.Id && Candidate.ParameterName != SourceParameter.ParameterName;
+                    });
+                if (bIdConflict)
+                {
+                    Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+                        TEXT("Skipped scalar id preserve for '%s' because the source id is already used by another target scalar."),
+                        *SourceParameter.ParameterName.ToString())));
+                }
+                else
+                {
+                    ModifyTargetCollection();
+                    TargetParameter->Id = SourceParameter.Id;
+                    ++UpdatedScalarIdCount;
+                }
+            }
+            if (bCopyDefaults && !FMath::IsNearlyEqual(TargetParameter->DefaultValue, SourceParameter.DefaultValue))
+            {
+                ModifyTargetCollection();
+                TargetParameter->DefaultValue = SourceParameter.DefaultValue;
+                ++UpdatedScalarDefaultCount;
+            }
+        }
+
+        TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("name"), SourceParameter.ParameterName.ToString());
+        Item->SetStringField(TEXT("source_id"), SourceParameter.Id.ToString(EGuidFormats::DigitsWithHyphens));
+        Item->SetStringField(TEXT("target_id"), TargetParameter ? TargetParameter->Id.ToString(EGuidFormats::DigitsWithHyphens) : FString());
+        Item->SetNumberField(TEXT("default_value"), TargetParameter ? TargetParameter->DefaultValue : SourceParameter.DefaultValue);
+        Item->SetBoolField(TEXT("added"), bAdded);
+        MirroredScalars.Add(MakeShared<FJsonValueObject>(Item));
+    }
+
+    for (const FCollectionVectorParameter& SourceParameter : SourceCollection->VectorParameters)
+    {
+        if (!ShouldIncludeNamedParameter(ParameterFilter, SourceParameter.ParameterName))
+        {
+            continue;
+        }
+
+        FCollectionVectorParameter* TargetParameter = TargetCollection->VectorParameters.FindByPredicate(
+            [&SourceParameter](const FCollectionVectorParameter& Candidate)
+            {
+                return Candidate.ParameterName == SourceParameter.ParameterName;
+            });
+
+        const bool bAdded = TargetParameter == nullptr;
+        if (!TargetParameter)
+        {
+            ModifyTargetCollection();
+            FCollectionVectorParameter NewParameter = SourceParameter;
+            if (!bPreserveIds)
+            {
+                NewParameter.Id = FGuid::NewGuid();
+            }
+            TargetCollection->VectorParameters.Add(NewParameter);
+            TargetParameter = &TargetCollection->VectorParameters.Last();
+            ++AddedVectorCount;
+        }
+        else
+        {
+            if (bPreserveIds && TargetParameter->Id != SourceParameter.Id)
+            {
+                const bool bIdConflict = TargetCollection->VectorParameters.ContainsByPredicate(
+                    [&SourceParameter](const FCollectionVectorParameter& Candidate)
+                    {
+                        return Candidate.Id == SourceParameter.Id && Candidate.ParameterName != SourceParameter.ParameterName;
+                    });
+                if (bIdConflict)
+                {
+                    Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+                        TEXT("Skipped vector id preserve for '%s' because the source id is already used by another target vector."),
+                        *SourceParameter.ParameterName.ToString())));
+                }
+                else
+                {
+                    ModifyTargetCollection();
+                    TargetParameter->Id = SourceParameter.Id;
+                    ++UpdatedVectorIdCount;
+                }
+            }
+            if (bCopyDefaults && !TargetParameter->DefaultValue.Equals(SourceParameter.DefaultValue))
+            {
+                ModifyTargetCollection();
+                TargetParameter->DefaultValue = SourceParameter.DefaultValue;
+                ++UpdatedVectorDefaultCount;
+            }
+        }
+
+        TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("name"), SourceParameter.ParameterName.ToString());
+        Item->SetStringField(TEXT("source_id"), SourceParameter.Id.ToString(EGuidFormats::DigitsWithHyphens));
+        Item->SetStringField(TEXT("target_id"), TargetParameter ? TargetParameter->Id.ToString(EGuidFormats::DigitsWithHyphens) : FString());
+        Item->SetObjectField(TEXT("default_value"), TargetParameter ? LinearColorToJson(TargetParameter->DefaultValue) : LinearColorToJson(SourceParameter.DefaultValue));
+        Item->SetBoolField(TEXT("added"), bAdded);
+        MirroredVectors.Add(MakeShared<FJsonValueObject>(Item));
+    }
+
+    const bool bChanged =
+        AddedScalarCount > 0 ||
+        UpdatedScalarDefaultCount > 0 ||
+        UpdatedScalarIdCount > 0 ||
+        AddedVectorCount > 0 ||
+        UpdatedVectorDefaultCount > 0 ||
+        UpdatedVectorIdCount > 0;
+
+    bool bSaved = false;
+    if (bChanged)
+    {
+        TargetCollection->PostEditChange();
+        TargetCollection->MarkPackageDirty();
+        if (bSave)
+        {
+            bSaved = UEditorAssetLibrary::SaveLoadedAsset(TargetCollection, false);
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("source_collection"), SourceCollection->GetPathName());
+    ResultObj->SetStringField(TEXT("target_collection"), TargetCollection->GetPathName());
+    ResultObj->SetBoolField(TEXT("copy_defaults"), bCopyDefaults);
+    ResultObj->SetBoolField(TEXT("preserve_ids"), bPreserveIds);
+    ResultObj->SetBoolField(TEXT("changed"), bChanged);
+    ResultObj->SetNumberField(TEXT("added_scalar_count"), AddedScalarCount);
+    ResultObj->SetNumberField(TEXT("updated_scalar_default_count"), UpdatedScalarDefaultCount);
+    ResultObj->SetNumberField(TEXT("updated_scalar_id_count"), UpdatedScalarIdCount);
+    ResultObj->SetNumberField(TEXT("added_vector_count"), AddedVectorCount);
+    ResultObj->SetNumberField(TEXT("updated_vector_default_count"), UpdatedVectorDefaultCount);
+    ResultObj->SetNumberField(TEXT("updated_vector_id_count"), UpdatedVectorIdCount);
+    ResultObj->SetArrayField(TEXT("mirrored_scalars"), MirroredScalars);
+    ResultObj->SetArrayField(TEXT("mirrored_vectors"), MirroredVectors);
+    ResultObj->SetArrayField(TEXT("warnings"), Warnings);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_mirror"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_mirror"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleReplaceMaterialCollectionReferences(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    FString TargetCollectionPath;
+    if (!Params->TryGetStringField(TEXT("target_collection_path"), TargetCollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_collection_path' parameter"));
+    }
+
+    FString SourceCollectionPath;
+    Params->TryGetStringField(TEXT("source_collection_path"), SourceCollectionPath);
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    FString GraphType;
+    Params->TryGetStringField(TEXT("graph_type"), GraphType);
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, GraphType, Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    UMaterialParameterCollection* TargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(TargetCollectionPath));
+    if (!TargetCollection)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Target Material Parameter Collection not found: %s"), *TargetCollectionPath));
+    }
+
+    UMaterialParameterCollection* SourceCollection = nullptr;
+    if (!SourceCollectionPath.TrimStartAndEnd().IsEmpty())
+    {
+        SourceCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(SourceCollectionPath));
+        if (!SourceCollection)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Source Material Parameter Collection not found: %s"), *SourceCollectionPath));
+        }
+    }
+
+    auto FindTargetCollectionParameter = [TargetCollection](const FName ParameterName, FGuid& OutId, FString& OutType) -> bool
+    {
+        for (const FCollectionScalarParameter& ScalarParameter : TargetCollection->ScalarParameters)
+        {
+            if (ScalarParameter.ParameterName == ParameterName)
+            {
+                OutId = ScalarParameter.Id;
+                OutType = TEXT("scalar");
+                return true;
+            }
+        }
+        for (const FCollectionVectorParameter& VectorParameter : TargetCollection->VectorParameters)
+        {
+            if (VectorParameter.ParameterName == ParameterName)
+            {
+                OutId = VectorParameter.Id;
+                OutType = TEXT("vector");
+                return true;
+            }
+        }
+        return false;
+    };
+
+    UPackage* Package = Target.Asset ? Target.Asset->GetOutermost() : nullptr;
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+
+    TArray<TSharedPtr<FJsonValue>> ReplacedNodes;
+    TArray<TSharedPtr<FJsonValue>> SkippedNodes;
+    int32 CollectionNodeCount = 0;
+    int32 ReplacedNodeCount = 0;
+
+    bool bTargetAssetModified = false;
+    auto ModifyTargetAsset = [&]()
+    {
+        if (!bTargetAssetModified)
+        {
+            Target.Asset->Modify();
+            bTargetAssetModified = true;
+        }
+    };
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.GetExpressions())
+    {
+        UMaterialExpressionCollectionParameter* CollectionParameter = Cast<UMaterialExpressionCollectionParameter>(ExpressionPtr.Get());
+        if (!CollectionParameter)
+        {
+            continue;
+        }
+
+        ++CollectionNodeCount;
+        if (SourceCollection && CollectionParameter->Collection != SourceCollection)
+        {
+            TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+            AddExpressionReferenceFields(SkippedObject, CollectionParameter, TEXT(""));
+            SkippedObject->SetStringField(TEXT("reason"), TEXT("source_collection_mismatch"));
+            SkippedObject->SetStringField(TEXT("collection"), CollectionParameter->Collection ? CollectionParameter->Collection->GetPathName() : FString());
+            SkippedNodes.Add(MakeShared<FJsonValueObject>(SkippedObject));
+            continue;
+        }
+
+        FGuid TargetParameterId;
+        FString TargetParameterType;
+        if (!FindTargetCollectionParameter(CollectionParameter->ParameterName, TargetParameterId, TargetParameterType))
+        {
+            TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+            AddExpressionReferenceFields(SkippedObject, CollectionParameter, TEXT(""));
+            SkippedObject->SetStringField(TEXT("reason"), TEXT("target_collection_missing_parameter"));
+            SkippedObject->SetStringField(TEXT("parameter_name"), CollectionParameter->ParameterName.ToString());
+            SkippedNodes.Add(MakeShared<FJsonValueObject>(SkippedObject));
+            continue;
+        }
+
+        const FString OldCollectionPath = CollectionParameter->Collection ? CollectionParameter->Collection->GetPathName() : FString();
+        const FString OldParameterId = CollectionParameter->ParameterId.ToString(EGuidFormats::DigitsWithHyphens);
+
+        if (CollectionParameter->Collection == TargetCollection && CollectionParameter->ParameterId == TargetParameterId)
+        {
+            TSharedPtr<FJsonObject> SkippedObject = MakeShared<FJsonObject>();
+            AddExpressionReferenceFields(SkippedObject, CollectionParameter, TEXT(""));
+            SkippedObject->SetStringField(TEXT("reason"), TEXT("already_target_collection"));
+            SkippedNodes.Add(MakeShared<FJsonValueObject>(SkippedObject));
+            continue;
+        }
+
+        ModifyTargetAsset();
+        CollectionParameter->Modify();
+        CollectionParameter->Collection = TargetCollection;
+        CollectionParameter->ParameterId = TargetParameterId;
+        RefreshExpressionNodeSafe(CollectionParameter);
+        ++ReplacedNodeCount;
+
+        TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+        AddExpressionReferenceFields(NodeObj, CollectionParameter, TEXT(""));
+        NodeObj->SetStringField(TEXT("parameter_name"), CollectionParameter->ParameterName.ToString());
+        NodeObj->SetStringField(TEXT("parameter_type"), TargetParameterType);
+        NodeObj->SetStringField(TEXT("old_collection"), OldCollectionPath);
+        NodeObj->SetStringField(TEXT("new_collection"), TargetCollection->GetPathName());
+        NodeObj->SetStringField(TEXT("old_parameter_id"), OldParameterId);
+        NodeObj->SetStringField(TEXT("new_parameter_id"), TargetParameterId.ToString(EGuidFormats::DigitsWithHyphens));
+        ReplacedNodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+
+    bool bCompiled = true;
+    bool bCompilationFinished = true;
+    TArray<FString> CompileErrors;
+    if (ReplacedNodeCount > 0)
+    {
+        Target.MarkChanged();
+        if (Target.Material)
+        {
+            UMaterialEditingLibrary::RecompileMaterial(Target.Material);
+            if (FMaterialResource* MaterialResource = Target.Material->GetMaterialResource(GMaxRHIShaderPlatform))
+            {
+                MaterialResource->FinishCompilation();
+                bCompilationFinished = MaterialResource->IsCompilationFinished();
+                CompileErrors = MaterialResource->GetCompileErrors();
+                bCompiled = bCompilationFinished && CompileErrors.Num() == 0 && !Target.Material->IsCompilingOrHadCompileError(GMaxRHIShaderPlatform);
+            }
+            else
+            {
+                bCompiled = false;
+                CompileErrors.Add(TEXT("No material resource is available for the current shader platform."));
+            }
+        }
+        else if (Target.Function)
+        {
+            UMaterialEditingLibrary::UpdateMaterialFunction(Target.Function, nullptr);
+        }
+    }
+    else if (Package && !bWasDirty && Package->IsDirty())
+    {
+        Package->SetDirtyFlag(false);
+    }
+
+    bool bSaved = false;
+    const bool bSaveSkippedDueToCompileErrors = bSave && ReplacedNodeCount > 0 && !bCompiled;
+    if (bSave && ReplacedNodeCount > 0 && bCompiled)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetStringField(TEXT("graph_type"), Target.GetGraphType());
+    ResultObj->SetStringField(TEXT("source_collection"), SourceCollection ? SourceCollection->GetPathName() : FString());
+    ResultObj->SetStringField(TEXT("target_collection"), TargetCollection->GetPathName());
+    ResultObj->SetNumberField(TEXT("collection_node_count"), CollectionNodeCount);
+    ResultObj->SetNumberField(TEXT("replaced_node_count"), ReplacedNodeCount);
+    ResultObj->SetArrayField(TEXT("replaced_nodes"), ReplacedNodes);
+    ResultObj->SetNumberField(TEXT("skipped_node_count"), SkippedNodes.Num());
+    ResultObj->SetArrayField(TEXT("skipped_nodes"), SkippedNodes);
+    ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
+    ResultObj->SetBoolField(TEXT("compilation_finished"), bCompilationFinished);
+    ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
+    ResultObj->SetArrayField(TEXT("compile_errors"), StringArrayToJson(CompileErrors));
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("save_skipped_due_to_compile_errors"), bSaveSkippedDueToCompileErrors);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_replace"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_replace"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleReplaceMaterialCollectionParameters(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    bool bUseRuntimeValues = true;
+    if (Params->HasField(TEXT("use_runtime_values")))
+    {
+        bUseRuntimeValues = Params->GetBoolField(TEXT("use_runtime_values"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, TEXT("material"), Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    if (!Target.Material)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("replace_material_collection_parameters currently supports Material assets only"));
+    }
+
+    UWorld* World = bUseRuntimeValues ? GetEditorOrPIEWorld() : nullptr;
+    TArray<UMaterialExpressionCollectionParameter*> CollectionNodes;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.Material->GetExpressions())
+    {
+        if (UMaterialExpressionCollectionParameter* CollectionParameter = Cast<UMaterialExpressionCollectionParameter>(ExpressionPtr.Get()))
+        {
+            CollectionNodes.Add(CollectionParameter);
+        }
+    }
+
+    UPackage* Package = Target.Material->GetOutermost();
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+    bool bTargetMaterialModified = false;
+    auto ModifyTargetMaterial = [&]()
+    {
+        if (!bTargetMaterialModified)
+        {
+            Target.Material->Modify();
+            bTargetMaterialModified = true;
+        }
+    };
+
+    TMap<UMaterialExpression*, UMaterialExpression*> Replacements;
+    TArray<UMaterialExpression*> NodesToDelete;
+    TArray<TSharedPtr<FJsonValue>> ReplacedNodes;
+    TArray<TSharedPtr<FJsonValue>> MissingParameters;
+
+    for (UMaterialExpressionCollectionParameter* CollectionParameter : CollectionNodes)
+    {
+        if (!CollectionParameter || !CollectionParameter->Collection)
+        {
+            continue;
+        }
+
+        const FName ParameterName = CollectionParameter->ParameterName;
+        UMaterialParameterCollection* Collection = CollectionParameter->Collection;
+        UMaterialParameterCollectionInstance* Instance = (World && bUseRuntimeValues) ? World->GetParameterCollectionInstance(Collection) : nullptr;
+
+        bool bFound = false;
+        bool bRuntimeResolved = false;
+        FString ParameterType;
+        UMaterialExpression* Replacement = nullptr;
+
+        if (const FCollectionScalarParameter* ScalarParameter = FindScalarParameterForCollectionNode(CollectionParameter))
+        {
+            bFound = true;
+            ParameterType = TEXT("scalar");
+            float Value = ScalarParameter->DefaultValue;
+            if (Instance)
+            {
+                float RuntimeValue = Value;
+                bRuntimeResolved = Instance->GetScalarParameterValue(ParameterName, RuntimeValue);
+                if (bRuntimeResolved)
+                {
+                    Value = RuntimeValue;
+                }
+            }
+
+            ModifyTargetMaterial();
+            UMaterialExpressionScalarParameter* ScalarExpression = Cast<UMaterialExpressionScalarParameter>(
+                UMaterialEditingLibrary::CreateMaterialExpression(
+                    Target.Material,
+                    UMaterialExpressionScalarParameter::StaticClass(),
+                    CollectionParameter->MaterialExpressionEditorX,
+                    CollectionParameter->MaterialExpressionEditorY));
+            if (ScalarExpression)
+            {
+                ScalarExpression->ParameterName = ParameterName;
+                ScalarExpression->DefaultValue = Value;
+                ScalarExpression->Group = TEXT("Baked MPC");
+                ScalarExpression->Desc = FString::Printf(TEXT("Baked from %s.%s"), *Collection->GetPathName(), *ParameterName.ToString());
+                Replacement = ScalarExpression;
+            }
+        }
+
+        if (!bFound)
+        {
+            if (const FCollectionVectorParameter* VectorParameter = FindVectorParameterForCollectionNode(CollectionParameter))
+            {
+                bFound = true;
+                ParameterType = TEXT("vector");
+                FLinearColor Value = VectorParameter->DefaultValue;
+                if (Instance)
+                {
+                    FLinearColor RuntimeValue = Value;
+                    bRuntimeResolved = Instance->GetVectorParameterValue(ParameterName, RuntimeValue);
+                    if (bRuntimeResolved)
+                    {
+                        Value = RuntimeValue;
+                    }
+                }
+
+                ModifyTargetMaterial();
+                UMaterialExpressionVectorParameter* VectorExpression = Cast<UMaterialExpressionVectorParameter>(
+                    UMaterialEditingLibrary::CreateMaterialExpression(
+                        Target.Material,
+                        UMaterialExpressionVectorParameter::StaticClass(),
+                        CollectionParameter->MaterialExpressionEditorX,
+                        CollectionParameter->MaterialExpressionEditorY));
+                if (VectorExpression)
+                {
+                    VectorExpression->ParameterName = ParameterName;
+                    VectorExpression->DefaultValue = Value;
+                    VectorExpression->Group = TEXT("Baked MPC");
+                    VectorExpression->Desc = FString::Printf(TEXT("Baked from %s.%s"), *Collection->GetPathName(), *ParameterName.ToString());
+                    Replacement = VectorExpression;
+                }
+            }
+        }
+
+        if (!Replacement)
+        {
+            MissingParameters.Add(MakeShared<FJsonValueString>(ParameterName.ToString()));
+            continue;
+        }
+
+        Replacements.Add(CollectionParameter, Replacement);
+        NodesToDelete.Add(CollectionParameter);
+
+        TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+        NodeObj->SetStringField(TEXT("source_node"), CollectionParameter->GetName());
+        NodeObj->SetStringField(TEXT("replacement_node"), Replacement->GetName());
+        NodeObj->SetStringField(TEXT("parameter_name"), ParameterName.ToString());
+        NodeObj->SetStringField(TEXT("parameter_type"), ParameterType);
+        NodeObj->SetBoolField(TEXT("used_runtime_value"), bRuntimeResolved);
+        ReplacedNodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+
+    int32 RewiredExpressionInputCount = 0;
+    int32 RewiredMaterialPropertyCount = 0;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.Material->GetExpressions())
+    {
+        UMaterialExpression* Expression = ExpressionPtr.Get();
+        if (!Expression)
+        {
+            continue;
+        }
+
+        for (FExpressionInputIterator It(Expression); It; ++It)
+        {
+            FExpressionInput* Input = It.Input;
+            if (!Input || !Input->Expression)
+            {
+                continue;
+            }
+
+            if (UMaterialExpression** Replacement = Replacements.Find(Input->Expression))
+            {
+                Input->Expression = *Replacement;
+                Input->OutputIndex = 0;
+                ++RewiredExpressionInputCount;
+            }
+        }
+    }
+
+    for (int32 PropertyIndex = 0; PropertyIndex < static_cast<int32>(MP_MAX); ++PropertyIndex)
+    {
+        FExpressionInput* Input = Target.Material->GetExpressionInputForProperty(static_cast<EMaterialProperty>(PropertyIndex));
+        if (!Input || !Input->Expression)
+        {
+            continue;
+        }
+
+        if (UMaterialExpression** Replacement = Replacements.Find(Input->Expression))
+        {
+            Input->Expression = *Replacement;
+            Input->OutputIndex = 0;
+            ++RewiredMaterialPropertyCount;
+        }
+    }
+
+    for (UMaterialExpression* NodeToDelete : NodesToDelete)
+    {
+        if (NodeToDelete && NodeToDelete->GetOuter() == Target.Material)
+        {
+            UMaterialEditingLibrary::DeleteMaterialExpression(Target.Material, NodeToDelete);
+        }
+    }
+
+    UMaterialEditingLibrary::RecompileMaterial(Target.Material);
+    TArray<FString> CompileErrors;
+    bool bCompilationFinished = true;
+    bool bCompiled = true;
+    if (FMaterialResource* MaterialResource = Target.Material->GetMaterialResource(GMaxRHIShaderPlatform))
+    {
+        MaterialResource->FinishCompilation();
+        bCompilationFinished = MaterialResource->IsCompilationFinished();
+        CompileErrors = MaterialResource->GetCompileErrors();
+        bCompiled = bCompilationFinished && CompileErrors.Num() == 0 && !Target.Material->IsCompilingOrHadCompileError(GMaxRHIShaderPlatform);
+    }
+    else
+    {
+        bCompiled = false;
+        CompileErrors.Add(TEXT("No material resource is available for the current shader platform."));
+    }
+
+    const bool bChanged = Replacements.Num() > 0;
+    bool bSaved = false;
+    const bool bSaveSkippedDueToCompileErrors = bSave && bChanged && !bCompiled;
+    if (bSave && bChanged && bCompiled)
+    {
+        Target.MarkChanged();
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Material, false);
+    }
+    else if (!bChanged && Package && !bWasDirty && Package->IsDirty())
+    {
+        Package->SetDirtyFlag(false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetNumberField(TEXT("initial_collection_parameter_count"), CollectionNodes.Num());
+    ResultObj->SetNumberField(TEXT("replacement_count"), Replacements.Num());
+    ResultObj->SetNumberField(TEXT("deleted_collection_parameter_count"), NodesToDelete.Num());
+    ResultObj->SetNumberField(TEXT("rewired_expression_input_count"), RewiredExpressionInputCount);
+    ResultObj->SetNumberField(TEXT("rewired_material_property_count"), RewiredMaterialPropertyCount);
+    ResultObj->SetArrayField(TEXT("replaced_nodes"), ReplacedNodes);
+    ResultObj->SetArrayField(TEXT("missing_parameters"), MissingParameters);
+    ResultObj->SetNumberField(TEXT("missing_parameter_count"), MissingParameters.Num());
+    ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
+    ResultObj->SetBoolField(TEXT("compilation_finished"), bCompilationFinished);
+    ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
+    ResultObj->SetArrayField(TEXT("compile_errors"), StringArrayToJson(CompileErrors));
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("save_skipped_due_to_compile_errors"), bSaveSkippedDueToCompileErrors);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_replace"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_replace"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleReplaceMaterialTextureReferences(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    const TSharedPtr<FJsonObject>* ReplacementObject = nullptr;
+    if (!Params->TryGetObjectField(TEXT("replacements"), ReplacementObject) || !ReplacementObject || !ReplacementObject->IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'replacements' object parameter"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    FString GraphType;
+    Params->TryGetStringField(TEXT("graph_type"), GraphType);
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, GraphType, Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    auto AddTextureLookupKeys = [](TMap<FString, UTexture*>& Lookup, const FString& SourcePath, UTexture* ReplacementTexture)
+    {
+        TArray<FString> Keys;
+        const FString ObjectPath = FPackageName::ExportTextPathToObjectPath(SourcePath).TrimStartAndEnd();
+        Keys.Add(SourcePath);
+        Keys.Add(ObjectPath);
+        Keys.Add(NormalizeObjectPathForLoad(SourcePath));
+        Keys.Add(NormalizeObjectPathForLoad(ObjectPath));
+
+        if (ObjectPath.Contains(TEXT(".")))
+        {
+            FString PackagePart;
+            FString ObjectPart;
+            ObjectPath.Split(TEXT("."), &PackagePart, &ObjectPart, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+            Keys.Add(PackagePart);
+            Keys.Add(NormalizeObjectPathForLoad(PackagePart));
+        }
+
+        for (FString Key : Keys)
+        {
+            Key.TrimQuotesInline();
+            Key = Key.TrimStartAndEnd();
+            if (!Key.IsEmpty())
+            {
+                Lookup.Add(Key, ReplacementTexture);
+            }
+        }
+    };
+
+    auto FindReplacementForTexture = [](const TMap<FString, UTexture*>& Lookup, UTexture* CurrentTexture) -> UTexture*
+    {
+        if (!CurrentTexture)
+        {
+            return nullptr;
+        }
+
+        TArray<FString> Keys;
+        Keys.Add(CurrentTexture->GetPathName());
+        if (UPackage* Package = CurrentTexture->GetOutermost())
+        {
+            Keys.Add(Package->GetName());
+        }
+        Keys.Add(NormalizeObjectPathForLoad(CurrentTexture->GetPathName()));
+
+        for (FString Key : Keys)
+        {
+            Key.TrimQuotesInline();
+            Key = Key.TrimStartAndEnd();
+            if (UTexture* const* Replacement = Lookup.Find(Key))
+            {
+                return *Replacement;
+            }
+        }
+        return nullptr;
+    };
+
+    TMap<FString, UTexture*> ReplacementLookup;
+    TArray<TSharedPtr<FJsonValue>> ReplacementPairs;
+    TArray<TSharedPtr<FJsonValue>> InvalidReplacements;
+
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*ReplacementObject)->Values)
+    {
+        if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::String)
+        {
+            TSharedPtr<FJsonObject> InvalidObj = MakeShared<FJsonObject>();
+            InvalidObj->SetStringField(TEXT("source"), Pair.Key);
+            InvalidObj->SetStringField(TEXT("reason"), TEXT("replacement value must be a texture asset path string"));
+            InvalidReplacements.Add(MakeShared<FJsonValueObject>(InvalidObj));
+            continue;
+        }
+
+        UTexture* ReplacementTexture = Cast<UTexture>(LoadObjectValue(Pair.Value->AsString()));
+        if (!ReplacementTexture)
+        {
+            TSharedPtr<FJsonObject> InvalidObj = MakeShared<FJsonObject>();
+            InvalidObj->SetStringField(TEXT("source"), Pair.Key);
+            InvalidObj->SetStringField(TEXT("replacement"), Pair.Value->AsString());
+            InvalidObj->SetStringField(TEXT("reason"), TEXT("replacement texture could not be loaded"));
+            InvalidReplacements.Add(MakeShared<FJsonValueObject>(InvalidObj));
+            continue;
+        }
+
+        AddTextureLookupKeys(ReplacementLookup, Pair.Key, ReplacementTexture);
+
+        TSharedPtr<FJsonObject> PairObj = MakeShared<FJsonObject>();
+        PairObj->SetStringField(TEXT("source"), Pair.Key);
+        PairObj->SetStringField(TEXT("replacement"), ReplacementTexture->GetPathName());
+        ReplacementPairs.Add(MakeShared<FJsonValueObject>(PairObj));
+    }
+
+    if (ReplacementLookup.Num() == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No valid texture replacements were provided"));
+    }
+
+    UPackage* Package = Target.Asset ? Target.Asset->GetOutermost() : nullptr;
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+
+    int32 TextureExpressionCount = 0;
+    int32 ReplacedTextureReferenceCount = 0;
+    TArray<TSharedPtr<FJsonValue>> ReplacedNodes;
+    TArray<TSharedPtr<FJsonValue>> UnmatchedTextures;
+    TSet<FString> UnmatchedTexturePaths;
+
+    bool bTargetAssetModified = false;
+    auto ModifyTargetAsset = [&]()
+    {
+        if (!bTargetAssetModified)
+        {
+            Target.Asset->Modify();
+            bTargetAssetModified = true;
+        }
+    };
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.GetExpressions())
+    {
+        UMaterialExpressionTextureBase* TextureExpression = Cast<UMaterialExpressionTextureBase>(ExpressionPtr.Get());
+        if (!TextureExpression || !TextureExpression->Texture)
+        {
+            continue;
+        }
+
+        ++TextureExpressionCount;
+        UTexture* CurrentTexture = TextureExpression->Texture;
+        UTexture* ReplacementTexture = FindReplacementForTexture(ReplacementLookup, CurrentTexture);
+        if (!ReplacementTexture)
+        {
+            UnmatchedTexturePaths.Add(CurrentTexture->GetPathName());
+            continue;
+        }
+
+        if (ReplacementTexture == CurrentTexture)
+        {
+            continue;
+        }
+
+        ModifyTargetAsset();
+        TextureExpression->Modify();
+        TextureExpression->Texture = ReplacementTexture;
+        TextureExpression->AutoSetSampleType();
+        RefreshExpressionNodeSafe(TextureExpression);
+        ++ReplacedTextureReferenceCount;
+
+        TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+        AddExpressionReferenceFields(NodeObj, TextureExpression, TEXT(""));
+        NodeObj->SetStringField(TEXT("old_texture"), CurrentTexture->GetPathName());
+        NodeObj->SetStringField(TEXT("new_texture"), ReplacementTexture->GetPathName());
+        ReplacedNodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+    }
+
+    for (const FString& UnmatchedPath : UnmatchedTexturePaths)
+    {
+        UnmatchedTextures.Add(MakeShared<FJsonValueString>(UnmatchedPath));
+    }
+
+    bool bCompiled = true;
+    bool bCompilationFinished = true;
+    TArray<FString> CompileErrors;
+    if (Target.Material)
+    {
+        UMaterialEditingLibrary::RecompileMaterial(Target.Material);
+        if (FMaterialResource* MaterialResource = Target.Material->GetMaterialResource(GMaxRHIShaderPlatform))
+        {
+            MaterialResource->FinishCompilation();
+            bCompilationFinished = MaterialResource->IsCompilationFinished();
+            CompileErrors = MaterialResource->GetCompileErrors();
+            bCompiled = bCompilationFinished && CompileErrors.Num() == 0 && !Target.Material->IsCompilingOrHadCompileError(GMaxRHIShaderPlatform);
+        }
+        else
+        {
+            bCompiled = false;
+            CompileErrors.Add(TEXT("No material resource is available for the current shader platform."));
+        }
+    }
+    else if (Target.Function)
+    {
+        UMaterialEditingLibrary::UpdateMaterialFunction(Target.Function, nullptr);
+    }
+
+    const bool bChanged = ReplacedTextureReferenceCount > 0;
+    bool bSaved = false;
+    const bool bSaveSkippedDueToCompileErrors = bSave && bChanged && !bCompiled;
+    if (bSave && bChanged && bCompiled)
+    {
+        Target.MarkChanged();
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+    }
+    else if (!bChanged && Package && !bWasDirty && Package->IsDirty())
+    {
+        Package->SetDirtyFlag(false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetStringField(TEXT("graph_type"), Target.GetGraphType());
+    ResultObj->SetNumberField(TEXT("replacement_pair_count"), ReplacementPairs.Num());
+    ResultObj->SetArrayField(TEXT("replacement_pairs"), ReplacementPairs);
+    ResultObj->SetNumberField(TEXT("invalid_replacement_count"), InvalidReplacements.Num());
+    ResultObj->SetArrayField(TEXT("invalid_replacements"), InvalidReplacements);
+    ResultObj->SetNumberField(TEXT("texture_expression_count"), TextureExpressionCount);
+    ResultObj->SetNumberField(TEXT("replaced_texture_reference_count"), ReplacedTextureReferenceCount);
+    ResultObj->SetArrayField(TEXT("replaced_nodes"), ReplacedNodes);
+    ResultObj->SetNumberField(TEXT("unmatched_texture_count"), UnmatchedTextures.Num());
+    ResultObj->SetArrayField(TEXT("unmatched_textures"), UnmatchedTextures);
+    ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
+    ResultObj->SetBoolField(TEXT("compilation_finished"), bCompilationFinished);
+    ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
+    ResultObj->SetArrayField(TEXT("compile_errors"), StringArrayToJson(CompileErrors));
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("save_skipped_due_to_compile_errors"), bSaveSkippedDueToCompileErrors);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_replace"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_replace"), Package ? Package->IsDirty() : false);
     return ResultObj;
 }
 
@@ -4061,14 +5598,11 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCompileAndSaveMaterial
     }
 
     bool bSaved = false;
-    if (bSave)
+    const bool bSaveSkippedDueToCompileErrors = bSave && !bCompiled;
+    if (bSave && bCompiled)
     {
         Target.MarkChanged();
         bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
-    }
-    else if (Package && !bWasDirty && Package->IsDirty())
-    {
-        Package->SetDirtyFlag(false);
     }
 
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
@@ -4079,8 +5613,240 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleCompileAndSaveMaterial
     ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
     ResultObj->SetArrayField(TEXT("compile_errors"), StringArrayToJson(CompileErrors));
     ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("save_skipped_due_to_compile_errors"), bSaveSkippedDueToCompileErrors);
     ResultObj->SetBoolField(TEXT("was_dirty_before_compile"), bWasDirty);
     ResultObj->SetBoolField(TEXT("dirty_after_compile"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleRefreshMaterialCachedExpressionData(const TSharedPtr<FJsonObject>& Params)
+{
+    FString MaterialPath;
+    if (!Params->TryGetStringField(TEXT("material_path"), MaterialPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'material_path' parameter"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    FMaterialGraphTarget Target;
+    FString ErrorMessage;
+    if (!ResolveMaterialGraph(MaterialPath, TEXT("material"), Target, nullptr, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+    if (!Target.Material)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("refresh_material_cached_expression_data supports Material assets only"));
+    }
+
+    UPackage* Package = Target.Asset ? Target.Asset->GetOutermost() : nullptr;
+    const bool bWasDirty = Package ? Package->IsDirty() : false;
+
+    int32 MaterialFunctionCallCount = 0;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Target.GetExpressions())
+    {
+        if (Cast<UMaterialExpressionMaterialFunctionCall>(ExpressionPtr.Get()))
+        {
+            ++MaterialFunctionCallCount;
+        }
+    }
+
+    Target.Material->Modify();
+    Target.Material->UpdateCachedExpressionData();
+
+    const int32 FunctionInfoCountBeforeClear = Target.Material->GetCachedExpressionData().FunctionInfos.Num();
+    int32 FunctionInfoCountAfterClear = FunctionInfoCountBeforeClear;
+    bool bClearedStaleFunctionInfos = false;
+    int64 ClearedStaleFunctionReferenceCount = 0;
+    TArray<TSharedPtr<FJsonValue>> ClearedStaleFunctionReferenceDependencyArray;
+    TArray<TSharedPtr<FJsonValue>> ClearedStaleFunctionReferenceOwnerArray;
+    auto ClearStaleFunctionInfos = [&]()
+    {
+        FMaterialCachedExpressionData& MutableCachedData = const_cast<FMaterialCachedExpressionData&>(Target.Material->GetCachedExpressionData());
+        if (MaterialFunctionCallCount == 0 && MutableCachedData.FunctionInfos.Num() > 0)
+        {
+            // UDS material-function expansion can leave stale serialized function references
+            // even after the graph no longer contains function-call nodes. Clear only for
+            // fully expanded materials so real function dependencies are preserved.
+            MutableCachedData.FunctionInfos.Empty();
+            MutableCachedData.FunctionInfosStateCRC = 0xffffffff;
+            bClearedStaleFunctionInfos = true;
+        }
+        FunctionInfoCountAfterClear = MutableCachedData.FunctionInfos.Num();
+    };
+    ClearStaleFunctionInfos();
+
+    if (MaterialFunctionCallCount == 0 && Package)
+    {
+        FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FName> ExistingDependencies;
+        AssetRegistryModule.Get().GetDependencies(FName(*Package->GetName()), ExistingDependencies);
+
+        TMap<UMaterialFunctionInterface*, UMaterialFunctionInterface*> ReplacementMap;
+        for (const FName& DependencyName : ExistingDependencies)
+        {
+            const FString DependencyPath = DependencyName.ToString();
+            if (!DependencyPath.StartsWith(TEXT("/Game/UltraDynamicSky/Materials/Material_Functions/")))
+            {
+                continue;
+            }
+
+            const FString AssetName = FPackageName::GetLongPackageAssetName(DependencyPath);
+            if (AssetName.IsEmpty())
+            {
+                continue;
+            }
+
+            UMaterialFunctionInterface* Function = LoadObject<UMaterialFunctionInterface>(nullptr, *(DependencyPath + TEXT(".") + AssetName));
+            if (!Function)
+            {
+                continue;
+            }
+
+            ReplacementMap.Add(Function, nullptr);
+            ClearedStaleFunctionReferenceDependencyArray.Add(MakeShared<FJsonValueString>(Function->GetPathName()));
+        }
+
+        if (ReplacementMap.Num() > 0)
+        {
+            TArray<UObject*> PackageObjects;
+            ForEachObjectWithPackage(Package, [&PackageObjects](UObject* Object)
+            {
+                if (Object && !Object->HasAnyFlags(RF_ClassDefaultObject))
+                {
+                    PackageObjects.Add(Object);
+                }
+                return true;
+            }, true);
+
+            for (UObject* Object : PackageObjects)
+            {
+                if (!Object)
+                {
+                    continue;
+                }
+
+                Object->Modify();
+                FArchiveReplaceObjectRef<UMaterialFunctionInterface> ReplaceArchive(
+                    Object,
+                    ReplacementMap,
+                    EArchiveReplaceObjectFlags::IgnoreOuterRef |
+                    EArchiveReplaceObjectFlags::IgnoreArchetypeRef |
+                    EArchiveReplaceObjectFlags::TrackReplacedReferences);
+
+                const int64 ReplacedCount = ReplaceArchive.GetCount();
+                if (ReplacedCount > 0)
+                {
+                    ClearedStaleFunctionReferenceCount += ReplacedCount;
+                    TSharedPtr<FJsonObject> OwnerObj = MakeShared<FJsonObject>();
+                    OwnerObj->SetStringField(TEXT("object"), Object->GetPathName());
+                    OwnerObj->SetStringField(TEXT("class"), Object->GetClass() ? Object->GetClass()->GetName() : TEXT(""));
+                    OwnerObj->SetNumberField(TEXT("replaced_reference_count"), ReplacedCount);
+
+                    TArray<TSharedPtr<FJsonValue>> PropertyArray;
+                    for (const TPair<UObject*, TArray<FProperty*>>& ReplacedRefPair : ReplaceArchive.GetReplacedReferences())
+                    {
+                        if (ReplacedRefPair.Key != Object)
+                        {
+                            continue;
+                        }
+                        for (const FProperty* Property : ReplacedRefPair.Value)
+                        {
+                            PropertyArray.Add(MakeShared<FJsonValueString>(Property ? Property->GetName() : TEXT("<unknown>")));
+                        }
+                    }
+                    OwnerObj->SetArrayField(TEXT("properties"), PropertyArray);
+                    ClearedStaleFunctionReferenceOwnerArray.Add(MakeShared<FJsonValueObject>(OwnerObj));
+                }
+            }
+
+            if (ClearedStaleFunctionReferenceCount > 0)
+            {
+                Target.MarkChanged();
+                Target.Material->UpdateCachedExpressionData();
+                ClearStaleFunctionInfos();
+            }
+        }
+    }
+
+    Target.Material->PostEditChange();
+    ClearStaleFunctionInfos();
+    UMaterialEditingLibrary::RecompileMaterial(Target.Material);
+    ClearStaleFunctionInfos();
+
+    TArray<FString> CompileErrors;
+    bool bCompilationFinished = true;
+    bool bCompiled = true;
+    if (FMaterialResource* MaterialResource = Target.Material->GetMaterialResource(GMaxRHIShaderPlatform))
+    {
+        MaterialResource->FinishCompilation();
+        bCompilationFinished = MaterialResource->IsCompilationFinished();
+        CompileErrors = MaterialResource->GetCompileErrors();
+        bCompiled = bCompilationFinished && CompileErrors.Num() == 0 && !Target.Material->IsCompilingOrHadCompileError(GMaxRHIShaderPlatform);
+    }
+    else
+    {
+        bCompiled = false;
+        CompileErrors.Add(TEXT("No material resource is available for the current shader platform."));
+    }
+
+    bool bSaved = false;
+    const bool bSaveSkippedDueToCompileErrors = bSave && !bCompiled;
+    if (bSave && bCompiled)
+    {
+        Target.MarkChanged();
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Target.Asset, false);
+    }
+
+    TArray<FName> Dependencies;
+    if (Package)
+    {
+        FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FString> ModifiedAssetFiles;
+        ModifiedAssetFiles.Add(FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension()));
+        AssetRegistryModule.Get().ScanModifiedAssetFiles(ModifiedAssetFiles);
+        AssetRegistryModule.Get().GetDependencies(FName(*Package->GetName()), Dependencies);
+    }
+
+    TArray<TSharedPtr<FJsonValue>> DependencyArray;
+    TArray<TSharedPtr<FJsonValue>> SourceOrTempDependencyArray;
+    for (const FName& Dependency : Dependencies)
+    {
+        const FString DependencyString = Dependency.ToString();
+        DependencyArray.Add(MakeShared<FJsonValueString>(DependencyString));
+        if (DependencyString.StartsWith(TEXT("/Game/UltraDynamicSky")) || DependencyString.StartsWith(TEXT("/Game/_MCP_Temp")))
+        {
+            SourceOrTempDependencyArray.Add(MakeShared<FJsonValueString>(DependencyString));
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("material"), Target.GetPathName());
+    ResultObj->SetStringField(TEXT("graph_type"), Target.GetGraphType());
+    ResultObj->SetBoolField(TEXT("cached_expression_data_refreshed"), true);
+    ResultObj->SetNumberField(TEXT("material_function_call_count"), MaterialFunctionCallCount);
+    ResultObj->SetNumberField(TEXT("function_info_count_before_clear"), FunctionInfoCountBeforeClear);
+    ResultObj->SetNumberField(TEXT("function_info_count_after_clear"), FunctionInfoCountAfterClear);
+    ResultObj->SetBoolField(TEXT("cleared_stale_function_infos"), bClearedStaleFunctionInfos);
+    ResultObj->SetNumberField(TEXT("cleared_stale_function_reference_count"), ClearedStaleFunctionReferenceCount);
+    ResultObj->SetArrayField(TEXT("cleared_stale_function_reference_dependencies"), ClearedStaleFunctionReferenceDependencyArray);
+    ResultObj->SetArrayField(TEXT("cleared_stale_function_reference_owners"), ClearedStaleFunctionReferenceOwnerArray);
+    ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
+    ResultObj->SetBoolField(TEXT("compilation_finished"), bCompilationFinished);
+    ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
+    ResultObj->SetArrayField(TEXT("compile_errors"), StringArrayToJson(CompileErrors));
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("save_skipped_due_to_compile_errors"), bSaveSkippedDueToCompileErrors);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_refresh"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_refresh"), Package ? Package->IsDirty() : false);
+    ResultObj->SetArrayField(TEXT("dependencies"), DependencyArray);
+    ResultObj->SetArrayField(TEXT("source_or_temp_dependencies"), SourceOrTempDependencyArray);
+    ResultObj->SetNumberField(TEXT("source_or_temp_dependency_count"), SourceOrTempDependencyArray.Num());
     return ResultObj;
 }
 
@@ -4450,5 +6216,395 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleGetMaterialParameterCo
     ResultObj->SetArrayField(TEXT("vectors"), VectorValues);
     ResultObj->SetNumberField(TEXT("scalar_count"), ScalarValues.Num());
     ResultObj->SetNumberField(TEXT("vector_count"), VectorValues.Num());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialParameterCollectionValues(const TSharedPtr<FJsonObject>& Params)
+{
+    FString CollectionPath;
+    if (!Params->TryGetStringField(TEXT("collection_path"), CollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'collection_path' parameter"));
+    }
+
+    const TSharedPtr<FJsonObject>* ScalarObject = nullptr;
+    const TSharedPtr<FJsonObject>* VectorObject = nullptr;
+    Params->TryGetObjectField(TEXT("scalars"), ScalarObject);
+    Params->TryGetObjectField(TEXT("vectors"), VectorObject);
+    if (!ScalarObject && !VectorObject)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'scalars' or 'vectors' parameter object"));
+    }
+
+    bool bSetAssetDefaults = true;
+    if (Params->HasField(TEXT("set_asset_defaults")))
+    {
+        bSetAssetDefaults = Params->GetBoolField(TEXT("set_asset_defaults"));
+    }
+
+    bool bSetRuntime = true;
+    if (Params->HasField(TEXT("set_runtime")))
+    {
+        bSetRuntime = Params->GetBoolField(TEXT("set_runtime"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    UMaterialParameterCollection* Collection = Cast<UMaterialParameterCollection>(LoadObjectValue(CollectionPath));
+    if (!Collection)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Material Parameter Collection not found: %s"), *CollectionPath));
+    }
+
+    UPackage* Package = Collection->GetOutermost();
+    const bool bWasDirty = Package && Package->IsDirty();
+    bool bCollectionModified = false;
+    auto ModifyCollection = [&]()
+    {
+        if (!bCollectionModified)
+        {
+            Collection->Modify();
+            bCollectionModified = true;
+        }
+    };
+
+    UWorld* World = bSetRuntime ? GetEditorOrPIEWorld() : nullptr;
+    UMaterialParameterCollectionInstance* Instance = (World && bSetRuntime) ? World->GetParameterCollectionInstance(Collection) : nullptr;
+
+    TArray<TSharedPtr<FJsonValue>> UpdatedScalars;
+    TArray<TSharedPtr<FJsonValue>> UpdatedVectors;
+    TArray<TSharedPtr<FJsonValue>> MissingScalars;
+    TArray<TSharedPtr<FJsonValue>> MissingVectors;
+    TArray<TSharedPtr<FJsonValue>> Errors;
+    int32 AssetScalarUpdateCount = 0;
+    int32 RuntimeScalarUpdateCount = 0;
+    int32 AssetVectorUpdateCount = 0;
+    int32 RuntimeVectorUpdateCount = 0;
+
+    if (ScalarObject)
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*ScalarObject)->Values)
+        {
+            if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::Number)
+            {
+                Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Scalar '%s' requires a number value"), *Pair.Key)));
+                continue;
+            }
+
+            const FName ParameterName(*Pair.Key);
+            const float NewValue = static_cast<float>(Pair.Value->AsNumber());
+            bool bFound = false;
+            float OldAssetValue = 0.0f;
+            for (FCollectionScalarParameter& Parameter : Collection->ScalarParameters)
+            {
+                if (Parameter.ParameterName == ParameterName)
+                {
+                    bFound = true;
+                    OldAssetValue = Parameter.DefaultValue;
+                    if (bSetAssetDefaults && !FMath::IsNearlyEqual(Parameter.DefaultValue, NewValue))
+                    {
+                        ModifyCollection();
+                        Parameter.DefaultValue = NewValue;
+                        ++AssetScalarUpdateCount;
+                    }
+                    break;
+                }
+            }
+
+            bool bRuntimeUpdated = false;
+            if (Instance)
+            {
+                bRuntimeUpdated = Instance->SetScalarParameterValue(ParameterName, NewValue);
+                if (bRuntimeUpdated)
+                {
+                    ++RuntimeScalarUpdateCount;
+                }
+            }
+
+            if (!bFound)
+            {
+                MissingScalars.Add(MakeShared<FJsonValueString>(Pair.Key));
+                continue;
+            }
+
+            TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+            Item->SetStringField(TEXT("name"), Pair.Key);
+            Item->SetNumberField(TEXT("value"), NewValue);
+            Item->SetNumberField(TEXT("old_asset_default"), OldAssetValue);
+            Item->SetBoolField(TEXT("runtime_updated"), bRuntimeUpdated);
+            UpdatedScalars.Add(MakeShared<FJsonValueObject>(Item));
+        }
+    }
+
+    if (VectorObject)
+    {
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*VectorObject)->Values)
+        {
+            if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::Object)
+            {
+                Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Vector '%s' requires an object value"), *Pair.Key)));
+                continue;
+            }
+
+            const TSharedPtr<FJsonObject> ValueObject = Pair.Value->AsObject();
+            if (!ValueObject.IsValid())
+            {
+                Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Vector '%s' has an invalid object value"), *Pair.Key)));
+                continue;
+            }
+
+            auto TryReadVectorComponent = [&ValueObject, &Pair, &Errors](const TCHAR* ColorField, const TCHAR* AxisField, float& OutValue) -> bool
+            {
+                double ComponentValue = 0.0;
+                if (ValueObject->TryGetNumberField(ColorField, ComponentValue) ||
+                    ValueObject->TryGetNumberField(AxisField, ComponentValue))
+                {
+                    OutValue = static_cast<float>(ComponentValue);
+                    return true;
+                }
+
+                Errors.Add(MakeShared<FJsonValueString>(FString::Printf(
+                    TEXT("Vector '%s' requires numeric '%s' or '%s' component"),
+                    *Pair.Key,
+                    ColorField,
+                    AxisField)));
+                return false;
+            };
+
+            FLinearColor NewValue = FLinearColor::Transparent;
+            if (!TryReadVectorComponent(TEXT("r"), TEXT("x"), NewValue.R) ||
+                !TryReadVectorComponent(TEXT("g"), TEXT("y"), NewValue.G) ||
+                !TryReadVectorComponent(TEXT("b"), TEXT("z"), NewValue.B))
+            {
+                continue;
+            }
+
+            double AlphaValue = 1.0;
+            if (ValueObject->TryGetNumberField(TEXT("a"), AlphaValue) ||
+                ValueObject->TryGetNumberField(TEXT("w"), AlphaValue))
+            {
+                NewValue.A = static_cast<float>(AlphaValue);
+            }
+
+            const FName ParameterName(*Pair.Key);
+            bool bFound = false;
+            FLinearColor OldAssetValue = FLinearColor::Transparent;
+            for (FCollectionVectorParameter& Parameter : Collection->VectorParameters)
+            {
+                if (Parameter.ParameterName == ParameterName)
+                {
+                    bFound = true;
+                    OldAssetValue = Parameter.DefaultValue;
+                    if (bSetAssetDefaults && !Parameter.DefaultValue.Equals(NewValue))
+                    {
+                        ModifyCollection();
+                        Parameter.DefaultValue = NewValue;
+                        ++AssetVectorUpdateCount;
+                    }
+                    break;
+                }
+            }
+
+            bool bRuntimeUpdated = false;
+            if (Instance)
+            {
+                bRuntimeUpdated = Instance->SetVectorParameterValue(ParameterName, NewValue);
+                if (bRuntimeUpdated)
+                {
+                    ++RuntimeVectorUpdateCount;
+                }
+            }
+
+            if (!bFound)
+            {
+                MissingVectors.Add(MakeShared<FJsonValueString>(Pair.Key));
+                continue;
+            }
+
+            TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+            Item->SetStringField(TEXT("name"), Pair.Key);
+            Item->SetObjectField(TEXT("value"), LinearColorToJson(NewValue));
+            Item->SetObjectField(TEXT("old_asset_default"), LinearColorToJson(OldAssetValue));
+            Item->SetBoolField(TEXT("runtime_updated"), bRuntimeUpdated);
+            UpdatedVectors.Add(MakeShared<FJsonValueObject>(Item));
+        }
+    }
+
+    const bool bAssetDefaultsChanged = AssetScalarUpdateCount > 0 || AssetVectorUpdateCount > 0;
+    if (bAssetDefaultsChanged)
+    {
+        Collection->PostEditChange();
+        Collection->MarkPackageDirty();
+    }
+
+    bool bSaved = false;
+    if (bSave && bAssetDefaultsChanged)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Collection, false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("collection"), Collection->GetPathName());
+    ResultObj->SetBoolField(TEXT("set_asset_defaults"), bSetAssetDefaults);
+    ResultObj->SetBoolField(TEXT("set_runtime"), bSetRuntime);
+    ResultObj->SetBoolField(TEXT("has_world"), World != nullptr);
+    ResultObj->SetStringField(TEXT("world_type"), GetWorldTypeName(World));
+    ResultObj->SetBoolField(TEXT("has_runtime_instance"), Instance != nullptr);
+    ResultObj->SetBoolField(TEXT("asset_defaults_changed"), bAssetDefaultsChanged);
+    ResultObj->SetNumberField(TEXT("asset_scalar_update_count"), AssetScalarUpdateCount);
+    ResultObj->SetNumberField(TEXT("runtime_scalar_update_count"), RuntimeScalarUpdateCount);
+    ResultObj->SetNumberField(TEXT("asset_vector_update_count"), AssetVectorUpdateCount);
+    ResultObj->SetNumberField(TEXT("runtime_vector_update_count"), RuntimeVectorUpdateCount);
+    ResultObj->SetArrayField(TEXT("updated_scalars"), UpdatedScalars);
+    ResultObj->SetArrayField(TEXT("updated_vectors"), UpdatedVectors);
+    ResultObj->SetArrayField(TEXT("missing_scalars"), MissingScalars);
+    ResultObj->SetArrayField(TEXT("missing_vectors"), MissingVectors);
+    ResultObj->SetArrayField(TEXT("errors"), Errors);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("was_dirty_before_set"), bWasDirty);
+    ResultObj->SetBoolField(TEXT("dirty_after_set"), Package ? Package->IsDirty() : false);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialParameterCollectionSync(const TSharedPtr<FJsonObject>& Params)
+{
+    FString Action = TEXT("enable");
+    Params->TryGetStringField(TEXT("action"), Action);
+    Action = Action.ToLower();
+
+    auto MakeStatusResponse = []()
+    {
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("enabled"), GMPCSyncState.bEnabled);
+        ResultObj->SetStringField(TEXT("source_collection_path"), GMPCSyncState.SourceCollectionPath);
+        ResultObj->SetStringField(TEXT("target_collection_path"), GMPCSyncState.TargetCollectionPath);
+        ResultObj->SetNumberField(TEXT("interval_seconds"), GMPCSyncState.IntervalSeconds);
+        ResultObj->SetNumberField(TEXT("tick_count"), static_cast<double>(GMPCSyncState.TickCount));
+        ResultObj->SetNumberField(TEXT("last_scalar_count"), GMPCSyncState.LastScalarCount);
+        ResultObj->SetNumberField(TEXT("last_vector_count"), GMPCSyncState.LastVectorCount);
+        ResultObj->SetNumberField(TEXT("cached_scalar_count"), GMPCSyncState.ScalarParameterNames.Num());
+        ResultObj->SetNumberField(TEXT("cached_vector_count"), GMPCSyncState.VectorParameterNames.Num());
+        ResultObj->SetStringField(TEXT("last_error"), GMPCSyncState.LastError);
+
+        TArray<TSharedPtr<FJsonValue>> ParameterNames;
+        for (const FName& ParameterName : GMPCSyncState.ParameterFilter)
+        {
+            ParameterNames.Add(MakeShared<FJsonValueString>(ParameterName.ToString()));
+        }
+        ResultObj->SetArrayField(TEXT("parameter_names"), ParameterNames);
+        return ResultObj;
+    };
+
+    if (Action == TEXT("status"))
+    {
+        return MakeStatusResponse();
+    }
+
+    if (Action == TEXT("disable") || Action == TEXT("stop"))
+    {
+        StopMaterialParameterCollectionSyncInternal();
+        return MakeStatusResponse();
+    }
+
+    if (Action != TEXT("enable") && Action != TEXT("start"))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown MPC sync action: %s"), *Action));
+    }
+
+    FString SourceCollectionPath;
+    FString TargetCollectionPath;
+    if (!Params->TryGetStringField(TEXT("source_collection_path"), SourceCollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'source_collection_path' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("target_collection_path"), TargetCollectionPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_collection_path' parameter"));
+    }
+
+    float IntervalSeconds = 0.1f;
+    if (Params->HasField(TEXT("interval_seconds")))
+    {
+        IntervalSeconds = FMath::Max(0.01f, static_cast<float>(Params->GetNumberField(TEXT("interval_seconds"))));
+    }
+
+    bool bSetAssetDefaultsOnEnable = false;
+    if (Params->HasField(TEXT("set_asset_defaults_on_enable")))
+    {
+        bSetAssetDefaultsOnEnable = Params->GetBoolField(TEXT("set_asset_defaults_on_enable"));
+    }
+
+    bool bSaveOnEnable = false;
+    if (Params->HasField(TEXT("save_on_enable")))
+    {
+        bSaveOnEnable = Params->GetBoolField(TEXT("save_on_enable"));
+    }
+
+    StopMaterialParameterCollectionSyncInternal();
+
+    GMPCSyncState.bEnabled = true;
+    GMPCSyncState.SourceCollectionPath = SourceCollectionPath;
+    GMPCSyncState.TargetCollectionPath = TargetCollectionPath;
+    GMPCSyncState.ParameterFilter = GetOptionalParameterNameFilter(Params);
+    GMPCSyncState.IntervalSeconds = IntervalSeconds;
+    GMPCSyncState.TickCount = 0;
+    GMPCSyncState.LastScalarCount = 0;
+    GMPCSyncState.LastVectorCount = 0;
+    GMPCSyncState.LastError.Reset();
+
+    int32 InitialScalarCount = 0;
+    int32 InitialVectorCount = 0;
+    FString InitialError;
+    const bool bInitialSync = CopyMaterialParameterCollectionValues(
+        SourceCollectionPath,
+        TargetCollectionPath,
+        GMPCSyncState.ParameterFilter,
+        bSetAssetDefaultsOnEnable,
+        InitialScalarCount,
+        InitialVectorCount,
+        InitialError);
+
+    GMPCSyncState.LastScalarCount = InitialScalarCount;
+    GMPCSyncState.LastVectorCount = InitialVectorCount;
+    GMPCSyncState.LastError = InitialError;
+
+    if (!bInitialSync)
+    {
+        StopMaterialParameterCollectionSyncInternal();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(InitialError);
+    }
+
+    UMaterialParameterCollection* SourceCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(SourceCollectionPath));
+    UMaterialParameterCollection* TargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(TargetCollectionPath));
+    BuildMaterialParameterCollectionSyncCache(SourceCollection, TargetCollection, GMPCSyncState.ParameterFilter);
+    if (GMPCSyncState.ScalarParameterNames.Num() == 0 && GMPCSyncState.VectorParameterNames.Num() == 0)
+    {
+        StopMaterialParameterCollectionSyncInternal();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No same-name MPC parameters found to sync."));
+    }
+
+    bool bSavedOnEnable = false;
+    if (bSetAssetDefaultsOnEnable && bSaveOnEnable)
+    {
+        if (UMaterialParameterCollection* SaveTargetCollection = Cast<UMaterialParameterCollection>(LoadObjectValue(TargetCollectionPath)))
+        {
+            bSavedOnEnable = UEditorAssetLibrary::SaveLoadedAsset(SaveTargetCollection, false);
+        }
+    }
+
+    GMPCSyncState.TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateStatic(&TickMaterialParameterCollectionSync),
+        IntervalSeconds);
+
+    TSharedPtr<FJsonObject> ResultObj = MakeStatusResponse();
+    ResultObj->SetBoolField(TEXT("initial_sync"), bInitialSync);
+    ResultObj->SetNumberField(TEXT("initial_scalar_count"), InitialScalarCount);
+    ResultObj->SetNumberField(TEXT("initial_vector_count"), InitialVectorCount);
+    ResultObj->SetBoolField(TEXT("set_asset_defaults_on_enable"), bSetAssetDefaultsOnEnable);
+    ResultObj->SetBoolField(TEXT("saved_on_enable"), bSavedOnEnable);
     return ResultObj;
 }

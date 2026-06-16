@@ -1,5 +1,6 @@
 #include "UnrealMCPModule.h"
 #include "UnrealMCPBridge.h"
+#include "Commands/UnrealMCPMaterialCommands.h"
 #include "UI/NiagaraPreviewPlayerWindow.h"
 #include "Modules/ModuleManager.h"
 #include "EditorSubsystem.h"
@@ -20,6 +21,7 @@ void FUnrealMCPModule::StartupModule()
 
 void FUnrealMCPModule::ShutdownModule()
 {
+	FUnrealMCPMaterialCommands::StopMaterialParameterCollectionSync();
 	FNiagaraPreviewPlayerWindow::Shutdown();
 
 	if (UToolMenus::IsToolMenuUIEnabled())

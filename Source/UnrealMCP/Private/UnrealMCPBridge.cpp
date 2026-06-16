@@ -429,6 +429,11 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
             else if (CommandType == TEXT("resolve_material_graph") ||
                      CommandType == TEXT("list_material_nodes") ||
                      CommandType == TEXT("analyze_material_graph") ||
+                     CommandType == TEXT("list_material_collection_parameter_nodes") ||
+                     CommandType == TEXT("mirror_material_parameter_collection") ||
+                     CommandType == TEXT("replace_material_collection_references") ||
+                     CommandType == TEXT("replace_material_collection_parameters") ||
+                     CommandType == TEXT("replace_material_texture_references") ||
                      CommandType == TEXT("add_material_node") ||
                      CommandType == TEXT("add_custom_material_node") ||
                      CommandType == TEXT("set_material_node_property") ||
@@ -437,8 +442,11 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("delete_material_node") ||
                      CommandType == TEXT("layout_material_nodes") ||
                      CommandType == TEXT("compile_and_save_material") ||
+                     CommandType == TEXT("refresh_material_cached_expression_data") ||
                      CommandType == TEXT("expand_material_function_calls") ||
-                     CommandType == TEXT("get_material_parameter_collection_values"))
+                     CommandType == TEXT("get_material_parameter_collection_values") ||
+                     CommandType == TEXT("set_material_parameter_collection_values") ||
+                     CommandType == TEXT("set_material_parameter_collection_sync"))
             {
                 ResultJson = MaterialCommands->HandleCommand(CommandType, Params);
             }
