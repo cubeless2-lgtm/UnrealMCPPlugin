@@ -8,6 +8,7 @@
 #include "EdGraph/EdGraphPin.h"
 #include "EdGraphToken.h"
 #include "EdGraphSchema_K2.h"
+#include "Editor.h"
 #include "K2Node_Event.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -79,6 +80,11 @@ bool IsCompilerErrorSeverity(EMessageSeverity::Type Severity)
 bool IsCompilerWarningSeverity(EMessageSeverity::Type Severity)
 {
     return Severity == EMessageSeverity::Warning || Severity == EMessageSeverity::PerformanceWarning;
+}
+
+bool IsPlaySessionActive()
+{
+    return GEditor && GEditor->IsPlaySessionInProgress();
 }
 
 TSharedPtr<FJsonValue> NumberJsonValue(double Value)
@@ -327,6 +333,17 @@ void AddCompilerFallbackDiagnostic(TArray<TSharedPtr<FJsonValue>>& SummaryMessag
 TSharedPtr<FJsonObject> CompileBlueprintAndBuildValidationResult(UBlueprint* Blueprint, bool bSave, bool bRefreshNodes)
 {
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    if (IsPlaySessionActive())
+    {
+        ResultObj->SetBoolField(TEXT("success"), false);
+        ResultObj->SetBoolField(TEXT("compiled"), false);
+        ResultObj->SetBoolField(TEXT("validation_pass"), false);
+        ResultObj->SetNumberField(TEXT("compile_error_count"), 1);
+        ResultObj->SetNumberField(TEXT("compile_warning_count"), 0);
+        ResultObj->SetStringField(TEXT("error"), TEXT("Blueprint compilation is blocked while PIE/SIE is active. End play mode before compiling blueprints through UnrealMCP."));
+        return ResultObj;
+    }
+
     if (!Blueprint)
     {
         ResultObj->SetBoolField(TEXT("compiled"), false);
@@ -671,6 +688,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAddComponentToBluepri
     FString ParentComponentName;
     Params->TryGetStringField(TEXT("parent_component_name"), ParentComponentName);
 
+    if (IsPlaySessionActive())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("Cannot add a component to a Blueprint while PIE/SIE is active. End the play session before mutating Blueprint structure.")
+        );
+    }
+
     // Find the blueprint
     UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
     if (!Blueprint)
@@ -884,6 +908,13 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleSetComponentProperty(
     if (!Params->TryGetStringField(TEXT("property_name"), PropertyName))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'property_name' parameter"));
+    }
+
+    if (IsPlaySessionActive())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("Cannot set a Blueprint component property while PIE/SIE is active. End the play session before mutating Blueprint defaults.")
+        );
     }
 
     // Log all input parameters for debugging

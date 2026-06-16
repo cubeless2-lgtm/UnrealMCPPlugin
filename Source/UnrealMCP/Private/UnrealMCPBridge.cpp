@@ -376,6 +376,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
             }
             // Blueprint Node Commands
             else if (CommandType == TEXT("connect_blueprint_nodes") || 
+                     CommandType == TEXT("delete_blueprint_node") ||
                      CommandType == TEXT("resolve_blueprint") ||
                      CommandType == TEXT("list_blueprint_graphs") ||
                      CommandType == TEXT("resolve_blueprint_graph") ||
@@ -451,14 +452,21 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("inspect_niagara_graph") ||
                      CommandType == TEXT("inspect_niagara_compile_status") ||
                      CommandType == TEXT("inspect_niagara_simulation_stages") ||
+                     CommandType == TEXT("set_niagara_simulation_stage_settings") ||
                      CommandType == TEXT("inspect_niagara_scratch_pad_interface") ||
                      CommandType == TEXT("duplicate_or_attach_emitter_from_source") ||
                      CommandType == TEXT("create_or_duplicate_scratch_pad_module") ||
                      CommandType == TEXT("add_scratch_pad_module_to_stack") ||
+                     CommandType == TEXT("set_niagara_scratch_pad_function_input_default") ||
+                     CommandType == TEXT("link_niagara_scratch_pad_pin_to_user_parameter") ||
+                     CommandType == TEXT("insert_niagara_scratch_pad_custom_hlsl_for_pin") ||
+                     CommandType == TEXT("wrap_niagara_scratch_pad_output_with_stack_context") ||
                      CommandType == TEXT("inspect_niagara_module_inputs") ||
                      CommandType == TEXT("inspect_niagara_data_interface_overrides") ||
                      CommandType == TEXT("create_niagara_module_input_override") ||
                      CommandType == TEXT("set_niagara_render_target2d_module_input") ||
+                     CommandType == TEXT("set_niagara_module_input_user_parameter") ||
+                     CommandType == TEXT("set_niagara_module_input_linked_parameter") ||
                      CommandType == TEXT("set_niagara_module_inputs_batch") ||
                      CommandType == TEXT("set_niagara_module_input_value"))
             {

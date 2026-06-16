@@ -15,6 +15,7 @@
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraGraph.h"
 #include "NiagaraMeshRendererProperties.h"
+#include "NiagaraNodeCustomHlsl.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeInput.h"
 #include "NiagaraNodeOutput.h"
@@ -23,6 +24,7 @@
 #include "NiagaraRibbonRendererProperties.h"
 #include "NiagaraScratchPadContainer.h"
 #include "NiagaraScript.h"
+#include "NiagaraScriptVariable.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraSimulationStageBase.h"
 #include "NiagaraSimulationStageCompileData.h"
@@ -30,9 +32,11 @@
 #include "NiagaraSystem.h"
 #include "NiagaraTypes.h"
 #include "NiagaraVolumeRendererProperties.h"
+#include "EdGraphSchema_Niagara.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "EdGraph/EdGraphSchema.h"
 #include "UObject/Package.h"
 #include "UObject/UnrealType.h"
 #include "ViewModels/Stack/NiagaraParameterHandle.h"
@@ -251,6 +255,198 @@ FString NiagaraEnumValueName(ENiagaraSimStageExecuteBehavior Value)
     default:
         return FString::FromInt(static_cast<int32>(Value));
     }
+}
+
+FString NormalizeNiagaraEnumToken(FString Value)
+{
+    Value.TrimStartAndEndInline();
+    Value.ToLowerInline();
+    Value.ReplaceInline(TEXT("_"), TEXT(""));
+    Value.ReplaceInline(TEXT("-"), TEXT(""));
+    Value.ReplaceInline(TEXT(" "), TEXT(""));
+    return Value;
+}
+
+bool ParseNiagaraIterationSource(const FString& Value, ENiagaraIterationSource& OutValue)
+{
+    const FString Token = NormalizeNiagaraEnumToken(Value);
+    if (Token == TEXT("particles"))
+    {
+        OutValue = ENiagaraIterationSource::Particles;
+        return true;
+    }
+    if (Token == TEXT("datainterface") || Token == TEXT("datainterfaceiteration"))
+    {
+        OutValue = ENiagaraIterationSource::DataInterface;
+        return true;
+    }
+    if (Token == TEXT("directset") || Token == TEXT("direct"))
+    {
+        OutValue = ENiagaraIterationSource::DirectSet;
+        return true;
+    }
+    return false;
+}
+
+bool ParseNiagaraGpuDispatchType(const FString& Value, ENiagaraGpuDispatchType& OutValue)
+{
+    const FString Token = NormalizeNiagaraEnumToken(Value);
+    if (Token == TEXT("oned") || Token == TEXT("1d"))
+    {
+        OutValue = ENiagaraGpuDispatchType::OneD;
+        return true;
+    }
+    if (Token == TEXT("twod") || Token == TEXT("2d"))
+    {
+        OutValue = ENiagaraGpuDispatchType::TwoD;
+        return true;
+    }
+    if (Token == TEXT("threed") || Token == TEXT("3d"))
+    {
+        OutValue = ENiagaraGpuDispatchType::ThreeD;
+        return true;
+    }
+    if (Token == TEXT("custom"))
+    {
+        OutValue = ENiagaraGpuDispatchType::Custom;
+        return true;
+    }
+    return false;
+}
+
+bool ParseNiagaraDirectDispatchElementType(const FString& Value, ENiagaraDirectDispatchElementType& OutValue)
+{
+    const FString Token = NormalizeNiagaraEnumToken(Value);
+    if (Token == TEXT("numthreads") || Token == TEXT("threads"))
+    {
+        OutValue = ENiagaraDirectDispatchElementType::NumThreads;
+        return true;
+    }
+    if (Token == TEXT("numthreadsnoclipping") || Token == TEXT("threadsnoclipping") || Token == TEXT("noclip"))
+    {
+        OutValue = ENiagaraDirectDispatchElementType::NumThreadsNoClipping;
+        return true;
+    }
+    if (Token == TEXT("numgroups") || Token == TEXT("groups"))
+    {
+        OutValue = ENiagaraDirectDispatchElementType::NumGroups;
+        return true;
+    }
+    return false;
+}
+
+bool ParseNiagaraSimStageExecuteBehavior(const FString& Value, ENiagaraSimStageExecuteBehavior& OutValue)
+{
+    const FString Token = NormalizeNiagaraEnumToken(Value);
+    if (Token == TEXT("always"))
+    {
+        OutValue = ENiagaraSimStageExecuteBehavior::Always;
+        return true;
+    }
+    if (Token == TEXT("onsimulationreset") || Token == TEXT("onreset"))
+    {
+        OutValue = ENiagaraSimStageExecuteBehavior::OnSimulationReset;
+        return true;
+    }
+    if (Token == TEXT("notonsimulationreset") || Token == TEXT("notonreset"))
+    {
+        OutValue = ENiagaraSimStageExecuteBehavior::NotOnSimulationReset;
+        return true;
+    }
+    return false;
+}
+
+bool TryGetJsonIntField(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, int32& OutValue, FString& OutError)
+{
+    if (!Object.IsValid() || !Object->HasField(FieldName))
+    {
+        return false;
+    }
+
+    double NumberValue = 0.0;
+    if (!Object->TryGetNumberField(FieldName, NumberValue))
+    {
+        OutError = FString::Printf(TEXT("'%s' must be a number"), FieldName);
+        return false;
+    }
+    if (!FMath::IsFinite(NumberValue))
+    {
+        OutError = FString::Printf(TEXT("'%s' must be finite"), FieldName);
+        return false;
+    }
+
+    const double RoundedValue = FMath::RoundToDouble(NumberValue);
+    if (!FMath::IsNearlyEqual(NumberValue, RoundedValue, KINDA_SMALL_NUMBER))
+    {
+        OutError = FString::Printf(TEXT("'%s' must be an integer"), FieldName);
+        return false;
+    }
+
+    OutValue = static_cast<int32>(RoundedValue);
+    return true;
+}
+
+bool TryGetNiagaraIntBindingDefault(const FNiagaraParameterBindingWithValue& Binding, int32& OutValue)
+{
+    if (Binding.GetDefaultValueArray().Num() != sizeof(int32))
+    {
+        OutValue = 0;
+        return false;
+    }
+
+    OutValue = Binding.GetDefaultValue<int32>();
+    return true;
+}
+
+void SetNiagaraIntBindingDefault(FNiagaraParameterBindingWithValue& Binding, int32 Value)
+{
+    Binding.SetDefaultParameter(FNiagaraTypeDefinition::GetIntDef(), Value);
+}
+
+TSharedPtr<FJsonObject> NiagaraSimStageCompileDataToJsonObject(const FNiagaraSimulationStageCompilationData& CompileData);
+
+TSharedPtr<FJsonObject> NiagaraSimulationStageSettingsToJsonObject(UNiagaraSimulationStageGeneric* Stage)
+{
+    TSharedPtr<FJsonObject> StageObject = MakeShared<FJsonObject>();
+    if (!Stage)
+    {
+        return StageObject;
+    }
+
+    int32 ElementCountX = 0;
+    int32 ElementCountY = 0;
+    int32 ElementCountZ = 0;
+    int32 NumIterations = 0;
+    TryGetNiagaraIntBindingDefault(Stage->ElementCountX, ElementCountX);
+    TryGetNiagaraIntBindingDefault(Stage->ElementCountY, ElementCountY);
+    TryGetNiagaraIntBindingDefault(Stage->ElementCountZ, ElementCountZ);
+    TryGetNiagaraIntBindingDefault(Stage->NumIterations, NumIterations);
+
+    StageObject->SetStringField(TEXT("stage_name"), Stage->SimulationStageName.ToString());
+    StageObject->SetBoolField(TEXT("enabled"), Stage->bEnabled != 0);
+    StageObject->SetStringField(TEXT("iteration_source"), NiagaraEnumValueName(Stage->IterationSource));
+    StageObject->SetStringField(TEXT("execute_behavior"), NiagaraEnumValueName(Stage->ExecuteBehavior));
+    StageObject->SetStringField(TEXT("direct_dispatch_type"), NiagaraEnumValueName(Stage->DirectDispatchType));
+    StageObject->SetStringField(TEXT("direct_dispatch_element_type"), NiagaraEnumValueName(Stage->DirectDispatchElementType));
+    StageObject->SetBoolField(TEXT("gpu_dispatch_force_linear"), Stage->bGpuDispatchForceLinear != 0);
+    StageObject->SetBoolField(TEXT("override_gpu_dispatch_num_threads"), Stage->bOverrideGpuDispatchNumThreads != 0);
+    StageObject->SetArrayField(TEXT("element_count"), IntArrayToJsonValues({ ElementCountX, ElementCountY, ElementCountZ }));
+    StageObject->SetNumberField(TEXT("num_iterations"), NumIterations);
+
+#if WITH_EDITORONLY_DATA
+    TArray<FNiagaraSimulationStageCompilationData> CompilationData;
+    const bool bFilledCompilationData = Stage->FillCompilationData(CompilationData);
+    TArray<TSharedPtr<FJsonValue>> CompileDataValues;
+    for (const FNiagaraSimulationStageCompilationData& CompileData : CompilationData)
+    {
+        CompileDataValues.Add(MakeShared<FJsonValueObject>(NiagaraSimStageCompileDataToJsonObject(CompileData)));
+    }
+    StageObject->SetBoolField(TEXT("filled_compile_data"), bFilledCompilationData);
+    StageObject->SetNumberField(TEXT("compile_data_count"), CompileDataValues.Num());
+    StageObject->SetArrayField(TEXT("compile_data"), CompileDataValues);
+#endif
+
+    return StageObject;
 }
 
 FString TextureRenderTargetFormatName(ETextureRenderTargetFormat Format)
@@ -651,6 +847,68 @@ TArray<TSharedPtr<FJsonValue>> LinkedPinsToJson(const UEdGraphPin* Pin, bool bIn
     return Values;
 }
 
+bool IsNiagaraDynamicAddPin(const UEdGraphPin* Pin)
+{
+    return Pin &&
+        Pin->PinType.PinCategory == UEdGraphSchema_Niagara::PinCategoryMisc &&
+        Pin->PinType.PinSubCategory == TEXT("DynamicAddPin");
+}
+
+UEdGraphPin* FindGraphPinByName(UEdGraphNode* Node, EEdGraphPinDirection Direction, const FName PinName, bool bSkipDynamicAddPins = true)
+{
+    if (!Node)
+    {
+        return nullptr;
+    }
+
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (!Pin || Pin->Direction != Direction)
+        {
+            continue;
+        }
+        if (bSkipDynamicAddPins && IsNiagaraDynamicAddPin(Pin))
+        {
+            continue;
+        }
+        if (Pin->PinName == PinName)
+        {
+            return Pin;
+        }
+    }
+    return nullptr;
+}
+
+FString GetNiagaraCustomHlslString(const UNiagaraNodeCustomHlsl* CustomNode)
+{
+    if (!CustomNode)
+    {
+        return FString();
+    }
+
+    if (const FStrProperty* CustomHlslProperty = FindFProperty<FStrProperty>(CustomNode->GetClass(), TEXT("CustomHlsl")))
+    {
+        return CustomHlslProperty->GetPropertyValue_InContainer(CustomNode);
+    }
+    return FString();
+}
+
+bool SetNiagaraCustomHlslString(UNiagaraNodeCustomHlsl* CustomNode, const FString& CustomHlsl)
+{
+    if (!CustomNode)
+    {
+        return false;
+    }
+
+    if (FStrProperty* CustomHlslProperty = FindFProperty<FStrProperty>(CustomNode->GetClass(), TEXT("CustomHlsl")))
+    {
+        CustomNode->Modify();
+        CustomHlslProperty->SetPropertyValue_InContainer(CustomNode, CustomHlsl);
+        return true;
+    }
+    return false;
+}
+
 TArray<TSharedPtr<FJsonValue>> GraphPinsToJson(const TArray<UEdGraphPin*>& Pins)
 {
     TArray<TSharedPtr<FJsonValue>> Values;
@@ -659,6 +917,172 @@ TArray<TSharedPtr<FJsonValue>> GraphPinsToJson(const TArray<UEdGraphPin*>& Pins)
         Values.Add(MakeShared<FJsonValueObject>(GraphPinToJsonObject(Pin)));
     }
     return Values;
+}
+
+FString FormatNiagaraPinNumber(double Value)
+{
+    return FString::Printf(TEXT("%.6f"), Value);
+}
+
+bool TryGetJsonNumberFieldCaseInsensitive(const TSharedPtr<FJsonObject>& Object, const FString& LowerName, double& OutValue)
+{
+    if (!Object.IsValid())
+    {
+        return false;
+    }
+
+    if (Object->TryGetNumberField(LowerName, OutValue))
+    {
+        return true;
+    }
+
+    FString UpperName = LowerName.ToUpper();
+    return Object->TryGetNumberField(UpperName, OutValue);
+}
+
+bool BuildNiagaraPinDefaultValueFromJson(const TSharedPtr<FJsonValue>& Value, FString& OutDefaultValue, FString& OutError)
+{
+    if (!Value.IsValid())
+    {
+        OutError = TEXT("Missing 'default_value' or 'value' parameter");
+        return false;
+    }
+
+    if (Value->Type == EJson::String)
+    {
+        OutDefaultValue = Value->AsString();
+        return true;
+    }
+
+    if (Value->Type == EJson::Number)
+    {
+        double NumberValue = 0.0;
+        if (!Value->TryGetNumber(NumberValue))
+        {
+            OutError = TEXT("Expected numeric Niagara pin default value");
+            return false;
+        }
+        OutDefaultValue = FormatNiagaraPinNumber(NumberValue);
+        return true;
+    }
+
+    if (Value->Type == EJson::Boolean)
+    {
+        bool BoolValue = false;
+        if (!Value->TryGetBool(BoolValue))
+        {
+            OutError = TEXT("Expected boolean Niagara pin default value");
+            return false;
+        }
+        OutDefaultValue = BoolValue ? TEXT("true") : TEXT("false");
+        return true;
+    }
+
+    if (Value->Type == EJson::Array)
+    {
+        TArray<double> Values;
+        if (!JsonArrayToDoubles(Value, Values))
+        {
+            OutError = TEXT("Expected numeric array Niagara pin default value");
+            return false;
+        }
+
+        if (Values.Num() == 2)
+        {
+            OutDefaultValue = FString::Printf(
+                TEXT("X=%s Y=%s"),
+                *FormatNiagaraPinNumber(Values[0]),
+                *FormatNiagaraPinNumber(Values[1]));
+            return true;
+        }
+        if (Values.Num() == 3)
+        {
+            OutDefaultValue = FString::Printf(
+                TEXT("(X=%s,Y=%s,Z=%s)"),
+                *FormatNiagaraPinNumber(Values[0]),
+                *FormatNiagaraPinNumber(Values[1]),
+                *FormatNiagaraPinNumber(Values[2]));
+            return true;
+        }
+        if (Values.Num() == 4)
+        {
+            OutDefaultValue = FString::Printf(
+                TEXT("(R=%s,G=%s,B=%s,A=%s)"),
+                *FormatNiagaraPinNumber(Values[0]),
+                *FormatNiagaraPinNumber(Values[1]),
+                *FormatNiagaraPinNumber(Values[2]),
+                *FormatNiagaraPinNumber(Values[3]));
+            return true;
+        }
+
+        OutError = FString::Printf(TEXT("Unsupported Niagara pin default array length: %d"), Values.Num());
+        return false;
+    }
+
+    if (Value->Type == EJson::Object)
+    {
+        const TSharedPtr<FJsonObject> Object = Value->AsObject();
+        double R = 0.0;
+        double G = 0.0;
+        double B = 0.0;
+        double A = 1.0;
+        if (TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("r"), R) &&
+            TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("g"), G) &&
+            TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("b"), B))
+        {
+            TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("a"), A);
+            OutDefaultValue = FString::Printf(
+                TEXT("(R=%s,G=%s,B=%s,A=%s)"),
+                *FormatNiagaraPinNumber(R),
+                *FormatNiagaraPinNumber(G),
+                *FormatNiagaraPinNumber(B),
+                *FormatNiagaraPinNumber(A));
+            return true;
+        }
+
+        double X = 0.0;
+        double Y = 0.0;
+        double Z = 0.0;
+        double W = 0.0;
+        if (TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("x"), X) &&
+            TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("y"), Y))
+        {
+            if (TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("z"), Z))
+            {
+                if (TryGetJsonNumberFieldCaseInsensitive(Object, TEXT("w"), W))
+                {
+                    OutDefaultValue = FString::Printf(
+                        TEXT("(X=%s,Y=%s,Z=%s,W=%s)"),
+                        *FormatNiagaraPinNumber(X),
+                        *FormatNiagaraPinNumber(Y),
+                        *FormatNiagaraPinNumber(Z),
+                        *FormatNiagaraPinNumber(W));
+                }
+                else
+                {
+                    OutDefaultValue = FString::Printf(
+                        TEXT("(X=%s,Y=%s,Z=%s)"),
+                        *FormatNiagaraPinNumber(X),
+                        *FormatNiagaraPinNumber(Y),
+                        *FormatNiagaraPinNumber(Z));
+                }
+            }
+            else
+            {
+                OutDefaultValue = FString::Printf(
+                    TEXT("X=%s Y=%s"),
+                    *FormatNiagaraPinNumber(X),
+                    *FormatNiagaraPinNumber(Y));
+            }
+            return true;
+        }
+
+        OutError = TEXT("Expected object Niagara pin default value with r/g/b[/a] or x/y[/z[/w]] fields");
+        return false;
+    }
+
+    OutError = TEXT("Unsupported JSON type for Niagara pin default value");
+    return false;
 }
 
 TArray<TSharedPtr<FJsonValue>> StringsToJson(const TArray<FString>& Values);
@@ -1589,7 +2013,12 @@ int32 NiagaraInputControlPriority(const FString& ControlKind, const FString& Fun
 
 TSharedPtr<FJsonObject> BuildFunctionCallJson(const UNiagaraNodeFunctionCall* FunctionCall, int32 NodeIndex, bool bIncludePins);
 TSharedPtr<FJsonObject> BuildRenderTargetObjectJson(const UObject* Object);
-TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(const UNiagaraDataInterface* DataInterface, UNiagaraSystem* System = nullptr);
+TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(
+    const UNiagaraDataInterface* DataInterface,
+    UNiagaraSystem* System = nullptr,
+    bool bIncludeProperties = false,
+    int32 MaxProperties = 120,
+    int32 MaxPropertyValueLength = 512);
 const UObject* GetObjectPropertyForInspection(const UObject* Object, const FName PropertyName);
 
 bool IsLowSignalNiagaraInputPinName(const FString& PinName)
@@ -1797,11 +2226,12 @@ bool ValidateLinkedNiagaraDataInterfaceInputNode(UEdGraphPin& OverridePin, FStri
 
     const bool bIsSupportedOverrideValueNode =
         LinkedNode->IsA<UNiagaraNodeInput>() ||
+        LinkedNode->IsA<UNiagaraNodeFunctionCall>() ||
         LinkedNode->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapGet"));
     if (!bIsSupportedOverrideValueNode)
     {
         OutError = FString::Printf(
-            TEXT("Existing override value node '%s' is not a direct Niagara data input or parameter-map-get node; refusing to rewrite an unsupported graph shape"),
+            TEXT("Existing override value node '%s' is not a direct Niagara data input, parameter-map-get, or dynamic-input function node; refusing to rewrite an unsupported graph shape"),
             *LinkedNode->GetName());
         return false;
     }
@@ -2117,7 +2547,11 @@ TSharedPtr<FJsonObject> BuildInputNodeJson(const UNiagaraNodeInput* InputNode)
     InputObject->SetBoolField(TEXT("is_hidden"), InputNode->IsHidden());
     InputObject->SetBoolField(TEXT("can_auto_bind"), InputNode->CanAutoBind());
     InputObject->SetObjectField(TEXT("object_asset"), BuildRenderTargetObjectJson(GetObjectPropertyForInspection(InputNode, TEXT("ObjectAsset"))));
-    InputObject->SetObjectField(TEXT("data_interface"), BuildDataInterfaceInspectionJson(Cast<UNiagaraDataInterface>(GetObjectPropertyForInspection(InputNode, TEXT("DataInterface")))));
+    const UNiagaraDataInterface* DataInterface = Cast<UNiagaraDataInterface>(GetObjectPropertyForInspection(InputNode, TEXT("DataInterface")));
+    if (DataInterface || InputNode->Input.GetType().IsDataInterface())
+    {
+        InputObject->SetObjectField(TEXT("data_interface"), BuildDataInterfaceInspectionJson(DataInterface));
+    }
     InputObject->SetArrayField(TEXT("control_hints"), StringsToJson(BuildNiagaraControlHints(InputNode->Input.GetName().ToString())));
     return InputObject;
 }
@@ -2193,12 +2627,20 @@ const UObject* GetObjectPropertyForInspection(const UObject* Object, const FName
     return Property ? Property->GetObjectPropertyValue_InContainer(Object) : nullptr;
 }
 
-TSharedPtr<FJsonObject> BuildObjectPropertySnapshotJson(const UObject* Object, int32 MaxProperties = 120)
+TSharedPtr<FJsonObject> BuildObjectPropertySnapshotJson(
+    const UObject* Object,
+    int32 MaxProperties = 120,
+    int32 MaxPropertyValueLength = 512)
 {
     TSharedPtr<FJsonObject> SnapshotJson = MakeShared<FJsonObject>();
     TArray<TSharedPtr<FJsonValue>> PropertyValues;
     int32 PropertyCount = 0;
+    int32 EligiblePropertyCount = 0;
+    int32 SkippedTransientCount = 0;
+    int32 SkippedNonEditableCount = 0;
+    int32 TruncatedValueCount = 0;
     const int32 SafeMaxProperties = FMath::Clamp(MaxProperties, 0, 500);
+    const int32 SafeMaxPropertyValueLength = FMath::Clamp(MaxPropertyValueLength, 64, 4096);
 
     if (Object)
     {
@@ -2211,6 +2653,20 @@ TSharedPtr<FJsonObject> BuildObjectPropertySnapshotJson(const UObject* Object, i
             }
 
             ++PropertyCount;
+            const bool bIsTransient = Property->HasAnyPropertyFlags(CPF_Transient);
+            const bool bIsEditable = Property->HasAnyPropertyFlags(CPF_Edit);
+            if (bIsTransient)
+            {
+                ++SkippedTransientCount;
+                continue;
+            }
+            if (!bIsEditable)
+            {
+                ++SkippedNonEditableCount;
+                continue;
+            }
+
+            ++EligiblePropertyCount;
             if (PropertyValues.Num() >= SafeMaxProperties)
             {
                 continue;
@@ -2218,29 +2674,51 @@ TSharedPtr<FJsonObject> BuildObjectPropertySnapshotJson(const UObject* Object, i
 
             FString ValueText;
             Property->ExportText_InContainer(0, ValueText, Object, Object, const_cast<UObject*>(Object), PPF_None);
+            const bool bValueTruncated = ValueText.Len() > SafeMaxPropertyValueLength;
+            if (bValueTruncated)
+            {
+                ValueText.LeftInline(SafeMaxPropertyValueLength);
+                ++TruncatedValueCount;
+            }
 
             TSharedPtr<FJsonObject> PropertyJson = MakeShared<FJsonObject>();
             PropertyJson->SetStringField(TEXT("name"), Property->GetName());
             PropertyJson->SetStringField(TEXT("cpp_type"), Property->GetCPPType());
             PropertyJson->SetStringField(TEXT("value"), ValueText);
-            PropertyJson->SetBoolField(TEXT("is_transient"), Property->HasAnyPropertyFlags(CPF_Transient));
-            PropertyJson->SetBoolField(TEXT("is_editable"), Property->HasAnyPropertyFlags(CPF_Edit));
+            PropertyJson->SetBoolField(TEXT("value_truncated"), bValueTruncated);
+            PropertyJson->SetBoolField(TEXT("is_transient"), bIsTransient);
+            PropertyJson->SetBoolField(TEXT("is_editable"), bIsEditable);
             PropertyValues.Add(MakeShared<FJsonValueObject>(PropertyJson));
         }
     }
 
     SnapshotJson->SetNumberField(TEXT("property_count"), PropertyCount);
-    SnapshotJson->SetBoolField(TEXT("properties_truncated"), PropertyCount > PropertyValues.Num());
+    SnapshotJson->SetNumberField(TEXT("eligible_property_count"), EligiblePropertyCount);
+    SnapshotJson->SetNumberField(TEXT("included_property_count"), PropertyValues.Num());
+    SnapshotJson->SetNumberField(TEXT("skipped_transient_count"), SkippedTransientCount);
+    SnapshotJson->SetNumberField(TEXT("skipped_non_editable_count"), SkippedNonEditableCount);
+    SnapshotJson->SetNumberField(TEXT("truncated_value_count"), TruncatedValueCount);
+    SnapshotJson->SetNumberField(TEXT("max_property_value_length"), SafeMaxPropertyValueLength);
+    SnapshotJson->SetBoolField(TEXT("properties_truncated"), EligiblePropertyCount > PropertyValues.Num());
     SnapshotJson->SetArrayField(TEXT("properties"), PropertyValues);
     return SnapshotJson;
 }
 
-TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(const UNiagaraDataInterface* DataInterface, UNiagaraSystem* System)
+TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(
+    const UNiagaraDataInterface* DataInterface,
+    UNiagaraSystem* System,
+    bool bIncludeProperties,
+    int32 MaxProperties,
+    int32 MaxPropertyValueLength)
 {
     TSharedPtr<FJsonObject> DataInterfaceJson = BuildUObjectReferenceJson(DataInterface);
     DataInterfaceJson->SetBoolField(TEXT("is_data_interface"), DataInterface != nullptr);
     DataInterfaceJson->SetBoolField(TEXT("is_render_target_2d_data_interface"), DataInterface && DataInterface->IsA<UNiagaraDataInterfaceRenderTarget2D>());
-    DataInterfaceJson->SetObjectField(TEXT("properties"), BuildObjectPropertySnapshotJson(DataInterface));
+    DataInterfaceJson->SetBoolField(TEXT("properties_included"), bIncludeProperties && DataInterface != nullptr);
+    if (bIncludeProperties && DataInterface)
+    {
+        DataInterfaceJson->SetObjectField(TEXT("properties"), BuildObjectPropertySnapshotJson(DataInterface, MaxProperties, MaxPropertyValueLength));
+    }
 
     const UNiagaraDataInterfaceRenderTarget2D* RenderTargetDataInterface = Cast<UNiagaraDataInterfaceRenderTarget2D>(DataInterface);
     if (RenderTargetDataInterface)
@@ -2263,7 +2741,10 @@ TSharedPtr<FJsonObject> BuildDataInterfaceInspectionJson(const UNiagaraDataInter
 
 TSharedPtr<FJsonObject> BuildNiagaraDataInterfaceOverrideJson(
     const UEdGraphPin* OverridePin,
-    UNiagaraSystem* System)
+    UNiagaraSystem* System,
+    bool bIncludeDataInterfaceProperties,
+    int32 MaxDataInterfaceProperties,
+    int32 MaxDataInterfacePropertyValueLength)
 {
     TSharedPtr<FJsonObject> OverrideJson = MakeShared<FJsonObject>();
     OverrideJson->SetBoolField(TEXT("has_override_pin"), OverridePin != nullptr);
@@ -2317,7 +2798,14 @@ TSharedPtr<FJsonObject> BuildNiagaraDataInterfaceOverrideJson(
     OverrideJson->SetObjectField(TEXT("object_asset"), BuildRenderTargetObjectJson(GetObjectPropertyForInspection(InputNode, TEXT("ObjectAsset"))));
 
     const UNiagaraDataInterface* DataInterface = Cast<UNiagaraDataInterface>(GetObjectPropertyForInspection(InputNode, TEXT("DataInterface")));
-    OverrideJson->SetObjectField(TEXT("data_interface"), BuildDataInterfaceInspectionJson(DataInterface, System));
+    OverrideJson->SetObjectField(
+        TEXT("data_interface"),
+        BuildDataInterfaceInspectionJson(
+            DataInterface,
+            System,
+            bIncludeDataInterfaceProperties,
+            MaxDataInterfaceProperties,
+            MaxDataInterfacePropertyValueLength));
     return OverrideJson;
 }
 
@@ -2586,6 +3074,10 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCommand(const FString& 
     {
         return HandleInspectNiagaraSimulationStages(Params);
     }
+    if (CommandType == TEXT("set_niagara_simulation_stage_settings"))
+    {
+        return HandleSetNiagaraSimulationStageSettings(Params);
+    }
     if (CommandType == TEXT("inspect_niagara_scratch_pad_interface"))
     {
         return HandleInspectNiagaraScratchPadInterface(Params);
@@ -2602,6 +3094,22 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCommand(const FString& 
     {
         return HandleAddScratchPadModuleToStack(Params);
     }
+    if (CommandType == TEXT("set_niagara_scratch_pad_function_input_default"))
+    {
+        return HandleSetNiagaraScratchPadFunctionInputDefault(Params);
+    }
+    if (CommandType == TEXT("link_niagara_scratch_pad_pin_to_user_parameter"))
+    {
+        return HandleLinkNiagaraScratchPadPinToUserParameter(Params);
+    }
+    if (CommandType == TEXT("insert_niagara_scratch_pad_custom_hlsl_for_pin"))
+    {
+        return HandleInsertNiagaraScratchPadCustomHlslForPin(Params);
+    }
+    if (CommandType == TEXT("wrap_niagara_scratch_pad_output_with_stack_context"))
+    {
+        return HandleWrapNiagaraScratchPadOutputWithStackContext(Params);
+    }
     if (CommandType == TEXT("inspect_niagara_module_inputs"))
     {
         return HandleInspectNiagaraModuleInputs(Params);
@@ -2617,6 +3125,14 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleCommand(const FString& 
     if (CommandType == TEXT("set_niagara_render_target2d_module_input"))
     {
         return HandleSetNiagaraRenderTarget2DModuleInput(Params);
+    }
+    if (CommandType == TEXT("set_niagara_module_input_user_parameter"))
+    {
+        return HandleSetNiagaraModuleInputUserParameter(Params);
+    }
+    if (CommandType == TEXT("set_niagara_module_input_linked_parameter"))
+    {
+        return HandleSetNiagaraModuleInputLinkedParameter(Params);
     }
     if (CommandType == TEXT("set_niagara_module_inputs_batch"))
     {
@@ -3717,6 +4233,365 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraGraph(con
     return Result;
 }
 
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraSimulationStageSettings(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara SimulationStage outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    int32 TargetEmitterIndex = INDEX_NONE;
+    int32 TargetStageIndex = INDEX_NONE;
+    FString TargetEmitterName;
+    FString TargetStageName;
+    Params->TryGetNumberField(TEXT("emitter_index"), TargetEmitterIndex);
+    Params->TryGetNumberField(TEXT("stage_index"), TargetStageIndex);
+    Params->TryGetStringField(TEXT("emitter_name"), TargetEmitterName);
+    Params->TryGetStringField(TEXT("stage_name"), TargetStageName);
+    TargetEmitterName.TrimStartAndEndInline();
+    TargetStageName.TrimStartAndEndInline();
+
+    if (TargetStageIndex == INDEX_NONE && TargetStageName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("set_niagara_simulation_stage_settings requires 'stage_index' or 'stage_name'"));
+    }
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    FString ErrorMessage;
+    int32 ElementCountX = 0;
+    int32 ElementCountY = 0;
+    int32 ElementCountZ = 0;
+    bool bHasElementCountX = TryGetJsonIntField(Params, TEXT("element_count_x"), ElementCountX, ErrorMessage);
+    if (!ErrorMessage.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+    bool bHasElementCountY = TryGetJsonIntField(Params, TEXT("element_count_y"), ElementCountY, ErrorMessage);
+    if (!ErrorMessage.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+    bool bHasElementCountZ = TryGetJsonIntField(Params, TEXT("element_count_z"), ElementCountZ, ErrorMessage);
+    if (!ErrorMessage.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* ElementCountArray = nullptr;
+    if (Params->TryGetArrayField(TEXT("element_count"), ElementCountArray))
+    {
+        if (!ElementCountArray || ElementCountArray->Num() < 1 || ElementCountArray->Num() > 3)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'element_count' must contain 1 to 3 integer values"));
+        }
+        for (int32 Index = 0; Index < ElementCountArray->Num(); ++Index)
+        {
+            double NumberValue = 0.0;
+            if (!(*ElementCountArray)[Index].IsValid() || !(*ElementCountArray)[Index]->TryGetNumber(NumberValue))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'element_count' values must be numbers"));
+            }
+            const double RoundedValue = FMath::RoundToDouble(NumberValue);
+            if (!FMath::IsFinite(NumberValue) || !FMath::IsNearlyEqual(NumberValue, RoundedValue, KINDA_SMALL_NUMBER))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'element_count' values must be finite integers"));
+            }
+
+            if (Index == 0)
+            {
+                ElementCountX = static_cast<int32>(RoundedValue);
+                bHasElementCountX = true;
+            }
+            else if (Index == 1)
+            {
+                ElementCountY = static_cast<int32>(RoundedValue);
+                bHasElementCountY = true;
+            }
+            else
+            {
+                ElementCountZ = static_cast<int32>(RoundedValue);
+                bHasElementCountZ = true;
+            }
+        }
+    }
+
+    int32 NumIterations = 0;
+    const bool bHasNumIterations = TryGetJsonIntField(Params, TEXT("num_iterations"), NumIterations, ErrorMessage);
+    if (!ErrorMessage.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    bool bEnabled = false;
+    const bool bHasEnabled = Params->TryGetBoolField(TEXT("enabled"), bEnabled);
+
+    bool bGpuDispatchForceLinear = false;
+    const bool bHasGpuDispatchForceLinear = Params->TryGetBoolField(TEXT("gpu_dispatch_force_linear"), bGpuDispatchForceLinear);
+
+    bool bOverrideGpuDispatchNumThreads = false;
+    const bool bHasOverrideGpuDispatchNumThreads = Params->TryGetBoolField(TEXT("override_gpu_dispatch_num_threads"), bOverrideGpuDispatchNumThreads);
+
+    FString IterationSourceText;
+    FString DirectDispatchTypeText;
+    FString DirectDispatchElementTypeText;
+    FString ExecuteBehaviorText;
+    ENiagaraIterationSource IterationSource = ENiagaraIterationSource::Particles;
+    ENiagaraGpuDispatchType DirectDispatchType = ENiagaraGpuDispatchType::OneD;
+    ENiagaraDirectDispatchElementType DirectDispatchElementType = ENiagaraDirectDispatchElementType::NumThreads;
+    ENiagaraSimStageExecuteBehavior ExecuteBehavior = ENiagaraSimStageExecuteBehavior::Always;
+    const bool bHasIterationSource = Params->TryGetStringField(TEXT("iteration_source"), IterationSourceText);
+    const bool bHasDirectDispatchType = Params->TryGetStringField(TEXT("direct_dispatch_type"), DirectDispatchTypeText);
+    const bool bHasDirectDispatchElementType = Params->TryGetStringField(TEXT("direct_dispatch_element_type"), DirectDispatchElementTypeText);
+    const bool bHasExecuteBehavior = Params->TryGetStringField(TEXT("execute_behavior"), ExecuteBehaviorText);
+
+    if (bHasIterationSource && !ParseNiagaraIterationSource(IterationSourceText, IterationSource))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unsupported iteration_source: %s"), *IterationSourceText));
+    }
+    if (bHasDirectDispatchType && !ParseNiagaraGpuDispatchType(DirectDispatchTypeText, DirectDispatchType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unsupported direct_dispatch_type: %s"), *DirectDispatchTypeText));
+    }
+    if (bHasDirectDispatchElementType && !ParseNiagaraDirectDispatchElementType(DirectDispatchElementTypeText, DirectDispatchElementType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unsupported direct_dispatch_element_type: %s"), *DirectDispatchElementTypeText));
+    }
+    if (bHasExecuteBehavior && !ParseNiagaraSimStageExecuteBehavior(ExecuteBehaviorText, ExecuteBehavior))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unsupported execute_behavior: %s"), *ExecuteBehaviorText));
+    }
+
+    const bool bHasAnySetting =
+        bHasEnabled ||
+        bHasIterationSource ||
+        bHasDirectDispatchType ||
+        bHasDirectDispatchElementType ||
+        bHasExecuteBehavior ||
+        bHasGpuDispatchForceLinear ||
+        bHasOverrideGpuDispatchNumThreads ||
+        bHasElementCountX ||
+        bHasElementCountY ||
+        bHasElementCountZ ||
+        bHasNumIterations;
+
+    if (!bHasAnySetting)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No SimulationStage setting fields were provided"));
+    }
+
+    if ((bHasElementCountX && ElementCountX < 0) || (bHasElementCountY && ElementCountY < 0) || (bHasElementCountZ && ElementCountZ < 0))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("element_count values cannot be negative"));
+    }
+    if (bHasNumIterations && NumIterations < 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("num_iterations must be >= 1"));
+    }
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraSimulationStageGeneric* MatchedStage = nullptr;
+    FString MatchedEmitterName;
+    int32 MatchedEmitterIndex = INDEX_NONE;
+    int32 MatchedStageIndex = INDEX_NONE;
+    int32 MatchCount = 0;
+
+    int32 CurrentEmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        const bool bEmitterMatches =
+            (TargetEmitterIndex == INDEX_NONE || TargetEmitterIndex == CurrentEmitterIndex) &&
+            (TargetEmitterName.IsEmpty() || TargetEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase));
+
+        if (bEmitterMatches)
+        {
+            if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+            {
+                const TArray<UNiagaraSimulationStageBase*>& SimulationStages = EmitterData->GetSimulationStages();
+                for (int32 StageIndex = 0; StageIndex < SimulationStages.Num(); ++StageIndex)
+                {
+                    UNiagaraSimulationStageBase* Stage = SimulationStages[StageIndex];
+                    if (!Stage)
+                    {
+                        continue;
+                    }
+
+                    const bool bStageMatches =
+                        (TargetStageIndex == INDEX_NONE || TargetStageIndex == StageIndex) &&
+                        (TargetStageName.IsEmpty() || TargetStageName.Equals(Stage->SimulationStageName.ToString(), ESearchCase::IgnoreCase));
+
+                    if (bStageMatches)
+                    {
+                        ++MatchCount;
+                        if (!MatchedStage)
+                        {
+                            MatchedStage = Cast<UNiagaraSimulationStageGeneric>(Stage);
+                            MatchedEmitterName = EmitterName;
+                            MatchedEmitterIndex = CurrentEmitterIndex;
+                            MatchedStageIndex = StageIndex;
+                        }
+                    }
+                }
+            }
+        }
+        ++CurrentEmitterIndex;
+    }
+
+    if (MatchCount == 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching Niagara SimulationStage was found"));
+    }
+    if (MatchCount > 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("SimulationStage selector matched more than one stage; provide emitter_index/emitter_name or stage_index"));
+    }
+    if (!MatchedStage)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Matched SimulationStage is not a generic stage and cannot be edited by this command"));
+    }
+
+    TSharedPtr<FJsonObject> BeforeSettings = NiagaraSimulationStageSettingsToJsonObject(MatchedStage);
+
+    ENiagaraIterationSource NewIterationSource = bHasIterationSource ? IterationSource : MatchedStage->IterationSource;
+    ENiagaraGpuDispatchType NewDirectDispatchType = bHasDirectDispatchType ? DirectDispatchType : MatchedStage->DirectDispatchType;
+    int32 NewElementCountX = 0;
+    int32 NewElementCountY = 0;
+    int32 NewElementCountZ = 0;
+    TryGetNiagaraIntBindingDefault(MatchedStage->ElementCountX, NewElementCountX);
+    TryGetNiagaraIntBindingDefault(MatchedStage->ElementCountY, NewElementCountY);
+    TryGetNiagaraIntBindingDefault(MatchedStage->ElementCountZ, NewElementCountZ);
+    if (bHasElementCountX)
+    {
+        NewElementCountX = ElementCountX;
+    }
+    if (bHasElementCountY)
+    {
+        NewElementCountY = ElementCountY;
+    }
+    if (bHasElementCountZ)
+    {
+        NewElementCountZ = ElementCountZ;
+    }
+
+    if (NewIterationSource == ENiagaraIterationSource::DirectSet)
+    {
+        if (NewDirectDispatchType == ENiagaraGpuDispatchType::OneD && NewElementCountX <= 0)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("DirectSet OneD dispatch requires element_count_x > 0"));
+        }
+        if (NewDirectDispatchType == ENiagaraGpuDispatchType::TwoD && (NewElementCountX <= 0 || NewElementCountY <= 0))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("DirectSet TwoD dispatch requires element_count_x and element_count_y > 0"));
+        }
+        if (NewDirectDispatchType == ENiagaraGpuDispatchType::ThreeD && (NewElementCountX <= 0 || NewElementCountY <= 0 || NewElementCountZ <= 0))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("DirectSet ThreeD dispatch requires element_count_x/y/z > 0"));
+        }
+    }
+
+    System->Modify();
+    MatchedStage->Modify();
+
+    if (bHasEnabled)
+    {
+        MatchedStage->SetEnabled(bEnabled);
+    }
+    if (bHasIterationSource)
+    {
+        MatchedStage->IterationSource = IterationSource;
+    }
+    if (bHasDirectDispatchType)
+    {
+        MatchedStage->DirectDispatchType = DirectDispatchType;
+    }
+    if (bHasDirectDispatchElementType)
+    {
+        MatchedStage->DirectDispatchElementType = DirectDispatchElementType;
+    }
+    if (bHasExecuteBehavior)
+    {
+        MatchedStage->ExecuteBehavior = ExecuteBehavior;
+    }
+    if (bHasGpuDispatchForceLinear)
+    {
+        MatchedStage->bGpuDispatchForceLinear = bGpuDispatchForceLinear;
+    }
+    if (bHasOverrideGpuDispatchNumThreads)
+    {
+        MatchedStage->bOverrideGpuDispatchNumThreads = bOverrideGpuDispatchNumThreads;
+    }
+    if (bHasElementCountX)
+    {
+        SetNiagaraIntBindingDefault(MatchedStage->ElementCountX, ElementCountX);
+    }
+    if (bHasElementCountY)
+    {
+        SetNiagaraIntBindingDefault(MatchedStage->ElementCountY, ElementCountY);
+    }
+    if (bHasElementCountZ)
+    {
+        SetNiagaraIntBindingDefault(MatchedStage->ElementCountZ, ElementCountZ);
+    }
+    if (bHasNumIterations)
+    {
+        SetNiagaraIntBindingDefault(MatchedStage->NumIterations, NumIterations);
+    }
+
+    MatchedStage->RequestRecompile();
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after SimulationStage settings update"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("emitter_name"), MatchedEmitterName);
+    Result->SetNumberField(TEXT("emitter_index"), MatchedEmitterIndex);
+    Result->SetStringField(TEXT("stage_name"), MatchedStage->SimulationStageName.ToString());
+    Result->SetNumberField(TEXT("stage_index"), MatchedStageIndex);
+    Result->SetObjectField(TEXT("before"), BeforeSettings);
+    Result->SetObjectField(TEXT("after"), NiagaraSimulationStageSettingsToJsonObject(MatchedStage));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("simulation_stage_settings"));
+    return Result;
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("set_niagara_simulation_stage_settings requires editor-only Niagara data"));
+#endif
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraScratchPadInterface(const TSharedPtr<FJsonObject>& Params)
 {
     FString SystemPath;
@@ -4720,6 +5595,2529 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleAddScratchPadModuleToSt
 #endif
 }
 
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraScratchPadFunctionInputDefault(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara Scratch Pad graph outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    FString FunctionName;
+    FString FunctionNodeGuid;
+    FString InputPinName;
+    int32 FunctionNodeIndex = INDEX_NONE;
+    int32 FunctionCallIndexSelector = INDEX_NONE;
+    Params->TryGetStringField(TEXT("function_name"), FunctionName);
+    Params->TryGetStringField(TEXT("function_node_guid"), FunctionNodeGuid);
+    Params->TryGetNumberField(TEXT("function_node_index"), FunctionNodeIndex);
+    Params->TryGetNumberField(TEXT("node_index"), FunctionNodeIndex);
+    Params->TryGetNumberField(TEXT("function_call_index"), FunctionCallIndexSelector);
+    if (FunctionName.IsEmpty() && FunctionNodeGuid.IsEmpty() && FunctionNodeIndex == INDEX_NONE && FunctionCallIndexSelector == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing function selector. Provide 'function_name', 'function_node_guid', 'function_node_index', or 'function_call_index'."));
+    }
+    if (!Params->TryGetStringField(TEXT("input_pin_name"), InputPinName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'input_pin_name' parameter"));
+    }
+
+    FString NewDefaultValue;
+    if (!Params->TryGetStringField(TEXT("default_value"), NewDefaultValue))
+    {
+        FString DefaultValueError;
+        const TSharedPtr<FJsonValue> Value = Params->TryGetField(TEXT("value"));
+        if (!BuildNiagaraPinDefaultValueFromJson(Value, NewDefaultValue, DefaultValueError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(DefaultValueError);
+        }
+    }
+
+    FString ScratchPadScriptPath;
+    FString ScratchPadOwnerKind = TEXT("system");
+    FString ScratchPadName;
+    int32 ScratchPadScriptIndex = INDEX_NONE;
+    int32 ScratchPadEmitterIndex = INDEX_NONE;
+    FString ScratchPadEmitterName;
+    Params->TryGetStringField(TEXT("scratch_pad_script_path"), ScratchPadScriptPath);
+    Params->TryGetStringField(TEXT("scratch_pad_owner_kind"), ScratchPadOwnerKind);
+    Params->TryGetStringField(TEXT("scratch_pad_name"), ScratchPadName);
+    Params->TryGetStringField(TEXT("scratch_pad_script_name"), ScratchPadName);
+    Params->TryGetNumberField(TEXT("scratch_pad_script_index"), ScratchPadScriptIndex);
+    Params->TryGetNumberField(TEXT("scratch_pad_emitter_index"), ScratchPadEmitterIndex);
+    Params->TryGetStringField(TEXT("scratch_pad_emitter_name"), ScratchPadEmitterName);
+    if (ScratchPadScriptPath.IsEmpty() && ScratchPadName.IsEmpty() && ScratchPadScriptIndex == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing Scratch Pad selector. Provide 'scratch_pad_script_path', 'scratch_pad_name', or 'scratch_pad_script_index'."));
+    }
+
+    bool bBreakLinks = true;
+    Params->TryGetBoolField(TEXT("break_links"), bBreakLinks);
+
+    bool bAllowMultiLinkBreak = false;
+    Params->TryGetBoolField(TEXT("allow_multi_link_break"), bAllowMultiLinkBreak);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraScript* RequestedScript = nullptr;
+    if (!ScratchPadScriptPath.IsEmpty())
+    {
+        RequestedScript = LoadObject<UNiagaraScript>(nullptr, *NormalizeNiagaraObjectPathForLoad(ScratchPadScriptPath));
+        if (!RequestedScript)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Scratch Pad script: %s"), *ScratchPadScriptPath));
+        }
+    }
+
+    UNiagaraScript* ScratchPadScript = nullptr;
+    FString ResolvedScratchPadOwnerKind;
+    FString ResolvedScratchPadOwnerName;
+    int32 ResolvedScratchPadEmitterIndex = INDEX_NONE;
+    int32 ResolvedScratchPadScriptIndex = INDEX_NONE;
+
+    auto TryMatchScratchPadScript = [&RequestedScript, &ScratchPadName, ScratchPadScriptIndex](
+        const TArray<TObjectPtr<UNiagaraScript>>& Scripts,
+        int32& OutScriptIndex) -> UNiagaraScript*
+    {
+        for (int32 ScriptIndex = 0; ScriptIndex < Scripts.Num(); ++ScriptIndex)
+        {
+            UNiagaraScript* Candidate = Scripts[ScriptIndex].Get();
+            if (!Candidate)
+            {
+                continue;
+            }
+
+            const bool bPathMatches = !RequestedScript || Candidate == RequestedScript || Candidate->GetPathName().Equals(RequestedScript->GetPathName(), ESearchCase::IgnoreCase);
+            const bool bIndexMatches = RequestedScript || ScratchPadScriptIndex == INDEX_NONE || ScratchPadScriptIndex == ScriptIndex;
+            const bool bNameMatches = RequestedScript || ScratchPadName.IsEmpty() || Candidate->GetName().Equals(ScratchPadName, ESearchCase::IgnoreCase);
+            if (bPathMatches && bIndexMatches && bNameMatches)
+            {
+                OutScriptIndex = ScriptIndex;
+                return Candidate;
+            }
+        }
+        return nullptr;
+    };
+
+    auto TryResolveSystemScratchPad = [&]()
+    {
+        int32 MatchedScriptIndex = INDEX_NONE;
+        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(System->ScratchPadScripts, MatchedScriptIndex))
+        {
+            ScratchPadScript = Candidate;
+            ResolvedScratchPadOwnerKind = TEXT("system");
+            ResolvedScratchPadOwnerName = System->GetName();
+            ResolvedScratchPadEmitterIndex = INDEX_NONE;
+            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+            return true;
+        }
+        return false;
+    };
+
+    auto TryResolveEmitterScratchPad = [&]()
+    {
+        int32 CurrentEmitterIndex = 0;
+        for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+        {
+            const FString EmitterName = EmitterHandle.GetName().ToString();
+            const bool bEmitterMatches =
+                RequestedScript ||
+                ((ScratchPadEmitterIndex == INDEX_NONE || ScratchPadEmitterIndex == CurrentEmitterIndex) &&
+                (ScratchPadEmitterName.IsEmpty() || ScratchPadEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase)));
+            if (bEmitterMatches)
+            {
+                if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+                {
+                    if (EmitterData->ScratchPads)
+                    {
+                        int32 MatchedScriptIndex = INDEX_NONE;
+                        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(EmitterData->ScratchPads->Scripts, MatchedScriptIndex))
+                        {
+                            ScratchPadScript = Candidate;
+                            ResolvedScratchPadOwnerKind = TEXT("emitter");
+                            ResolvedScratchPadOwnerName = EmitterName;
+                            ResolvedScratchPadEmitterIndex = CurrentEmitterIndex;
+                            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+                            return true;
+                        }
+                    }
+                }
+            }
+            ++CurrentEmitterIndex;
+        }
+        return false;
+    };
+
+    if (RequestedScript)
+    {
+        TryResolveSystemScratchPad();
+        if (!ScratchPadScript)
+        {
+            TryResolveEmitterScratchPad();
+        }
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("system"), ESearchCase::IgnoreCase))
+    {
+        TryResolveSystemScratchPad();
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("emitter"), ESearchCase::IgnoreCase))
+    {
+        TryResolveEmitterScratchPad();
+    }
+    else
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unsupported scratch_pad_owner_kind. Use 'system' or 'emitter'."));
+    }
+
+    if (!ScratchPadScript)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching target-local Scratch Pad script was found"));
+    }
+
+    UNiagaraScriptSource* ScriptSource = Cast<UNiagaraScriptSource>(ScratchPadScript->GetLatestSource());
+    UNiagaraGraph* Graph = ScriptSource ? ScriptSource->NodeGraph : nullptr;
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Scratch Pad script has no editable graph: %s"), *ScratchPadScript->GetPathName()));
+    }
+
+    UNiagaraNodeFunctionCall* MatchedFunctionCall = nullptr;
+    int32 MatchedFunctionNodeIndex = INDEX_NONE;
+    int32 MatchedFunctionCallIndex = INDEX_NONE;
+    int32 GraphNodeIndex = 0;
+    int32 FunctionCallIndex = 0;
+    int32 MatchCount = 0;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        const int32 CurrentGraphNodeIndex = GraphNodeIndex++;
+        UNiagaraNodeFunctionCall* FunctionCall = Cast<UNiagaraNodeFunctionCall>(Node);
+        if (!FunctionCall)
+        {
+            continue;
+        }
+        const int32 CurrentFunctionCallIndex = FunctionCallIndex++;
+
+        FString CandidateFunctionName = FunctionCall->GetFunctionName();
+        if (CandidateFunctionName.IsEmpty())
+        {
+            CandidateFunctionName = FunctionCall->Signature.GetNameString();
+        }
+        const FString CandidateGuid = FunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const bool bIndexMatches = FunctionNodeIndex == INDEX_NONE || FunctionNodeIndex == CurrentGraphNodeIndex;
+        const bool bFunctionCallIndexMatches = FunctionCallIndexSelector == INDEX_NONE || FunctionCallIndexSelector == CurrentFunctionCallIndex;
+        const bool bNameMatches = FunctionName.IsEmpty() || CandidateFunctionName.Equals(FunctionName, ESearchCase::IgnoreCase);
+        const bool bGuidMatches = FunctionNodeGuid.IsEmpty() || CandidateGuid.Equals(FunctionNodeGuid, ESearchCase::IgnoreCase);
+
+        if (bIndexMatches && bFunctionCallIndexMatches && bNameMatches && bGuidMatches)
+        {
+            ++MatchCount;
+            if (!MatchedFunctionCall)
+            {
+                MatchedFunctionCall = FunctionCall;
+                MatchedFunctionNodeIndex = CurrentGraphNodeIndex;
+                MatchedFunctionCallIndex = CurrentFunctionCallIndex;
+            }
+        }
+    }
+
+    if (!MatchedFunctionCall)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching Scratch Pad function call was found"));
+    }
+    if (MatchCount > 1 && FunctionNodeIndex == INDEX_NONE && FunctionNodeGuid.IsEmpty() && FunctionCallIndexSelector == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Function selector matched %d nodes. Provide 'function_node_index' or 'function_node_guid'."), MatchCount));
+    }
+
+    UEdGraphPin* TargetPin = nullptr;
+    for (UEdGraphPin* Pin : MatchedFunctionCall->Pins)
+    {
+        if (!Pin || Pin->Direction != EGPD_Input)
+        {
+            continue;
+        }
+
+        const FString CandidatePinName = Pin->PinName.ToString();
+        const bool bPinMatches = CandidatePinName.Equals(InputPinName, ESearchCase::IgnoreCase) ||
+            InputPinName.EndsWith(FString::Printf(TEXT(".%s"), *CandidatePinName), ESearchCase::IgnoreCase);
+        if (bPinMatches)
+        {
+            TargetPin = Pin;
+            break;
+        }
+    }
+
+    if (!TargetPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching input pin was found: %s"), *InputPinName));
+    }
+    if (bBreakLinks && TargetPin->LinkedTo.Num() > 1 && !bAllowMultiLinkBreak)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(
+                TEXT("Input pin '%s' has %d links. Pass allow_multi_link_break=true to break all of them."),
+                *TargetPin->PinName.ToString(),
+                TargetPin->LinkedTo.Num()));
+    }
+
+    const FString PreviousDefaultValue = TargetPin->DefaultValue;
+    const FString PreviousDefaultObject = NiagaraObjectPathOrEmpty(TargetPin->DefaultObject);
+    const int32 PreviousLinkCount = TargetPin->LinkedTo.Num();
+    const TArray<TSharedPtr<FJsonValue>> PreviousLinkedSources = LinkedPinsToJson(TargetPin, true);
+
+    System->Modify();
+    ScratchPadScript->Modify();
+    ScriptSource->Modify();
+    Graph->Modify();
+    MatchedFunctionCall->Modify();
+
+    const UEdGraphSchema* Schema = TargetPin->GetSchema();
+    TargetPin->DefaultObject = nullptr;
+    TargetPin->DefaultTextValue = FText::GetEmpty();
+    if (Schema)
+    {
+        Schema->TrySetDefaultValue(*TargetPin, NewDefaultValue);
+    }
+    else
+    {
+        TargetPin->DefaultValue = NewDefaultValue;
+    }
+
+    int32 BrokenLinkCount = 0;
+    if (bBreakLinks && PreviousLinkCount > 0)
+    {
+        BrokenLinkCount = PreviousLinkCount;
+        TargetPin->BreakAllPinLinks(true);
+    }
+
+    Graph->NotifyGraphChanged();
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after Scratch Pad function input default edit"));
+        }
+    }
+
+    FString ResolvedFunctionName = MatchedFunctionCall->GetFunctionName();
+    if (ResolvedFunctionName.IsEmpty())
+    {
+        ResolvedFunctionName = MatchedFunctionCall->Signature.GetNameString();
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_name"), ScratchPadScript->GetName());
+    Result->SetStringField(TEXT("scratch_pad_owner_kind"), ResolvedScratchPadOwnerKind);
+    Result->SetStringField(TEXT("scratch_pad_owner_name"), ResolvedScratchPadOwnerName);
+    Result->SetNumberField(TEXT("scratch_pad_emitter_index"), ResolvedScratchPadEmitterIndex);
+    Result->SetNumberField(TEXT("scratch_pad_script_index"), ResolvedScratchPadScriptIndex);
+    Result->SetStringField(TEXT("function_name"), ResolvedFunctionName);
+    Result->SetNumberField(TEXT("function_node_index"), MatchedFunctionNodeIndex);
+    Result->SetNumberField(TEXT("function_call_index"), MatchedFunctionCallIndex);
+    Result->SetStringField(TEXT("function_node_guid"), MatchedFunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetStringField(TEXT("input_pin_name"), TargetPin->PinName.ToString());
+    Result->SetStringField(TEXT("previous_default_value"), PreviousDefaultValue);
+    Result->SetStringField(TEXT("previous_default_object"), PreviousDefaultObject);
+    Result->SetStringField(TEXT("new_default_value"), TargetPin->DefaultValue);
+    Result->SetNumberField(TEXT("previous_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("broken_link_count"), BrokenLinkCount);
+    Result->SetNumberField(TEXT("new_link_count"), TargetPin->LinkedTo.Num());
+    Result->SetArrayField(TEXT("previous_linked_sources"), PreviousLinkedSources);
+    Result->SetObjectField(TEXT("pin"), GraphPinToJsonObject(TargetPin));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_internal_function_input_default"));
+    return Result;
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("set_niagara_scratch_pad_function_input_default requires editor-only Niagara data"));
+#endif
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleLinkNiagaraScratchPadPinToUserParameter(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara Scratch Pad graph outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    FString TargetPinName;
+    if (!Params->TryGetStringField(TEXT("target_pin_name"), TargetPinName))
+    {
+        Params->TryGetStringField(TEXT("input_pin_name"), TargetPinName);
+    }
+    TargetPinName.TrimStartAndEndInline();
+    if (TargetPinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_pin_name' parameter"));
+    }
+
+    FString UserParameterName;
+    if (!Params->TryGetStringField(TEXT("user_parameter_name"), UserParameterName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'user_parameter_name' parameter"));
+    }
+    UserParameterName.TrimStartAndEndInline();
+    if (UserParameterName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'user_parameter_name' cannot be empty"));
+    }
+    if (!UserParameterName.StartsWith(TEXT("User.")))
+    {
+        UserParameterName = FString::Printf(TEXT("User.%s"), *UserParameterName);
+    }
+
+    bool bOverwriteExisting = false;
+    Params->TryGetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+
+    bool bAllowMultiLinkBreak = false;
+    Params->TryGetBoolField(TEXT("allow_multi_link_break"), bAllowMultiLinkBreak);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    FString ScratchPadScriptPath;
+    FString ScratchPadOwnerKind = TEXT("system");
+    FString ScratchPadName;
+    int32 ScratchPadScriptIndex = INDEX_NONE;
+    int32 ScratchPadEmitterIndex = INDEX_NONE;
+    FString ScratchPadEmitterName;
+    Params->TryGetStringField(TEXT("scratch_pad_script_path"), ScratchPadScriptPath);
+    Params->TryGetStringField(TEXT("scratch_pad_owner_kind"), ScratchPadOwnerKind);
+    Params->TryGetStringField(TEXT("scratch_pad_name"), ScratchPadName);
+    Params->TryGetStringField(TEXT("scratch_pad_script_name"), ScratchPadName);
+    Params->TryGetNumberField(TEXT("scratch_pad_script_index"), ScratchPadScriptIndex);
+    Params->TryGetNumberField(TEXT("scratch_pad_emitter_index"), ScratchPadEmitterIndex);
+    Params->TryGetStringField(TEXT("scratch_pad_emitter_name"), ScratchPadEmitterName);
+    if (ScratchPadScriptPath.IsEmpty() && ScratchPadName.IsEmpty() && ScratchPadScriptIndex == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing Scratch Pad selector. Provide 'scratch_pad_script_path', 'scratch_pad_name', or 'scratch_pad_script_index'."));
+    }
+
+    FString TargetNodeGuid;
+    Params->TryGetStringField(TEXT("target_node_guid"), TargetNodeGuid);
+    Params->TryGetStringField(TEXT("parameter_map_set_node_guid"), TargetNodeGuid);
+
+    int32 TargetNodeIndex = INDEX_NONE;
+    Params->TryGetNumberField(TEXT("target_node_index"), TargetNodeIndex);
+    Params->TryGetNumberField(TEXT("parameter_map_set_node_index"), TargetNodeIndex);
+
+    int32 ParameterMapSetIndexSelector = INDEX_NONE;
+    Params->TryGetNumberField(TEXT("parameter_map_set_index"), ParameterMapSetIndexSelector);
+
+    const TSharedPtr<FJsonValue> DefaultValue = Params->TryGetField(TEXT("default_value"));
+    const bool bHasDefaultValue = DefaultValue.IsValid();
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraScript* RequestedScript = nullptr;
+    if (!ScratchPadScriptPath.IsEmpty())
+    {
+        RequestedScript = LoadObject<UNiagaraScript>(nullptr, *NormalizeNiagaraObjectPathForLoad(ScratchPadScriptPath));
+        if (!RequestedScript)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Scratch Pad script: %s"), *ScratchPadScriptPath));
+        }
+    }
+
+    UNiagaraScript* ScratchPadScript = nullptr;
+    FString ResolvedScratchPadOwnerKind;
+    FString ResolvedScratchPadOwnerName;
+    int32 ResolvedScratchPadEmitterIndex = INDEX_NONE;
+    int32 ResolvedScratchPadScriptIndex = INDEX_NONE;
+
+    auto TryMatchScratchPadScript = [&RequestedScript, &ScratchPadName, ScratchPadScriptIndex](
+        const TArray<TObjectPtr<UNiagaraScript>>& Scripts,
+        int32& OutScriptIndex) -> UNiagaraScript*
+    {
+        for (int32 ScriptIndex = 0; ScriptIndex < Scripts.Num(); ++ScriptIndex)
+        {
+            UNiagaraScript* Candidate = Scripts[ScriptIndex].Get();
+            if (!Candidate)
+            {
+                continue;
+            }
+
+            const bool bPathMatches = !RequestedScript || Candidate == RequestedScript || Candidate->GetPathName().Equals(RequestedScript->GetPathName(), ESearchCase::IgnoreCase);
+            const bool bIndexMatches = RequestedScript || ScratchPadScriptIndex == INDEX_NONE || ScratchPadScriptIndex == ScriptIndex;
+            const bool bNameMatches = RequestedScript || ScratchPadName.IsEmpty() || Candidate->GetName().Equals(ScratchPadName, ESearchCase::IgnoreCase);
+            if (bPathMatches && bIndexMatches && bNameMatches)
+            {
+                OutScriptIndex = ScriptIndex;
+                return Candidate;
+            }
+        }
+        return nullptr;
+    };
+
+    auto TryResolveSystemScratchPad = [&]()
+    {
+        int32 MatchedScriptIndex = INDEX_NONE;
+        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(System->ScratchPadScripts, MatchedScriptIndex))
+        {
+            ScratchPadScript = Candidate;
+            ResolvedScratchPadOwnerKind = TEXT("system");
+            ResolvedScratchPadOwnerName = System->GetName();
+            ResolvedScratchPadEmitterIndex = INDEX_NONE;
+            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+            return true;
+        }
+        return false;
+    };
+
+    auto TryResolveEmitterScratchPad = [&]()
+    {
+        int32 CurrentEmitterIndex = 0;
+        for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+        {
+            const FString EmitterName = EmitterHandle.GetName().ToString();
+            const bool bEmitterMatches =
+                RequestedScript ||
+                ((ScratchPadEmitterIndex == INDEX_NONE || ScratchPadEmitterIndex == CurrentEmitterIndex) &&
+                (ScratchPadEmitterName.IsEmpty() || ScratchPadEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase)));
+            if (bEmitterMatches)
+            {
+                if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+                {
+                    if (EmitterData->ScratchPads)
+                    {
+                        int32 MatchedScriptIndex = INDEX_NONE;
+                        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(EmitterData->ScratchPads->Scripts, MatchedScriptIndex))
+                        {
+                            ScratchPadScript = Candidate;
+                            ResolvedScratchPadOwnerKind = TEXT("emitter");
+                            ResolvedScratchPadOwnerName = EmitterName;
+                            ResolvedScratchPadEmitterIndex = CurrentEmitterIndex;
+                            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+                            return true;
+                        }
+                    }
+                }
+            }
+            ++CurrentEmitterIndex;
+        }
+        return false;
+    };
+
+    if (RequestedScript)
+    {
+        TryResolveSystemScratchPad();
+        if (!ScratchPadScript)
+        {
+            TryResolveEmitterScratchPad();
+        }
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("system"), ESearchCase::IgnoreCase))
+    {
+        TryResolveSystemScratchPad();
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("emitter"), ESearchCase::IgnoreCase))
+    {
+        TryResolveEmitterScratchPad();
+    }
+    else
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unsupported scratch_pad_owner_kind. Use 'system' or 'emitter'."));
+    }
+
+    if (!ScratchPadScript)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching target-local Scratch Pad script was found"));
+    }
+
+    UNiagaraScriptSource* ScriptSource = Cast<UNiagaraScriptSource>(ScratchPadScript->GetLatestSource());
+    UNiagaraGraph* Graph = ScriptSource ? ScriptSource->NodeGraph : nullptr;
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Scratch Pad script has no editable graph: %s"), *ScratchPadScript->GetPathName()));
+    }
+
+    UEdGraphNode* MatchedSetNode = nullptr;
+    UEdGraphPin* TargetPin = nullptr;
+    int32 MatchedGraphNodeIndex = INDEX_NONE;
+    int32 MatchedParameterMapSetIndex = INDEX_NONE;
+    int32 MatchCount = 0;
+    int32 GraphNodeIndex = 0;
+    int32 ParameterMapSetIndex = 0;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        const int32 CurrentGraphNodeIndex = GraphNodeIndex++;
+        if (!Node || !Node->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapSet")))
+        {
+            continue;
+        }
+
+        const int32 CurrentParameterMapSetIndex = ParameterMapSetIndex++;
+        const FString CandidateGuid = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const bool bNodeIndexMatches = TargetNodeIndex == INDEX_NONE || TargetNodeIndex == CurrentGraphNodeIndex;
+        const bool bSetIndexMatches = ParameterMapSetIndexSelector == INDEX_NONE || ParameterMapSetIndexSelector == CurrentParameterMapSetIndex;
+        const bool bGuidMatches = TargetNodeGuid.IsEmpty() || TargetNodeGuid.Equals(CandidateGuid, ESearchCase::IgnoreCase);
+        if (!bNodeIndexMatches || !bSetIndexMatches || !bGuidMatches)
+        {
+            continue;
+        }
+
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (!Pin || Pin->Direction != EGPD_Input)
+            {
+                continue;
+            }
+
+            const FString CandidatePinName = Pin->PinName.ToString();
+            const bool bPinMatches = CandidatePinName.Equals(TargetPinName, ESearchCase::IgnoreCase) ||
+                TargetPinName.EndsWith(FString::Printf(TEXT(".%s"), *CandidatePinName), ESearchCase::IgnoreCase) ||
+                CandidatePinName.EndsWith(FString::Printf(TEXT(".%s"), *TargetPinName), ESearchCase::IgnoreCase);
+            if (bPinMatches)
+            {
+                ++MatchCount;
+                if (!MatchedSetNode)
+                {
+                    MatchedSetNode = Node;
+                    TargetPin = Pin;
+                    MatchedGraphNodeIndex = CurrentGraphNodeIndex;
+                    MatchedParameterMapSetIndex = CurrentParameterMapSetIndex;
+                }
+            }
+        }
+    }
+
+    if (!MatchedSetNode || !TargetPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching Scratch Pad ParameterMapSet input pin was found: %s"), *TargetPinName));
+    }
+    if (MatchCount > 1 && TargetNodeIndex == INDEX_NONE && TargetNodeGuid.IsEmpty() && ParameterMapSetIndexSelector == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Target pin selector matched %d pins. Provide 'target_node_index', 'parameter_map_set_index', or 'target_node_guid'."), MatchCount));
+    }
+    if (TargetPin->PinName == TEXT("Source"))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Refusing to link the ParameterMapSet Source pin; choose a value input pin instead."));
+    }
+
+    UEdGraphPin* SourcePin = nullptr;
+    for (UEdGraphPin* Pin : MatchedSetNode->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Input && Pin->PinName == TEXT("Source"))
+        {
+            SourcePin = Pin;
+            break;
+        }
+    }
+    if (!SourcePin || SourcePin->LinkedTo.Num() != 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(
+                TEXT("Target ParameterMapSet node '%s' must have exactly one linked Source pin before linking a User parameter. Found: %d"),
+                *MatchedSetNode->GetName(),
+                SourcePin ? SourcePin->LinkedTo.Num() : 0));
+    }
+
+    const FNiagaraTypeDefinition InputType = FNiagaraTypeDefinition::GetVec2Def();
+    FNiagaraVariable UserParameter(InputType, FName(*UserParameterName));
+
+    if (bHasDefaultValue)
+    {
+        FString DefaultValidationError;
+        if (!SetNiagaraVariableDataFromJson(UserParameter, DefaultValue, DefaultValidationError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(DefaultValidationError);
+        }
+    }
+
+    FNiagaraUserRedirectionParameterStore& UserParameterStore = System->GetExposedParameters();
+    bool bUserParameterAlreadyExisted = false;
+    TArray<FNiagaraVariable> UserParameters;
+    UserParameterStore.GetUserParameters(UserParameters);
+    for (const FNiagaraVariable& Candidate : UserParameters)
+    {
+        if (NiagaraUserParameterNameMatches(Candidate, UserParameterName))
+        {
+            bUserParameterAlreadyExisted = true;
+            if (Candidate.GetType() != InputType)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Existing user parameter '%s' has incompatible type: %s. Expected: %s"),
+                        *UserParameterName,
+                        *NiagaraTypeName(Candidate.GetType()),
+                        *NiagaraTypeName(InputType)));
+            }
+            UserParameter = Candidate;
+            break;
+        }
+    }
+
+    const int32 PreviousLinkCount = TargetPin->LinkedTo.Num();
+    if (PreviousLinkCount > 0 && !bOverwriteExisting)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Scratch Pad input pin '%s' already has %d link(s). Use overwrite_existing=true to replace it."),
+                *TargetPin->PinName.ToString(),
+                PreviousLinkCount));
+    }
+    if (PreviousLinkCount > 1 && !bAllowMultiLinkBreak)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Scratch Pad input pin '%s' has %d links. Pass allow_multi_link_break=true to break all of them."),
+                *TargetPin->PinName.ToString(),
+                PreviousLinkCount));
+    }
+
+    const FString PreviousDefaultValue = TargetPin->DefaultValue;
+    const FString PreviousDefaultObject = NiagaraObjectPathOrEmpty(TargetPin->DefaultObject);
+    const TArray<TSharedPtr<FJsonValue>> PreviousLinkedSources = LinkedPinsToJson(TargetPin, true);
+
+    System->Modify();
+    ScratchPadScript->Modify();
+    ScriptSource->Modify();
+    Graph->Modify();
+    MatchedSetNode->Modify();
+
+    if (!bUserParameterAlreadyExisted)
+    {
+        if (!UserParameterStore.AddParameter(UserParameter, true, true))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to add Niagara user parameter: %s"), *UserParameter.GetName().ToString()));
+        }
+    }
+    if (bHasDefaultValue)
+    {
+        FString DefaultSetError;
+        if (!SetNiagaraUserParameterValue(UserParameterStore, UserParameter, DefaultValue, DefaultSetError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(DefaultSetError);
+        }
+    }
+
+    int32 BrokenLinkCount = 0;
+    if (PreviousLinkCount > 0)
+    {
+        BrokenLinkCount = PreviousLinkCount;
+        TargetPin->BreakAllPinLinks(true);
+    }
+
+    const FNiagaraVariable LinkUserParameter(InputType, FName(*UserParameterName));
+    TSet<FNiagaraVariableBase> KnownParameters;
+    KnownParameters.Add(LinkUserParameter);
+    FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(
+        *TargetPin,
+        LinkUserParameter,
+        KnownParameters);
+
+    Graph->NotifyGraphChanged();
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after Scratch Pad user parameter link"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_name"), ScratchPadScript->GetName());
+    Result->SetStringField(TEXT("scratch_pad_owner_kind"), ResolvedScratchPadOwnerKind);
+    Result->SetStringField(TEXT("scratch_pad_owner_name"), ResolvedScratchPadOwnerName);
+    Result->SetNumberField(TEXT("scratch_pad_emitter_index"), ResolvedScratchPadEmitterIndex);
+    Result->SetNumberField(TEXT("scratch_pad_script_index"), ResolvedScratchPadScriptIndex);
+    Result->SetStringField(TEXT("parameter_map_set_node_name"), MatchedSetNode->GetName());
+    Result->SetStringField(TEXT("parameter_map_set_node_guid"), MatchedSetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("target_node_index"), MatchedGraphNodeIndex);
+    Result->SetNumberField(TEXT("parameter_map_set_index"), MatchedParameterMapSetIndex);
+    Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+    Result->SetStringField(TEXT("input_type"), NiagaraTypeName(InputType));
+    Result->SetStringField(TEXT("user_parameter_name"), UserParameter.GetName().ToString());
+    Result->SetStringField(TEXT("linked_parameter_name"), LinkUserParameter.GetName().ToString());
+    Result->SetBoolField(TEXT("user_parameter_created"), !bUserParameterAlreadyExisted);
+    Result->SetBoolField(TEXT("default_value_set"), bHasDefaultValue);
+    if (bHasDefaultValue)
+    {
+        Result->SetField(TEXT("default_value"), NiagaraParameterValueToJson(UserParameterStore, UserParameter));
+    }
+    Result->SetStringField(TEXT("previous_default_value"), PreviousDefaultValue);
+    Result->SetStringField(TEXT("previous_default_object"), PreviousDefaultObject);
+    Result->SetNumberField(TEXT("previous_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("broken_link_count"), BrokenLinkCount);
+    Result->SetNumberField(TEXT("new_link_count"), TargetPin->LinkedTo.Num());
+    Result->SetArrayField(TEXT("previous_linked_sources"), PreviousLinkedSources);
+    Result->SetArrayField(TEXT("new_linked_sources"), LinkedPinsToJson(TargetPin, true));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_pin_user_parameter_link"));
+    return Result;
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("link_niagara_scratch_pad_pin_to_user_parameter requires editor-only Niagara data"));
+#endif
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInsertNiagaraScratchPadCustomHlslForPin(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara Scratch Pad graph outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    FString TargetPinName;
+    Params->TryGetStringField(TEXT("target_pin_name"), TargetPinName);
+    TargetPinName.TrimStartAndEndInline();
+    if (TargetPinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'target_pin_name' is required"));
+    }
+
+    FString Expression;
+    Params->TryGetStringField(TEXT("expression"), Expression);
+    Expression.TrimStartAndEndInline();
+    if (Expression.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'expression' is required"));
+    }
+
+    FString PreserveExistingLinkAs = TEXT("BaseValue");
+    Params->TryGetStringField(TEXT("preserve_existing_link_as"), PreserveExistingLinkAs);
+    PreserveExistingLinkAs.TrimStartAndEndInline();
+    if (PreserveExistingLinkAs.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'preserve_existing_link_as' cannot be empty"));
+    }
+
+    FString OutputPinName = TEXT("CustomHLSLOutput");
+    Params->TryGetStringField(TEXT("output_pin_name"), OutputPinName);
+    OutputPinName.TrimStartAndEndInline();
+    if (OutputPinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'output_pin_name' cannot be empty"));
+    }
+
+    FString SignatureName = TEXT("IF_CustomPinValue");
+    Params->TryGetStringField(TEXT("signature_name"), SignatureName);
+    SignatureName.TrimStartAndEndInline();
+    if (SignatureName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'signature_name' cannot be empty"));
+    }
+
+    bool bSkipIfAlreadyInserted = true;
+    Params->TryGetBoolField(TEXT("skip_if_already_inserted"), bSkipIfAlreadyInserted);
+
+    bool bReplaceExistingCustom = false;
+    Params->TryGetBoolField(TEXT("replace_existing_custom"), bReplaceExistingCustom);
+
+    bool bRebuildExistingCustom = false;
+    Params->TryGetBoolField(TEXT("rebuild_existing_custom"), bRebuildExistingCustom);
+
+    bool bRequiresContext = false;
+    Params->TryGetBoolField(TEXT("requires_context"), bRequiresContext);
+
+    bool bDeleteUnlinkedCustomNodes = false;
+    Params->TryGetBoolField(TEXT("delete_unlinked_custom_nodes"), bDeleteUnlinkedCustomNodes);
+
+    bool bDeleteUnlinkedCustomInputSourceNodes = false;
+    Params->TryGetBoolField(TEXT("delete_unlinked_custom_input_source_nodes"), bDeleteUnlinkedCustomInputSourceNodes);
+
+    const bool bHasRequestedCustomInputs = Params->HasTypedField<EJson::Array>(TEXT("inputs"));
+    const bool bHasRequestedUserParameterInputs = Params->HasTypedField<EJson::Array>(TEXT("user_parameter_inputs"));
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    FString ScratchPadScriptPath;
+    FString ScratchPadOwnerKind = TEXT("system");
+    FString ScratchPadName = TEXT("RenderCircleToGrid");
+    int32 ScratchPadScriptIndex = INDEX_NONE;
+    int32 ScratchPadEmitterIndex = INDEX_NONE;
+    FString ScratchPadEmitterName;
+    Params->TryGetStringField(TEXT("scratch_pad_script_path"), ScratchPadScriptPath);
+    Params->TryGetStringField(TEXT("scratch_pad_owner_kind"), ScratchPadOwnerKind);
+    Params->TryGetStringField(TEXT("scratch_pad_name"), ScratchPadName);
+    Params->TryGetStringField(TEXT("scratch_pad_script_name"), ScratchPadName);
+    Params->TryGetNumberField(TEXT("scratch_pad_script_index"), ScratchPadScriptIndex);
+    Params->TryGetNumberField(TEXT("scratch_pad_emitter_index"), ScratchPadEmitterIndex);
+    Params->TryGetStringField(TEXT("scratch_pad_emitter_name"), ScratchPadEmitterName);
+
+    FString TargetNodeGuid;
+    FString TargetNodeName;
+    int32 TargetNodeIndex = INDEX_NONE;
+    Params->TryGetStringField(TEXT("target_node_guid"), TargetNodeGuid);
+    Params->TryGetStringField(TEXT("target_node_name"), TargetNodeName);
+    Params->TryGetNumberField(TEXT("target_node_index"), TargetNodeIndex);
+    TargetNodeGuid.TrimStartAndEndInline();
+    TargetNodeName.TrimStartAndEndInline();
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraScript* RequestedScript = nullptr;
+    if (!ScratchPadScriptPath.IsEmpty())
+    {
+        RequestedScript = LoadObject<UNiagaraScript>(nullptr, *NormalizeNiagaraObjectPathForLoad(ScratchPadScriptPath));
+        if (!RequestedScript)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Scratch Pad script: %s"), *ScratchPadScriptPath));
+        }
+    }
+
+    UNiagaraScript* ScratchPadScript = nullptr;
+    FString ResolvedScratchPadOwnerKind;
+    FString ResolvedScratchPadOwnerName;
+    int32 ResolvedScratchPadEmitterIndex = INDEX_NONE;
+    int32 ResolvedScratchPadScriptIndex = INDEX_NONE;
+
+    auto TryMatchScratchPadScript = [&RequestedScript, &ScratchPadName, ScratchPadScriptIndex](
+        const TArray<TObjectPtr<UNiagaraScript>>& Scripts,
+        int32& OutScriptIndex) -> UNiagaraScript*
+    {
+        for (int32 ScriptIndex = 0; ScriptIndex < Scripts.Num(); ++ScriptIndex)
+        {
+            UNiagaraScript* Candidate = Scripts[ScriptIndex].Get();
+            if (!Candidate)
+            {
+                continue;
+            }
+
+            const bool bPathMatches = !RequestedScript || Candidate == RequestedScript || Candidate->GetPathName().Equals(RequestedScript->GetPathName(), ESearchCase::IgnoreCase);
+            const bool bIndexMatches = RequestedScript || ScratchPadScriptIndex == INDEX_NONE || ScratchPadScriptIndex == ScriptIndex;
+            const bool bNameMatches = RequestedScript || ScratchPadName.IsEmpty() || Candidate->GetName().Equals(ScratchPadName, ESearchCase::IgnoreCase);
+            if (bPathMatches && bIndexMatches && bNameMatches)
+            {
+                OutScriptIndex = ScriptIndex;
+                return Candidate;
+            }
+        }
+        return nullptr;
+    };
+
+    auto TryResolveSystemScratchPad = [&]()
+    {
+        int32 MatchedScriptIndex = INDEX_NONE;
+        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(System->ScratchPadScripts, MatchedScriptIndex))
+        {
+            ScratchPadScript = Candidate;
+            ResolvedScratchPadOwnerKind = TEXT("system");
+            ResolvedScratchPadOwnerName = System->GetName();
+            ResolvedScratchPadEmitterIndex = INDEX_NONE;
+            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+            return true;
+        }
+        return false;
+    };
+
+    auto TryResolveEmitterScratchPad = [&]()
+    {
+        int32 CurrentEmitterIndex = 0;
+        for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+        {
+            const FString EmitterName = EmitterHandle.GetName().ToString();
+            const bool bEmitterMatches =
+                RequestedScript ||
+                ((ScratchPadEmitterIndex == INDEX_NONE || ScratchPadEmitterIndex == CurrentEmitterIndex) &&
+                (ScratchPadEmitterName.IsEmpty() || ScratchPadEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase)));
+            if (bEmitterMatches)
+            {
+                if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+                {
+                    if (EmitterData->ScratchPads)
+                    {
+                        int32 MatchedScriptIndex = INDEX_NONE;
+                        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(EmitterData->ScratchPads->Scripts, MatchedScriptIndex))
+                        {
+                            ScratchPadScript = Candidate;
+                            ResolvedScratchPadOwnerKind = TEXT("emitter");
+                            ResolvedScratchPadOwnerName = EmitterName;
+                            ResolvedScratchPadEmitterIndex = CurrentEmitterIndex;
+                            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+                            return true;
+                        }
+                    }
+                }
+            }
+            ++CurrentEmitterIndex;
+        }
+        return false;
+    };
+
+    if (RequestedScript)
+    {
+        TryResolveSystemScratchPad();
+        if (!ScratchPadScript)
+        {
+            TryResolveEmitterScratchPad();
+        }
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("system"), ESearchCase::IgnoreCase))
+    {
+        TryResolveSystemScratchPad();
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("emitter"), ESearchCase::IgnoreCase))
+    {
+        TryResolveEmitterScratchPad();
+    }
+    else
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unsupported scratch_pad_owner_kind. Use 'system' or 'emitter'."));
+    }
+
+    if (!ScratchPadScript)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching target-local Scratch Pad script was found"));
+    }
+
+    UNiagaraScriptSource* ScriptSource = Cast<UNiagaraScriptSource>(ScratchPadScript->GetLatestSource());
+    UNiagaraGraph* Graph = ScriptSource ? ScriptSource->NodeGraph : nullptr;
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Scratch Pad script has no editable graph: %s"), *ScratchPadScript->GetPathName()));
+    }
+
+    auto NodeMatchesSelector = [&](UEdGraphNode* Node, int32 NodeIndex)
+    {
+        if (!Node)
+        {
+            return false;
+        }
+        const FString CandidateGuid = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const bool bIndexMatches = TargetNodeIndex == INDEX_NONE || TargetNodeIndex == NodeIndex;
+        const bool bGuidMatches = TargetNodeGuid.IsEmpty() || TargetNodeGuid.Equals(CandidateGuid, ESearchCase::IgnoreCase);
+        const bool bNameMatches = TargetNodeName.IsEmpty() || TargetNodeName.Equals(Node->GetName(), ESearchCase::IgnoreCase);
+        return bIndexMatches && bGuidMatches && bNameMatches;
+    };
+
+    UEdGraphNode* TargetNode = nullptr;
+    UEdGraphPin* TargetPin = nullptr;
+    int32 MatchedTargetNodeIndex = INDEX_NONE;
+    int32 TargetMatchCount = 0;
+    for (int32 NodeIndex = 0; NodeIndex < Graph->Nodes.Num(); ++NodeIndex)
+    {
+        UEdGraphNode* Node = Graph->Nodes[NodeIndex];
+        if (!Node || !NodeMatchesSelector(Node, NodeIndex))
+        {
+            continue;
+        }
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (!Pin || Pin->Direction != EGPD_Input)
+            {
+                continue;
+            }
+            const FString CandidatePinName = Pin->PinName.ToString();
+            const bool bPinMatches = CandidatePinName.Equals(TargetPinName, ESearchCase::IgnoreCase) ||
+                TargetPinName.EndsWith(FString::Printf(TEXT(".%s"), *CandidatePinName), ESearchCase::IgnoreCase) ||
+                CandidatePinName.EndsWith(FString::Printf(TEXT(".%s"), *TargetPinName), ESearchCase::IgnoreCase);
+            if (bPinMatches)
+            {
+                ++TargetMatchCount;
+                if (!TargetNode)
+                {
+                    TargetNode = Node;
+                    TargetPin = Pin;
+                    MatchedTargetNodeIndex = NodeIndex;
+                }
+            }
+        }
+    }
+    if (!TargetNode || !TargetPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching Scratch Pad input pin was found: %s"), *TargetPinName));
+    }
+    if (TargetMatchCount > 1 && TargetNodeIndex == INDEX_NONE && TargetNodeGuid.IsEmpty() && TargetNodeName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Target selector matched %d pins. Provide target_node_index, target_node_guid, or target_node_name."), TargetMatchCount));
+    }
+
+    const int32 PreviousLinkCount = TargetPin->LinkedTo.Num();
+    if (PreviousLinkCount != 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Target pin '%s' must have exactly one existing value link. Found: %d"),
+                *TargetPin->PinName.ToString(),
+                PreviousLinkCount));
+    }
+
+    const FNiagaraTypeDefinition TargetType = UEdGraphSchema_Niagara::PinToTypeDefinition(TargetPin);
+    if (!TargetType.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unable to resolve Niagara type for target pin: %s"), *TargetPin->PinName.ToString()));
+    }
+
+    auto ResolveScratchPadCustomInputType = [&PreserveExistingLinkAs, &TargetType](const FName InputName, const FNiagaraTypeDefinition& CurrentType)
+    {
+        const FString InputNameString = InputName.ToString();
+        if (InputNameString.Equals(TEXT("Map"), ESearchCase::IgnoreCase))
+        {
+            return FNiagaraTypeDefinition::GetParameterMapDef();
+        }
+        if (InputNameString.Equals(PreserveExistingLinkAs, ESearchCase::IgnoreCase) ||
+            InputNameString.Equals(TEXT("BaseValue"), ESearchCase::IgnoreCase))
+        {
+            return TargetType;
+        }
+        if (InputNameString.Equals(TEXT("StampScale"), ESearchCase::IgnoreCase))
+        {
+            return FNiagaraTypeDefinition::GetFloatDef();
+        }
+        return CurrentType;
+    };
+
+    UEdGraphPin* PreservedPreviousValuePin = TargetPin->LinkedTo[0];
+    UNiagaraNodeCustomHlsl* ExistingCustomNodeToReplace = nullptr;
+    TSet<UEdGraphNode*> ExistingCustomInputSourceNodesToReplace;
+    auto TrackExistingCustomInputSourceNodes = [&ExistingCustomInputSourceNodesToReplace](UNiagaraNodeCustomHlsl* CustomNode)
+    {
+        if (!CustomNode)
+        {
+            return;
+        }
+
+        for (UEdGraphPin* Pin : CustomNode->Pins)
+        {
+            if (!Pin || Pin->Direction != EGPD_Input)
+            {
+                continue;
+            }
+
+            for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+            {
+                UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+                if (LinkedNode &&
+                    (LinkedNode->IsA<UNiagaraNodeInput>() ||
+                        LinkedNode->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapGet"))))
+                {
+                    ExistingCustomInputSourceNodesToReplace.Add(LinkedNode);
+                }
+            }
+        }
+    };
+    if (UNiagaraNodeCustomHlsl* ExistingCustomNode = Cast<UNiagaraNodeCustomHlsl>(TargetPin->LinkedTo[0]->GetOwningNode()))
+    {
+        const FString ExistingExpression = GetNiagaraCustomHlslString(ExistingCustomNode).TrimStartAndEnd();
+        if (bSkipIfAlreadyInserted && ExistingExpression.Equals(Expression, ESearchCase::CaseSensitive))
+        {
+            bool bExistingCustomMatchesRequestedTopology = true;
+            FString ExistingCustomTopologyError;
+
+            if (bHasRequestedCustomInputs)
+            {
+                bExistingCustomMatchesRequestedTopology = false;
+                ExistingCustomTopologyError = TEXT("explicit custom input topology was requested");
+            }
+
+            if (bExistingCustomMatchesRequestedTopology)
+            {
+                UEdGraphPin* ExistingPreservedInputPin = FindGraphPinByName(ExistingCustomNode, EGPD_Input, FName(*PreserveExistingLinkAs));
+                if (!ExistingPreservedInputPin || ExistingPreservedInputPin->LinkedTo.Num() != 1)
+                {
+                    bExistingCustomMatchesRequestedTopology = false;
+                    ExistingCustomTopologyError = FString::Printf(
+                        TEXT("existing Custom HLSL node does not expose exactly one '%s' input link"),
+                        *PreserveExistingLinkAs);
+                }
+            }
+
+            if (bExistingCustomMatchesRequestedTopology && bHasRequestedUserParameterInputs)
+            {
+                const TArray<TSharedPtr<FJsonValue>>* ExistingUserParameterInputValues = nullptr;
+                if (!Params->TryGetArrayField(TEXT("user_parameter_inputs"), ExistingUserParameterInputValues) || !ExistingUserParameterInputValues)
+                {
+                    bExistingCustomMatchesRequestedTopology = false;
+                    ExistingCustomTopologyError = TEXT("requested user_parameter_inputs were unavailable");
+                }
+                else
+                {
+                    for (const TSharedPtr<FJsonValue>& InputValue : *ExistingUserParameterInputValues)
+                    {
+                        const TSharedPtr<FJsonObject> InputObject = InputValue.IsValid() ? InputValue->AsObject() : nullptr;
+                        if (!InputObject.IsValid())
+                        {
+                            bExistingCustomMatchesRequestedTopology = false;
+                            ExistingCustomTopologyError = TEXT("each user_parameter_inputs entry must be an object");
+                            break;
+                        }
+
+                        FString InputName;
+                        FString UserParameterName;
+                        InputObject->TryGetStringField(TEXT("input_name"), InputName);
+                        if (!InputObject->TryGetStringField(TEXT("user_parameter_name"), UserParameterName))
+                        {
+                            InputObject->TryGetStringField(TEXT("parameter_name"), UserParameterName);
+                        }
+                        InputName.TrimStartAndEndInline();
+                        UserParameterName.TrimStartAndEndInline();
+                        if (InputName.IsEmpty() || UserParameterName.IsEmpty())
+                        {
+                            bExistingCustomMatchesRequestedTopology = false;
+                            ExistingCustomTopologyError = TEXT("each user_parameter_inputs entry requires input_name and user_parameter_name");
+                            break;
+                        }
+                        if (!UserParameterName.StartsWith(TEXT("User.")))
+                        {
+                            UserParameterName = FString::Printf(TEXT("User.%s"), *UserParameterName);
+                        }
+
+                        UEdGraphPin* ExistingInputPin = FindGraphPinByName(ExistingCustomNode, EGPD_Input, FName(*InputName));
+                        if (!ExistingInputPin || ExistingInputPin->LinkedTo.Num() != 1)
+                        {
+                            bExistingCustomMatchesRequestedTopology = false;
+                            ExistingCustomTopologyError = FString::Printf(
+                                TEXT("existing Custom HLSL input '%s' is missing or is not linked exactly once"),
+                                *InputName);
+                            break;
+                        }
+
+                        UEdGraphNode* ExistingInputSourceNode = ExistingInputPin->LinkedTo[0] ? ExistingInputPin->LinkedTo[0]->GetOwningNode() : nullptr;
+                        const UNiagaraNodeInput* ExistingInputSource = Cast<UNiagaraNodeInput>(ExistingInputSourceNode);
+                        if (!ExistingInputSource || !NiagaraUserParameterNameMatches(ExistingInputSource->Input, UserParameterName))
+                        {
+                            bExistingCustomMatchesRequestedTopology = false;
+                            ExistingCustomTopologyError = FString::Printf(
+                                TEXT("existing Custom HLSL input '%s' is not linked to requested User parameter '%s'"),
+                                *InputName,
+                                *UserParameterName);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (bExistingCustomMatchesRequestedTopology && !bRebuildExistingCustom && !bDeleteUnlinkedCustomInputSourceNodes)
+            {
+                TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                Result->SetBoolField(TEXT("success"), true);
+                Result->SetBoolField(TEXT("already_inserted"), true);
+                Result->SetStringField(TEXT("system_path"), System->GetPathName());
+                Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+                Result->SetStringField(TEXT("target_node_name"), TargetNode->GetName());
+                Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+                Result->SetStringField(TEXT("custom_hlsl_node_guid"), ExistingCustomNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+                Result->SetStringField(TEXT("expression"), ExistingExpression);
+                Result->SetBoolField(TEXT("topology_verified"), true);
+                Result->SetBoolField(TEXT("compile_requested"), false);
+                Result->SetBoolField(TEXT("saved"), false);
+                Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_custom_hlsl_pin_insert"));
+                return Result;
+            }
+
+            bReplaceExistingCustom = true;
+            bRebuildExistingCustom = true;
+            if (!ExistingCustomTopologyError.IsEmpty())
+            {
+                UE_LOG(LogTemp, Display, TEXT("Rebuilding existing Niagara Custom HLSL node because %s"), *ExistingCustomTopologyError);
+            }
+        }
+        if (!bReplaceExistingCustom)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Target pin '%s' is already linked to a Custom HLSL node. Set replace_existing_custom=true to replace it."), *TargetPin->PinName.ToString()));
+        }
+
+        if (bRebuildExistingCustom)
+        {
+            UEdGraphPin* ExistingPreservedInputPin = FindGraphPinByName(ExistingCustomNode, EGPD_Input, FName(*PreserveExistingLinkAs));
+            if (!ExistingPreservedInputPin || ExistingPreservedInputPin->LinkedTo.Num() != 1)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Existing Custom HLSL node for '%s' does not expose exactly one '%s' input link to preserve."),
+                        *TargetPin->PinName.ToString(),
+                        *PreserveExistingLinkAs));
+            }
+
+            PreservedPreviousValuePin = ExistingPreservedInputPin->LinkedTo[0];
+            ExistingCustomNodeToReplace = ExistingCustomNode;
+            TrackExistingCustomInputSourceNodes(ExistingCustomNode);
+        }
+        else
+        {
+            System->Modify();
+            ScratchPadScript->Modify();
+            ScriptSource->Modify();
+            Graph->Modify();
+            ExistingCustomNode->Modify();
+
+            FNiagaraFunctionSignature UpdatedSignature = ExistingCustomNode->Signature;
+            UpdatedSignature.bRequiresContext = bRequiresContext;
+            for (FNiagaraVariable& Input : UpdatedSignature.Inputs)
+            {
+                const FNiagaraTypeDefinition ResolvedType = ResolveScratchPadCustomInputType(Input.GetName(), Input.GetType());
+                if (ResolvedType != Input.GetType())
+                {
+                    Input = FNiagaraVariable(ResolvedType, Input.GetName());
+                }
+            }
+            for (FNiagaraVariableBase& Output : UpdatedSignature.Outputs)
+            {
+                if (Output.GetType() != TargetType)
+                {
+                    Output = FNiagaraVariableBase(TargetType, Output.GetName());
+                }
+            }
+            ExistingCustomNode->Signature = UpdatedSignature;
+            ExistingCustomNode->ReconstructNode();
+
+            if (!SetNiagaraCustomHlslString(ExistingCustomNode, Expression))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to update existing Custom HLSL expression"));
+            }
+
+            Graph->NotifyGraphChanged();
+            System->MarkPackageDirty();
+            if (bRequestCompile)
+            {
+                System->RequestCompile(false);
+            }
+
+            bool bSavedExisting = false;
+            if (bSave)
+            {
+                bSavedExisting = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+                if (!bSavedExisting)
+                {
+                    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after updating existing Scratch Pad Custom HLSL"));
+                }
+            }
+
+            TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+            Result->SetBoolField(TEXT("success"), true);
+            Result->SetBoolField(TEXT("already_inserted"), false);
+            Result->SetBoolField(TEXT("updated_existing_custom"), true);
+            Result->SetStringField(TEXT("system_path"), System->GetPathName());
+            Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+            Result->SetStringField(TEXT("target_node_name"), TargetNode->GetName());
+            Result->SetStringField(TEXT("target_node_guid"), TargetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+            Result->SetNumberField(TEXT("target_node_index"), MatchedTargetNodeIndex);
+            Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+            Result->SetStringField(TEXT("custom_hlsl_node_guid"), ExistingCustomNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+            Result->SetStringField(TEXT("expression"), Expression);
+            Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+            Result->SetBoolField(TEXT("saved"), bSavedExisting);
+            Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_custom_hlsl_pin_update"));
+            return Result;
+        }
+    }
+
+    struct FCustomInputSpec
+    {
+        FString InputName;
+        UEdGraphPin* SourcePin = nullptr;
+        FNiagaraTypeDefinition Type;
+        FNiagaraVariable LinkedParameter;
+        bool bLinkToParameter = false;
+    };
+
+    struct FUserParameterInputRequest
+    {
+        FString InputName;
+        FString UserParameterName;
+        FNiagaraVariable UserParameter;
+    };
+
+    TArray<FCustomInputSpec> CustomInputs;
+    TArray<FUserParameterInputRequest> UserParameterInputRequests;
+    TSet<FString> UsedInputNames;
+    auto AddCustomInput = [&](const FString& InputName, UEdGraphPin* SourcePin, FString& OutError) -> bool
+    {
+        FString CleanInputName = InputName;
+        CleanInputName.TrimStartAndEndInline();
+        if (CleanInputName.IsEmpty())
+        {
+            OutError = TEXT("Custom input name cannot be empty");
+            return false;
+        }
+        if (UsedInputNames.Contains(CleanInputName))
+        {
+            OutError = FString::Printf(TEXT("Duplicate custom input name: %s"), *CleanInputName);
+            return false;
+        }
+        if (!SourcePin)
+        {
+            OutError = FString::Printf(TEXT("Custom input '%s' has no source pin"), *CleanInputName);
+            return false;
+        }
+        FNiagaraTypeDefinition SourceType = UEdGraphSchema_Niagara::PinToTypeDefinition(SourcePin);
+        SourceType = ResolveScratchPadCustomInputType(FName(*CleanInputName), SourceType);
+        if (!SourceType.IsValid())
+        {
+            OutError = FString::Printf(TEXT("Unable to resolve Niagara type for source pin '%s'"), *SourcePin->PinName.ToString());
+            return false;
+        }
+        FCustomInputSpec Spec;
+        Spec.InputName = CleanInputName;
+        Spec.SourcePin = SourcePin;
+        Spec.Type = SourceType;
+        CustomInputs.Add(Spec);
+        UsedInputNames.Add(CleanInputName);
+        return true;
+    };
+
+    auto AddLinkedParameterCustomInput = [&](const FString& InputName, const FNiagaraVariable& LinkedParameter, FString& OutError) -> bool
+    {
+        FString CleanInputName = InputName;
+        CleanInputName.TrimStartAndEndInline();
+        if (CleanInputName.IsEmpty())
+        {
+            OutError = TEXT("Custom input name cannot be empty");
+            return false;
+        }
+        if (UsedInputNames.Contains(CleanInputName))
+        {
+            OutError = FString::Printf(TEXT("Duplicate custom input name: %s"), *CleanInputName);
+            return false;
+        }
+        if (!LinkedParameter.GetType().IsValid())
+        {
+            OutError = FString::Printf(TEXT("Custom input '%s' has an invalid linked parameter type"), *CleanInputName);
+            return false;
+        }
+
+        FCustomInputSpec Spec;
+        Spec.InputName = CleanInputName;
+        Spec.SourcePin = nullptr;
+        Spec.Type = LinkedParameter.GetType();
+        Spec.LinkedParameter = LinkedParameter;
+        Spec.bLinkToParameter = true;
+        CustomInputs.Add(Spec);
+        UsedInputNames.Add(CleanInputName);
+        return true;
+    };
+
+    FString InputError;
+    UEdGraphPin* PreviousValuePin = PreservedPreviousValuePin;
+    if (!AddCustomInput(PreserveExistingLinkAs, PreviousValuePin, InputError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(InputError);
+    }
+
+    auto FindNodeBySpec = [&](const TSharedPtr<FJsonObject>& SpecObject, FString& OutError) -> UEdGraphNode*
+    {
+        FString SourceNodeGuid;
+        FString SourceNodeName;
+        int32 SourceNodeIndex = INDEX_NONE;
+        SpecObject->TryGetStringField(TEXT("source_node_guid"), SourceNodeGuid);
+        SpecObject->TryGetStringField(TEXT("source_node_name"), SourceNodeName);
+        SpecObject->TryGetNumberField(TEXT("source_node_index"), SourceNodeIndex);
+        SourceNodeGuid.TrimStartAndEndInline();
+        SourceNodeName.TrimStartAndEndInline();
+        if (SourceNodeGuid.IsEmpty() && SourceNodeName.IsEmpty() && SourceNodeIndex == INDEX_NONE)
+        {
+            OutError = TEXT("Each custom input source must provide source_node_guid, source_node_name, or source_node_index");
+            return nullptr;
+        }
+
+        UEdGraphNode* MatchedNode = nullptr;
+        int32 MatchCount = 0;
+        for (int32 NodeIndex = 0; NodeIndex < Graph->Nodes.Num(); ++NodeIndex)
+        {
+            UEdGraphNode* Node = Graph->Nodes[NodeIndex];
+            if (!Node)
+            {
+                continue;
+            }
+            const FString CandidateGuid = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+            const bool bIndexMatches = SourceNodeIndex == INDEX_NONE || SourceNodeIndex == NodeIndex;
+            const bool bGuidMatches = SourceNodeGuid.IsEmpty() || SourceNodeGuid.Equals(CandidateGuid, ESearchCase::IgnoreCase);
+            const bool bNameMatches = SourceNodeName.IsEmpty() || SourceNodeName.Equals(Node->GetName(), ESearchCase::IgnoreCase);
+            if (bIndexMatches && bGuidMatches && bNameMatches)
+            {
+                ++MatchCount;
+                if (!MatchedNode)
+                {
+                    MatchedNode = Node;
+                }
+            }
+        }
+        if (!MatchedNode)
+        {
+            OutError = TEXT("Unable to find custom input source node");
+            return nullptr;
+        }
+        if (MatchCount > 1)
+        {
+            OutError = FString::Printf(TEXT("Custom input source selector matched %d nodes"), MatchCount);
+            return nullptr;
+        }
+        return MatchedNode;
+    };
+
+    const TArray<TSharedPtr<FJsonValue>>* ExtraInputValues = nullptr;
+    if (Params->TryGetArrayField(TEXT("inputs"), ExtraInputValues) && ExtraInputValues)
+    {
+        for (const TSharedPtr<FJsonValue>& InputValue : *ExtraInputValues)
+        {
+            const TSharedPtr<FJsonObject> InputObject = InputValue.IsValid() ? InputValue->AsObject() : nullptr;
+            if (!InputObject.IsValid())
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Each 'inputs' entry must be an object"));
+            }
+
+            FString InputName;
+            FString SourcePinName;
+            FString SourcePinDirection = TEXT("output");
+            InputObject->TryGetStringField(TEXT("input_name"), InputName);
+            InputObject->TryGetStringField(TEXT("source_pin_name"), SourcePinName);
+            InputObject->TryGetStringField(TEXT("source_pin_direction"), SourcePinDirection);
+            InputName.TrimStartAndEndInline();
+            SourcePinName.TrimStartAndEndInline();
+            SourcePinDirection.TrimStartAndEndInline();
+            if (InputName.IsEmpty() || SourcePinName.IsEmpty())
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Each custom input requires input_name and source_pin_name"));
+            }
+
+            FString SourceError;
+            UEdGraphNode* SourceNode = FindNodeBySpec(InputObject, SourceError);
+            if (!SourceNode)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(SourceError);
+            }
+
+            const EEdGraphPinDirection Direction = SourcePinDirection.Equals(TEXT("input"), ESearchCase::IgnoreCase) ? EGPD_Input : EGPD_Output;
+            UEdGraphPin* SourcePin = FindGraphPinByName(SourceNode, Direction, FName(*SourcePinName), false);
+            if (!SourcePin)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Unable to find source pin '%s' on node '%s'"), *SourcePinName, *SourceNode->GetName()));
+            }
+            if (!AddCustomInput(InputName, SourcePin, InputError))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(InputError);
+            }
+        }
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* UserParameterInputValues = nullptr;
+    if (Params->TryGetArrayField(TEXT("user_parameter_inputs"), UserParameterInputValues) && UserParameterInputValues)
+    {
+        TArray<FNiagaraVariable> UserParameters;
+        System->GetExposedParameters().GetUserParameters(UserParameters);
+
+        for (const TSharedPtr<FJsonValue>& InputValue : *UserParameterInputValues)
+        {
+            const TSharedPtr<FJsonObject> InputObject = InputValue.IsValid() ? InputValue->AsObject() : nullptr;
+            if (!InputObject.IsValid())
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Each 'user_parameter_inputs' entry must be an object"));
+            }
+
+            FString InputName;
+            FString UserParameterName;
+            InputObject->TryGetStringField(TEXT("input_name"), InputName);
+            if (!InputObject->TryGetStringField(TEXT("user_parameter_name"), UserParameterName))
+            {
+                InputObject->TryGetStringField(TEXT("parameter_name"), UserParameterName);
+            }
+            InputName.TrimStartAndEndInline();
+            UserParameterName.TrimStartAndEndInline();
+            if (InputName.IsEmpty() || UserParameterName.IsEmpty())
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Each user parameter input requires input_name and user_parameter_name"));
+            }
+            if (!UserParameterName.StartsWith(TEXT("User.")))
+            {
+                UserParameterName = FString::Printf(TEXT("User.%s"), *UserParameterName);
+            }
+
+            const FNiagaraVariable* MatchedParameter = UserParameters.FindByPredicate(
+                [&UserParameterName](const FNiagaraVariable& Candidate)
+                {
+                    return NiagaraUserParameterNameMatches(Candidate, UserParameterName);
+                });
+            if (!MatchedParameter)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Unable to find Niagara User parameter for Custom HLSL input '%s': %s"), *InputName, *UserParameterName));
+            }
+            if (!IsSettableNiagaraUserParameterType(MatchedParameter->GetType()))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Unsupported Niagara User parameter type for Custom HLSL input '%s': %s (%s)"),
+                        *InputName,
+                        *UserParameterName,
+                        *NiagaraTypeName(MatchedParameter->GetType())));
+            }
+
+            FUserParameterInputRequest Request;
+            Request.InputName = InputName;
+            Request.UserParameterName = UserParameterName;
+            Request.UserParameter = FNiagaraVariable(MatchedParameter->GetType(), FName(*UserParameterName));
+            UserParameterInputRequests.Add(Request);
+        }
+    }
+
+    if (bRequiresContext)
+    {
+        CustomInputs.StableSort([](const FCustomInputSpec& Left, const FCustomInputSpec& Right)
+        {
+            const bool bLeftIsMap = Left.InputName.Equals(TEXT("Map"), ESearchCase::IgnoreCase);
+            const bool bRightIsMap = Right.InputName.Equals(TEXT("Map"), ESearchCase::IgnoreCase);
+            return bLeftIsMap && !bRightIsMap;
+        });
+    }
+
+    System->Modify();
+    ScratchPadScript->Modify();
+    ScriptSource->Modify();
+    Graph->Modify();
+    TargetNode->Modify();
+    TargetPin->Modify();
+
+    TArray<UEdGraphNode*> CreatedCustomInputSourceNodes;
+    auto RemoveCreatedCustomInputSourceNodes = [&]()
+    {
+        for (UEdGraphNode* CreatedNode : CreatedCustomInputSourceNodes)
+        {
+            if (CreatedNode)
+            {
+                Graph->RemoveNode(CreatedNode, true, false);
+            }
+        }
+        CreatedCustomInputSourceNodes.Reset();
+    };
+
+    if (UserParameterInputRequests.Num() > 0)
+    {
+        for (const FUserParameterInputRequest& Request : UserParameterInputRequests)
+        {
+            if (!AddLinkedParameterCustomInput(Request.InputName, Request.UserParameter, InputError))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(InputError);
+            }
+        }
+    }
+
+    FNiagaraFunctionSignature CustomSignature;
+    CustomSignature.Name = FName(*SignatureName);
+    CustomSignature.bRequiresContext = bRequiresContext;
+    for (const FCustomInputSpec& Spec : CustomInputs)
+    {
+        CustomSignature.Inputs.Add(FNiagaraVariable(Spec.Type, FName(*Spec.InputName)));
+    }
+    CustomSignature.Outputs.Add(FNiagaraVariable(TargetType, FName(*OutputPinName)));
+
+    TMap<FString, UEdGraphPin*> LinkedParameterOutputPins;
+    int32 LinkedParameterInputNodeIndex = 0;
+    for (const FCustomInputSpec& Spec : CustomInputs)
+    {
+        if (!Spec.bLinkToParameter)
+        {
+            continue;
+        }
+
+        FGraphNodeCreator<UNiagaraNodeInput> InputNodeCreator(*Graph);
+        UNiagaraNodeInput* InputNode = InputNodeCreator.CreateNode(false);
+        if (!InputNode)
+        {
+            RemoveCreatedCustomInputSourceNodes();
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to create Niagara input node for Custom HLSL input '%s'"), *Spec.InputName));
+        }
+
+        FNiagaraVariable ParameterVariable = Spec.LinkedParameter;
+        if (!ParameterVariable.GetType().IsDataInterface() && !ParameterVariable.GetType().IsUObject() && !ParameterVariable.IsDataAllocated())
+        {
+            ParameterVariable.AllocateData();
+        }
+
+        InputNode->NodePosX = TargetNode->NodePosX - 640;
+        InputNode->NodePosY = TargetNode->NodePosY + 120 + (LinkedParameterInputNodeIndex++ * 80);
+        InputNode->Usage = ENiagaraInputNodeUsage::Parameter;
+        InputNode->bCanRenameNode = false;
+        InputNode->Input = ParameterVariable;
+        InputNode->ExposureOptions.bExposed = false;
+        InputNode->ExposureOptions.bRequired = false;
+        InputNode->ExposureOptions.bCanAutoBind = false;
+        InputNode->ExposureOptions.bHidden = true;
+        InputNodeCreator.Finalize();
+        InputNode->Modify();
+        CreatedCustomInputSourceNodes.Add(InputNode);
+
+        UEdGraphPin* InputOutputPin = FindGraphPinByName(InputNode, EGPD_Output, FName(TEXT("Input")), false);
+        if (!InputOutputPin)
+        {
+            RemoveCreatedCustomInputSourceNodes();
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to find Niagara input node output pin for Custom HLSL input '%s'"), *Spec.InputName));
+        }
+
+        LinkedParameterOutputPins.Add(Spec.InputName, InputOutputPin);
+    }
+
+    FGraphNodeCreator<UNiagaraNodeCustomHlsl> CustomNodeCreator(*Graph);
+    UNiagaraNodeCustomHlsl* CustomNode = CustomNodeCreator.CreateNode(false);
+    if (!CustomNode)
+    {
+        RemoveCreatedCustomInputSourceNodes();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara Custom HLSL node"));
+    }
+    CustomNode->NodePosX = TargetNode->NodePosX - 280;
+    CustomNode->NodePosY = TargetNode->NodePosY + 120;
+    CustomNode->ScriptUsage = ENiagaraScriptUsage::DynamicInput;
+    CustomNode->Signature = CustomSignature;
+    CustomNodeCreator.Finalize();
+    CustomNode->Modify();
+
+    if (!SetNiagaraCustomHlslString(CustomNode, Expression))
+    {
+        Graph->RemoveNode(CustomNode, true, false);
+        RemoveCreatedCustomInputSourceNodes();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to set Custom HLSL expression"));
+    }
+
+    UEdGraphPin* CustomOutputPin = FindGraphPinByName(CustomNode, EGPD_Output, FName(*OutputPinName));
+    if (!CustomOutputPin)
+    {
+        Graph->RemoveNode(CustomNode, true, false);
+        RemoveCreatedCustomInputSourceNodes();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to find Custom HLSL output pin"));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> LinkedCustomInputs;
+    for (const FCustomInputSpec& Spec : CustomInputs)
+    {
+        UEdGraphPin* CustomInputPin = FindGraphPinByName(CustomNode, EGPD_Input, FName(*Spec.InputName));
+        if (!CustomInputPin)
+        {
+            Graph->RemoveNode(CustomNode, true, false);
+            RemoveCreatedCustomInputSourceNodes();
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to find Custom HLSL input pin: %s"), *Spec.InputName));
+        }
+        if (Spec.bLinkToParameter)
+        {
+            UEdGraphPin** LinkedParameterOutputPin = LinkedParameterOutputPins.Find(Spec.InputName);
+            if (!LinkedParameterOutputPin || !*LinkedParameterOutputPin)
+            {
+                Graph->RemoveNode(CustomNode, true, false);
+                RemoveCreatedCustomInputSourceNodes();
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Failed to resolve Niagara linked parameter input node output pin for Custom HLSL input '%s'"), *Spec.InputName));
+            }
+            (*LinkedParameterOutputPin)->MakeLinkTo(CustomInputPin);
+        }
+        else
+        {
+            Spec.SourcePin->MakeLinkTo(CustomInputPin);
+        }
+
+        TSharedPtr<FJsonObject> InputJson = MakeShared<FJsonObject>();
+        InputJson->SetStringField(TEXT("input_name"), Spec.InputName);
+        if (Spec.bLinkToParameter)
+        {
+            InputJson->SetStringField(TEXT("linked_parameter_name"), Spec.LinkedParameter.GetName().ToString());
+        }
+        else
+        {
+            InputJson->SetStringField(TEXT("source_node_name"), Spec.SourcePin->GetOwningNode() ? Spec.SourcePin->GetOwningNode()->GetName() : FString());
+            InputJson->SetStringField(TEXT("source_pin_name"), Spec.SourcePin->PinName.ToString());
+        }
+        InputJson->SetStringField(TEXT("input_type"), NiagaraTypeName(Spec.Type));
+        LinkedCustomInputs.Add(MakeShared<FJsonValueObject>(InputJson));
+    }
+
+    const FString PreviousDefaultValue = TargetPin->DefaultValue;
+    const FString PreviousDefaultObject = NiagaraObjectPathOrEmpty(TargetPin->DefaultObject);
+    const TArray<TSharedPtr<FJsonValue>> PreviousLinkedSources = LinkedPinsToJson(TargetPin, true);
+    TargetPin->BreakAllPinLinks(true);
+    if (ExistingCustomNodeToReplace)
+    {
+        Graph->RemoveNode(ExistingCustomNodeToReplace, true, false);
+    }
+    CustomOutputPin->MakeLinkTo(TargetPin);
+
+    int32 RemovedUnlinkedCustomNodeCount = 0;
+    if (bDeleteUnlinkedCustomNodes)
+    {
+        TArray<UEdGraphNode*> NodesToRemove;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            if (!Node || Node == CustomNode || !Node->IsA<UNiagaraNodeCustomHlsl>())
+            {
+                continue;
+            }
+
+            bool bHasOutputLinks = false;
+            for (UEdGraphPin* Pin : Node->Pins)
+            {
+                if (Pin && Pin->Direction == EGPD_Output && !IsNiagaraDynamicAddPin(Pin) && Pin->LinkedTo.Num() > 0)
+                {
+                    bHasOutputLinks = true;
+                    break;
+                }
+            }
+            if (!bHasOutputLinks)
+            {
+                NodesToRemove.Add(Node);
+            }
+        }
+
+        for (UEdGraphNode* NodeToRemove : NodesToRemove)
+        {
+            Graph->RemoveNode(NodeToRemove, true, false);
+            ++RemovedUnlinkedCustomNodeCount;
+        }
+    }
+
+    int32 RemovedUnlinkedCustomInputSourceNodeCount = 0;
+    if (bDeleteUnlinkedCustomInputSourceNodes)
+    {
+        TArray<UEdGraphNode*> NodesToRemove;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            if (!Node || Node == CustomNode || CreatedCustomInputSourceNodes.Contains(Node))
+            {
+                continue;
+            }
+            if (!ExistingCustomInputSourceNodesToReplace.Contains(Node))
+            {
+                continue;
+            }
+
+            const bool bIsSupportedInputSourceNode =
+                Node->IsA<UNiagaraNodeInput>() ||
+                Node->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapGet"));
+            if (!bIsSupportedInputSourceNode)
+            {
+                continue;
+            }
+
+            bool bHasOutputLinks = false;
+            for (UEdGraphPin* Pin : Node->Pins)
+            {
+                if (Pin && Pin->Direction == EGPD_Output && !IsNiagaraDynamicAddPin(Pin) && Pin->LinkedTo.Num() > 0)
+                {
+                    bHasOutputLinks = true;
+                    break;
+                }
+            }
+            if (!bHasOutputLinks)
+            {
+                NodesToRemove.Add(Node);
+            }
+        }
+
+        for (UEdGraphNode* NodeToRemove : NodesToRemove)
+        {
+            Graph->RemoveNode(NodeToRemove, true, false);
+            ++RemovedUnlinkedCustomInputSourceNodeCount;
+        }
+    }
+
+    Graph->NotifyGraphChanged();
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after inserting Scratch Pad Custom HLSL"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetBoolField(TEXT("already_inserted"), false);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_name"), ScratchPadScript->GetName());
+    Result->SetStringField(TEXT("scratch_pad_owner_kind"), ResolvedScratchPadOwnerKind);
+    Result->SetStringField(TEXT("scratch_pad_owner_name"), ResolvedScratchPadOwnerName);
+    Result->SetNumberField(TEXT("scratch_pad_emitter_index"), ResolvedScratchPadEmitterIndex);
+    Result->SetNumberField(TEXT("scratch_pad_script_index"), ResolvedScratchPadScriptIndex);
+    Result->SetStringField(TEXT("target_node_name"), TargetNode->GetName());
+    Result->SetStringField(TEXT("target_node_guid"), TargetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("target_node_index"), MatchedTargetNodeIndex);
+    Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+    Result->SetStringField(TEXT("output_pin_name"), OutputPinName);
+    Result->SetStringField(TEXT("output_type"), NiagaraTypeName(TargetType));
+    Result->SetStringField(TEXT("custom_hlsl_node_guid"), CustomNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetStringField(TEXT("expression"), Expression);
+    Result->SetStringField(TEXT("previous_default_value"), PreviousDefaultValue);
+    Result->SetStringField(TEXT("previous_default_object"), PreviousDefaultObject);
+    Result->SetNumberField(TEXT("previous_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("broken_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("new_link_count"), TargetPin->LinkedTo.Num());
+    Result->SetNumberField(TEXT("removed_unlinked_custom_node_count"), RemovedUnlinkedCustomNodeCount);
+    Result->SetNumberField(TEXT("removed_unlinked_custom_input_source_node_count"), RemovedUnlinkedCustomInputSourceNodeCount);
+    Result->SetNumberField(TEXT("user_parameter_input_count"), UserParameterInputRequests.Num());
+    Result->SetNumberField(TEXT("created_user_parameter_input_node_count"), CreatedCustomInputSourceNodes.Num());
+    Result->SetArrayField(TEXT("previous_linked_sources"), PreviousLinkedSources);
+    Result->SetArrayField(TEXT("new_linked_sources"), LinkedPinsToJson(TargetPin, true));
+    Result->SetArrayField(TEXT("custom_inputs"), LinkedCustomInputs);
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_custom_hlsl_pin_insert"));
+    return Result;
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("insert_niagara_scratch_pad_custom_hlsl_for_pin requires editor-only Niagara data"));
+#endif
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleWrapNiagaraScratchPadOutputWithStackContext(const TSharedPtr<FJsonObject>& Params)
+{
+#if WITH_EDITORONLY_DATA
+    FString SystemPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara Scratch Pad graph outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    FString TargetPinName = TEXT("StackContext.RGBA");
+    Params->TryGetStringField(TEXT("target_pin_name"), TargetPinName);
+    Params->TryGetStringField(TEXT("input_pin_name"), TargetPinName);
+    TargetPinName.TrimStartAndEndInline();
+    if (TargetPinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'target_pin_name' cannot be empty"));
+    }
+
+    FString LocalValuePinName = TEXT("LocalStampValue");
+    Params->TryGetStringField(TEXT("local_value_pin_name"), LocalValuePinName);
+    LocalValuePinName.TrimStartAndEndInline();
+    if (LocalValuePinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'local_value_pin_name' cannot be empty"));
+    }
+
+    FString PreviousStackValuePinName = TEXT("PreviousStackValue");
+    Params->TryGetStringField(TEXT("previous_stack_value_pin_name"), PreviousStackValuePinName);
+    PreviousStackValuePinName.TrimStartAndEndInline();
+    if (PreviousStackValuePinName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'previous_stack_value_pin_name' cannot be empty"));
+    }
+
+    FString Expression = TEXT("max(PreviousStackValue, LocalStampValue)");
+    Params->TryGetStringField(TEXT("expression"), Expression);
+    Expression.TrimStartAndEndInline();
+    if (Expression.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'expression' cannot be empty"));
+    }
+
+    bool bSkipIfAlreadyWrapped = true;
+    Params->TryGetBoolField(TEXT("skip_if_already_wrapped"), bSkipIfAlreadyWrapped);
+
+    bool bReplaceExistingCustom = true;
+    Params->TryGetBoolField(TEXT("replace_existing_custom"), bReplaceExistingCustom);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    FString ScratchPadScriptPath;
+    FString ScratchPadOwnerKind = TEXT("system");
+    FString ScratchPadName = TEXT("RenderCircleToGrid");
+    int32 ScratchPadScriptIndex = INDEX_NONE;
+    int32 ScratchPadEmitterIndex = INDEX_NONE;
+    FString ScratchPadEmitterName;
+    Params->TryGetStringField(TEXT("scratch_pad_script_path"), ScratchPadScriptPath);
+    Params->TryGetStringField(TEXT("scratch_pad_owner_kind"), ScratchPadOwnerKind);
+    Params->TryGetStringField(TEXT("scratch_pad_name"), ScratchPadName);
+    Params->TryGetStringField(TEXT("scratch_pad_script_name"), ScratchPadName);
+    Params->TryGetNumberField(TEXT("scratch_pad_script_index"), ScratchPadScriptIndex);
+    Params->TryGetNumberField(TEXT("scratch_pad_emitter_index"), ScratchPadEmitterIndex);
+    Params->TryGetStringField(TEXT("scratch_pad_emitter_name"), ScratchPadEmitterName);
+
+    FString TargetNodeGuid;
+    Params->TryGetStringField(TEXT("target_node_guid"), TargetNodeGuid);
+    Params->TryGetStringField(TEXT("parameter_map_set_node_guid"), TargetNodeGuid);
+
+    int32 TargetNodeIndex = INDEX_NONE;
+    Params->TryGetNumberField(TEXT("target_node_index"), TargetNodeIndex);
+    Params->TryGetNumberField(TEXT("parameter_map_set_node_index"), TargetNodeIndex);
+
+    int32 ParameterMapSetIndexSelector = INDEX_NONE;
+    Params->TryGetNumberField(TEXT("parameter_map_set_index"), ParameterMapSetIndexSelector);
+
+    if (!FindFProperty<FStrProperty>(UNiagaraNodeCustomHlsl::StaticClass(), TEXT("CustomHlsl")))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unable to access Niagara Custom HLSL storage"));
+    }
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraScript* RequestedScript = nullptr;
+    if (!ScratchPadScriptPath.IsEmpty())
+    {
+        RequestedScript = LoadObject<UNiagaraScript>(nullptr, *NormalizeNiagaraObjectPathForLoad(ScratchPadScriptPath));
+        if (!RequestedScript)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Scratch Pad script: %s"), *ScratchPadScriptPath));
+        }
+    }
+
+    UNiagaraScript* ScratchPadScript = nullptr;
+    FString ResolvedScratchPadOwnerKind;
+    FString ResolvedScratchPadOwnerName;
+    int32 ResolvedScratchPadEmitterIndex = INDEX_NONE;
+    int32 ResolvedScratchPadScriptIndex = INDEX_NONE;
+
+    auto TryMatchScratchPadScript = [&RequestedScript, &ScratchPadName, ScratchPadScriptIndex](
+        const TArray<TObjectPtr<UNiagaraScript>>& Scripts,
+        int32& OutScriptIndex) -> UNiagaraScript*
+    {
+        for (int32 ScriptIndex = 0; ScriptIndex < Scripts.Num(); ++ScriptIndex)
+        {
+            UNiagaraScript* Candidate = Scripts[ScriptIndex].Get();
+            if (!Candidate)
+            {
+                continue;
+            }
+
+            const bool bPathMatches = !RequestedScript || Candidate == RequestedScript || Candidate->GetPathName().Equals(RequestedScript->GetPathName(), ESearchCase::IgnoreCase);
+            const bool bIndexMatches = RequestedScript || ScratchPadScriptIndex == INDEX_NONE || ScratchPadScriptIndex == ScriptIndex;
+            const bool bNameMatches = RequestedScript || ScratchPadName.IsEmpty() || Candidate->GetName().Equals(ScratchPadName, ESearchCase::IgnoreCase);
+            if (bPathMatches && bIndexMatches && bNameMatches)
+            {
+                OutScriptIndex = ScriptIndex;
+                return Candidate;
+            }
+        }
+        return nullptr;
+    };
+
+    auto TryResolveSystemScratchPad = [&]()
+    {
+        int32 MatchedScriptIndex = INDEX_NONE;
+        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(System->ScratchPadScripts, MatchedScriptIndex))
+        {
+            ScratchPadScript = Candidate;
+            ResolvedScratchPadOwnerKind = TEXT("system");
+            ResolvedScratchPadOwnerName = System->GetName();
+            ResolvedScratchPadEmitterIndex = INDEX_NONE;
+            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+            return true;
+        }
+        return false;
+    };
+
+    auto TryResolveEmitterScratchPad = [&]()
+    {
+        int32 CurrentEmitterIndex = 0;
+        for (FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+        {
+            const FString EmitterName = EmitterHandle.GetName().ToString();
+            const bool bEmitterMatches =
+                RequestedScript ||
+                ((ScratchPadEmitterIndex == INDEX_NONE || ScratchPadEmitterIndex == CurrentEmitterIndex) &&
+                (ScratchPadEmitterName.IsEmpty() || ScratchPadEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase)));
+            if (bEmitterMatches)
+            {
+                if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+                {
+                    if (EmitterData->ScratchPads)
+                    {
+                        int32 MatchedScriptIndex = INDEX_NONE;
+                        if (UNiagaraScript* Candidate = TryMatchScratchPadScript(EmitterData->ScratchPads->Scripts, MatchedScriptIndex))
+                        {
+                            ScratchPadScript = Candidate;
+                            ResolvedScratchPadOwnerKind = TEXT("emitter");
+                            ResolvedScratchPadOwnerName = EmitterName;
+                            ResolvedScratchPadEmitterIndex = CurrentEmitterIndex;
+                            ResolvedScratchPadScriptIndex = MatchedScriptIndex;
+                            return true;
+                        }
+                    }
+                }
+            }
+            ++CurrentEmitterIndex;
+        }
+        return false;
+    };
+
+    if (RequestedScript)
+    {
+        TryResolveSystemScratchPad();
+        if (!ScratchPadScript)
+        {
+            TryResolveEmitterScratchPad();
+        }
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("system"), ESearchCase::IgnoreCase))
+    {
+        TryResolveSystemScratchPad();
+    }
+    else if (ScratchPadOwnerKind.Equals(TEXT("emitter"), ESearchCase::IgnoreCase))
+    {
+        TryResolveEmitterScratchPad();
+    }
+    else
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unsupported scratch_pad_owner_kind. Use 'system' or 'emitter'."));
+    }
+
+    if (!ScratchPadScript)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching target-local Scratch Pad script was found"));
+    }
+
+    UNiagaraScriptSource* ScriptSource = Cast<UNiagaraScriptSource>(ScratchPadScript->GetLatestSource());
+    UNiagaraGraph* Graph = ScriptSource ? ScriptSource->NodeGraph : nullptr;
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Scratch Pad script has no editable graph: %s"), *ScratchPadScript->GetPathName()));
+    }
+
+    UEdGraphNode* MatchedSetNode = nullptr;
+    UEdGraphPin* TargetPin = nullptr;
+    int32 MatchedGraphNodeIndex = INDEX_NONE;
+    int32 MatchedParameterMapSetIndex = INDEX_NONE;
+    int32 MatchCount = 0;
+    int32 GraphNodeIndex = 0;
+    int32 ParameterMapSetIndex = 0;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        const int32 CurrentGraphNodeIndex = GraphNodeIndex++;
+        if (!Node || !Node->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapSet")))
+        {
+            continue;
+        }
+
+        const int32 CurrentParameterMapSetIndex = ParameterMapSetIndex++;
+        const FString CandidateGuid = Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+        const bool bNodeIndexMatches = TargetNodeIndex == INDEX_NONE || TargetNodeIndex == CurrentGraphNodeIndex;
+        const bool bSetIndexMatches = ParameterMapSetIndexSelector == INDEX_NONE || ParameterMapSetIndexSelector == CurrentParameterMapSetIndex;
+        const bool bGuidMatches = TargetNodeGuid.IsEmpty() || TargetNodeGuid.Equals(CandidateGuid, ESearchCase::IgnoreCase);
+        if (!bNodeIndexMatches || !bSetIndexMatches || !bGuidMatches)
+        {
+            continue;
+        }
+
+        for (UEdGraphPin* Pin : Node->Pins)
+        {
+            if (!Pin || Pin->Direction != EGPD_Input)
+            {
+                continue;
+            }
+
+            const FString CandidatePinName = Pin->PinName.ToString();
+            const bool bPinMatches = CandidatePinName.Equals(TargetPinName, ESearchCase::IgnoreCase) ||
+                TargetPinName.EndsWith(FString::Printf(TEXT(".%s"), *CandidatePinName), ESearchCase::IgnoreCase) ||
+                CandidatePinName.EndsWith(FString::Printf(TEXT(".%s"), *TargetPinName), ESearchCase::IgnoreCase);
+            if (bPinMatches)
+            {
+                ++MatchCount;
+                if (!MatchedSetNode)
+                {
+                    MatchedSetNode = Node;
+                    TargetPin = Pin;
+                    MatchedGraphNodeIndex = CurrentGraphNodeIndex;
+                    MatchedParameterMapSetIndex = CurrentParameterMapSetIndex;
+                }
+            }
+        }
+    }
+
+    if (!MatchedSetNode || !TargetPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching Scratch Pad ParameterMapSet input pin was found: %s"), *TargetPinName));
+    }
+    if (MatchCount > 1 && TargetNodeIndex == INDEX_NONE && TargetNodeGuid.IsEmpty() && ParameterMapSetIndexSelector == INDEX_NONE)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Target pin selector matched %d pins. Provide 'target_node_index', 'parameter_map_set_index', or 'target_node_guid'."), MatchCount));
+    }
+    if (TargetPin->PinName == TEXT("Source"))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Refusing to wrap the ParameterMapSet Source pin; choose a value input pin instead."));
+    }
+
+    UEdGraphPin* SourcePin = FindGraphPinByName(MatchedSetNode, EGPD_Input, FName(TEXT("Source")), false);
+    if (!SourcePin || SourcePin->LinkedTo.Num() != 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(
+                TEXT("Target ParameterMapSet node '%s' must have exactly one linked Source pin before wrapping. Found: %d"),
+                *MatchedSetNode->GetName(),
+                SourcePin ? SourcePin->LinkedTo.Num() : 0));
+    }
+
+    UEdGraphPin* PreviousLocalValuePin = nullptr;
+    UNiagaraNodeCustomHlsl* ExistingCustomNodeToReplace = nullptr;
+    UEdGraphNode* ExistingParameterMapGetNodeToReplace = nullptr;
+    const int32 PreviousLinkCount = TargetPin->LinkedTo.Num();
+    if (PreviousLinkCount == 1)
+    {
+        if (UNiagaraNodeCustomHlsl* ExistingCustomNode = Cast<UNiagaraNodeCustomHlsl>(TargetPin->LinkedTo[0]->GetOwningNode()))
+        {
+            const FString ExistingExpression = GetNiagaraCustomHlslString(ExistingCustomNode).TrimStartAndEnd();
+            UEdGraphPin* ExistingPreviousStackValuePin = FindGraphPinByName(ExistingCustomNode, EGPD_Input, FName(*PreviousStackValuePinName));
+            UEdGraphPin* ExistingLocalValuePin = FindGraphPinByName(ExistingCustomNode, EGPD_Input, FName(*LocalValuePinName));
+            if (bSkipIfAlreadyWrapped && ExistingExpression.Equals(Expression, ESearchCase::CaseSensitive) && ExistingPreviousStackValuePin && ExistingLocalValuePin)
+            {
+                TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+                Result->SetBoolField(TEXT("success"), true);
+                Result->SetBoolField(TEXT("already_wrapped"), true);
+                Result->SetStringField(TEXT("system_path"), System->GetPathName());
+                Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+                Result->SetStringField(TEXT("scratch_pad_script_name"), ScratchPadScript->GetName());
+                Result->SetStringField(TEXT("parameter_map_set_node_name"), MatchedSetNode->GetName());
+                Result->SetStringField(TEXT("parameter_map_set_node_guid"), MatchedSetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+                Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+                Result->SetStringField(TEXT("custom_hlsl_node_guid"), ExistingCustomNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+                Result->SetStringField(TEXT("expression"), ExistingExpression);
+                Result->SetNumberField(TEXT("new_link_count"), TargetPin->LinkedTo.Num());
+                Result->SetArrayField(TEXT("new_linked_sources"), LinkedPinsToJson(TargetPin, true));
+                Result->SetBoolField(TEXT("compile_requested"), false);
+                Result->SetBoolField(TEXT("saved"), false);
+                Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_output_stack_context_accumulator"));
+                return Result;
+            }
+
+            if (!bReplaceExistingCustom)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Scratch Pad pin '%s' is already linked to a Custom HLSL node with a different expression."), *TargetPin->PinName.ToString()));
+            }
+            if (!ExistingLocalValuePin || ExistingLocalValuePin->LinkedTo.Num() != 1)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Existing Custom HLSL node for '%s' does not expose exactly one '%s' input link to preserve."),
+                        *TargetPin->PinName.ToString(),
+                        *LocalValuePinName));
+            }
+
+            ExistingCustomNodeToReplace = ExistingCustomNode;
+            PreviousLocalValuePin = ExistingLocalValuePin->LinkedTo[0];
+            if (ExistingPreviousStackValuePin && ExistingPreviousStackValuePin->LinkedTo.Num() == 1)
+            {
+                UEdGraphNode* ExistingPreviousStackNode = ExistingPreviousStackValuePin->LinkedTo[0]->GetOwningNode();
+                if (ExistingPreviousStackNode && ExistingPreviousStackNode->GetClass()->GetName().Equals(TEXT("NiagaraNodeParameterMapGet")))
+                {
+                    ExistingParameterMapGetNodeToReplace = ExistingPreviousStackNode;
+                }
+            }
+        }
+        else
+        {
+            PreviousLocalValuePin = TargetPin->LinkedTo[0];
+        }
+    }
+    if (PreviousLinkCount != 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Scratch Pad pin '%s' must have exactly one existing value link to wrap. Found: %d"),
+                *TargetPin->PinName.ToString(),
+                PreviousLinkCount));
+    }
+
+    const FNiagaraTypeDefinition TargetType = UEdGraphSchema_Niagara::PinToTypeDefinition(TargetPin);
+    if (!TargetType.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unable to resolve Niagara type for Scratch Pad pin: %s"), *TargetPin->PinName.ToString()));
+    }
+
+    UEdGraphPin* PreviousStackNodeOutputPin = SourcePin->LinkedTo[0];
+    const FString PreviousDefaultValue = TargetPin->DefaultValue;
+    const FString PreviousDefaultObject = NiagaraObjectPathOrEmpty(TargetPin->DefaultObject);
+    const TArray<TSharedPtr<FJsonValue>> PreviousLinkedSources = LinkedPinsToJson(TargetPin, true);
+    if (!PreviousLocalValuePin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unable to resolve the previous local value pin to wrap"));
+    }
+
+    System->Modify();
+    ScratchPadScript->Modify();
+    ScriptSource->Modify();
+    Graph->Modify();
+    MatchedSetNode->Modify();
+    TargetPin->Modify();
+
+    UClass* ParameterMapGetClass = StaticLoadClass(UEdGraphNode::StaticClass(), nullptr, TEXT("/Script/NiagaraEditor.NiagaraNodeParameterMapGet"));
+    if (!ParameterMapGetClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to load NiagaraNodeParameterMapGet class"));
+    }
+
+    FNiagaraFunctionSignature CustomSignature;
+    CustomSignature.Name = TEXT("IF_StackContextAccumulator");
+    CustomSignature.bRequiresContext = true;
+    CustomSignature.Inputs.Add(FNiagaraVariable(FNiagaraTypeDefinition::GetParameterMapDef(), FName(TEXT("Map"))));
+    CustomSignature.Inputs.Add(FNiagaraVariable(TargetType, FName(*PreviousStackValuePinName)));
+    CustomSignature.Inputs.Add(FNiagaraVariable(TargetType, FName(*LocalValuePinName)));
+    CustomSignature.Outputs.Add(FNiagaraVariable(TargetType, FName(TEXT("CustomHLSLOutput"))));
+
+    FGraphNodeCreator<UEdGraphNode> MapGetNodeCreator(*Graph);
+    UEdGraphNode* MapGetNode = MapGetNodeCreator.CreateNode(false, TSubclassOf<UEdGraphNode>(ParameterMapGetClass));
+    if (!MapGetNode)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara ParameterMapGet node"));
+    }
+    MapGetNode->NodePosX = MatchedSetNode->NodePosX - 640;
+    MapGetNode->NodePosY = MatchedSetNode->NodePosY + 40;
+    MapGetNodeCreator.Finalize();
+    MapGetNode->Modify();
+
+    UEdGraphPin* MapGetSourcePin = FindGraphPinByName(MapGetNode, EGPD_Input, FName(TEXT("Source")), false);
+    FNiagaraVariable PreviousStackValueVariable(TargetType, FName(*TargetPinName));
+    if (!TargetType.IsDataInterface() && !TargetType.IsUObject())
+    {
+        PreviousStackValueVariable.AllocateData();
+    }
+
+    UNiagaraGraph::FScriptVariableMap& ScriptVariableMap = Graph->GetAllMetaData();
+    UNiagaraScriptVariable* PreviousStackScriptVariable = ScriptVariableMap.FindRef(PreviousStackValueVariable);
+    if (!PreviousStackScriptVariable)
+    {
+        PreviousStackScriptVariable = NewObject<UNiagaraScriptVariable>(Graph, FName(), RF_Transactional);
+        PreviousStackScriptVariable->Init(PreviousStackValueVariable, FNiagaraVariableMetaData());
+        ScriptVariableMap.Add(PreviousStackValueVariable, PreviousStackScriptVariable);
+    }
+    if (!PreviousStackScriptVariable)
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to register Niagara default for ParameterMapGet output: %s"), *TargetPinName));
+    }
+    PreviousStackScriptVariable->Modify();
+    PreviousStackScriptVariable->DefaultMode = ENiagaraDefaultMode::Value;
+    PreviousStackScriptVariable->DefaultBinding = FNiagaraScriptVariableBinding();
+    if (PreviousStackValueVariable.IsDataAllocated())
+    {
+        PreviousStackScriptVariable->SetDefaultValueData(PreviousStackValueVariable.GetData());
+    }
+    PreviousStackScriptVariable->UpdateChangeId();
+
+    const FEdGraphPinType MapGetPinType = UEdGraphSchema_Niagara::TypeDefinitionToPinType(TargetType);
+    UEdGraphPin* MapGetOutputPin = MapGetNode->CreatePin(EGPD_Output, MapGetPinType, FName(*TargetPinName));
+    if (!MapGetOutputPin)
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara ParameterMapGet output pin"));
+    }
+    if (!MapGetOutputPin->PersistentGuid.IsValid())
+    {
+        MapGetOutputPin->PersistentGuid = FGuid::NewGuid();
+    }
+    MapGetOutputPin->PinType.PinSubCategory = FName(TEXT("ParameterPin"));
+    MapGetOutputPin->PinFriendlyName = FText::AsCultureInvariant(TargetPinName);
+
+    UEdGraphPin* MapGetDefaultPin = MapGetNode->CreatePin(EGPD_Input, MapGetPinType, NAME_None);
+    if (!MapGetDefaultPin)
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara ParameterMapGet default pin"));
+    }
+    if (!MapGetDefaultPin->PersistentGuid.IsValid())
+    {
+        MapGetDefaultPin->PersistentGuid = FGuid::NewGuid();
+    }
+    FString MapGetDefaultValue;
+    if (PreviousStackValueVariable.IsDataAllocated() &&
+        GetDefault<UEdGraphSchema_Niagara>()->TryGetPinDefaultValueFromNiagaraVariable(PreviousStackValueVariable, MapGetDefaultValue))
+    {
+        MapGetDefaultPin->DefaultValue = MapGetDefaultValue;
+        MapGetDefaultPin->AutogeneratedDefaultValue = MapGetDefaultValue;
+    }
+    MapGetDefaultPin->bNotConnectable = true;
+    MapGetDefaultPin->bDefaultValueIsReadOnly = true;
+    MapGetDefaultPin->bHidden = false;
+    if (FMapProperty* PinPairProperty = FindFProperty<FMapProperty>(MapGetNode->GetClass(), TEXT("PinOutputToPinDefaultPersistentId")))
+    {
+        FScriptMapHelper PinPairMap(PinPairProperty, PinPairProperty->ContainerPtrToValuePtr<void>(MapGetNode));
+        const int32 PairIndex = PinPairMap.AddDefaultValue_Invalid_NeedsRehash();
+        *reinterpret_cast<FGuid*>(PinPairMap.GetKeyPtr(PairIndex)) = MapGetOutputPin->PersistentGuid;
+        *reinterpret_cast<FGuid*>(PinPairMap.GetValuePtr(PairIndex)) = MapGetDefaultPin->PersistentGuid;
+        PinPairMap.Rehash();
+    }
+    else
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Unable to access Niagara ParameterMapGet output/default pin map"));
+    }
+
+    FGraphNodeCreator<UNiagaraNodeCustomHlsl> CustomNodeCreator(*Graph);
+    UNiagaraNodeCustomHlsl* CustomNode = CustomNodeCreator.CreateNode(false);
+    if (!CustomNode)
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara Custom HLSL accumulator node"));
+    }
+    CustomNode->NodePosX = MatchedSetNode->NodePosX - 320;
+    CustomNode->NodePosY = MatchedSetNode->NodePosY + 160;
+    CustomNode->ScriptUsage = ENiagaraScriptUsage::DynamicInput;
+    CustomNode->Signature = CustomSignature;
+    CustomNodeCreator.Finalize();
+    CustomNode->Modify();
+
+    if (!SetNiagaraCustomHlslString(CustomNode, Expression))
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        Graph->RemoveNode(CustomNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to set Custom HLSL expression on accumulator node"));
+    }
+
+    UEdGraphPin* CustomMapPin = FindGraphPinByName(CustomNode, EGPD_Input, FName(TEXT("Map")));
+    UEdGraphPin* CustomPreviousStackValuePin = FindGraphPinByName(CustomNode, EGPD_Input, FName(*PreviousStackValuePinName));
+    UEdGraphPin* CustomLocalValuePin = FindGraphPinByName(CustomNode, EGPD_Input, FName(*LocalValuePinName));
+    UEdGraphPin* CustomOutputPin = FindGraphPinByName(CustomNode, EGPD_Output, FName(TEXT("CustomHLSLOutput")));
+    if (!MapGetSourcePin || !MapGetOutputPin || !CustomMapPin || !CustomPreviousStackValuePin || !CustomLocalValuePin || !CustomOutputPin)
+    {
+        Graph->RemoveNode(MapGetNode, true, false);
+        Graph->RemoveNode(CustomNode, true, false);
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Custom HLSL accumulator pins"));
+    }
+
+    TargetPin->BreakAllPinLinks(true);
+    if (ExistingCustomNodeToReplace)
+    {
+        Graph->RemoveNode(ExistingCustomNodeToReplace, true, false);
+    }
+    if (ExistingParameterMapGetNodeToReplace)
+    {
+        Graph->RemoveNode(ExistingParameterMapGetNodeToReplace, true, false);
+    }
+    PreviousStackNodeOutputPin->MakeLinkTo(MapGetSourcePin);
+    MapGetOutputPin->MakeLinkTo(CustomPreviousStackValuePin);
+    PreviousStackNodeOutputPin->MakeLinkTo(CustomMapPin);
+    PreviousLocalValuePin->MakeLinkTo(CustomLocalValuePin);
+    CustomOutputPin->MakeLinkTo(TargetPin);
+
+    Graph->NotifyGraphChanged();
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after Scratch Pad accumulator wrap"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetBoolField(TEXT("already_wrapped"), false);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_path"), ScratchPadScript->GetPathName());
+    Result->SetStringField(TEXT("scratch_pad_script_name"), ScratchPadScript->GetName());
+    Result->SetStringField(TEXT("scratch_pad_owner_kind"), ResolvedScratchPadOwnerKind);
+    Result->SetStringField(TEXT("scratch_pad_owner_name"), ResolvedScratchPadOwnerName);
+    Result->SetNumberField(TEXT("scratch_pad_emitter_index"), ResolvedScratchPadEmitterIndex);
+    Result->SetNumberField(TEXT("scratch_pad_script_index"), ResolvedScratchPadScriptIndex);
+    Result->SetStringField(TEXT("parameter_map_set_node_name"), MatchedSetNode->GetName());
+    Result->SetStringField(TEXT("parameter_map_set_node_guid"), MatchedSetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("target_node_index"), MatchedGraphNodeIndex);
+    Result->SetNumberField(TEXT("parameter_map_set_index"), MatchedParameterMapSetIndex);
+    Result->SetStringField(TEXT("target_pin_name"), TargetPin->PinName.ToString());
+    Result->SetStringField(TEXT("input_type"), NiagaraTypeName(TargetType));
+    Result->SetStringField(TEXT("previous_stack_value_pin_name"), PreviousStackValuePinName);
+    Result->SetStringField(TEXT("local_value_pin_name"), LocalValuePinName);
+    Result->SetStringField(TEXT("expression"), Expression);
+    Result->SetStringField(TEXT("parameter_map_get_node_guid"), MapGetNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetStringField(TEXT("custom_hlsl_node_guid"), CustomNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetStringField(TEXT("previous_default_value"), PreviousDefaultValue);
+    Result->SetStringField(TEXT("previous_default_object"), PreviousDefaultObject);
+    Result->SetNumberField(TEXT("previous_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("broken_link_count"), PreviousLinkCount);
+    Result->SetNumberField(TEXT("new_link_count"), TargetPin->LinkedTo.Num());
+    Result->SetArrayField(TEXT("previous_linked_sources"), PreviousLinkedSources);
+    Result->SetArrayField(TEXT("new_linked_sources"), LinkedPinsToJson(TargetPin, true));
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("scratch_pad_output_stack_context_accumulator"));
+    return Result;
+#else
+    return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("wrap_niagara_scratch_pad_output_with_stack_context requires editor-only Niagara data"));
+#endif
+}
+
 TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraModuleInputs(const TSharedPtr<FJsonObject>& Params)
 {
     FString SystemPath;
@@ -4873,6 +8271,17 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraDataInter
     Params->TryGetNumberField(TEXT("max_inputs_per_module"), MaxInputsPerModule);
     MaxInputsPerModule = FMath::Clamp(MaxInputsPerModule, 0, 200);
 
+    bool bIncludeDataInterfaceProperties = false;
+    Params->TryGetBoolField(TEXT("include_data_interface_properties"), bIncludeDataInterfaceProperties);
+
+    int32 MaxDataInterfaceProperties = 120;
+    Params->TryGetNumberField(TEXT("max_data_interface_properties"), MaxDataInterfaceProperties);
+    MaxDataInterfaceProperties = FMath::Clamp(MaxDataInterfaceProperties, 0, 500);
+
+    int32 MaxDataInterfacePropertyValueLength = 512;
+    Params->TryGetNumberField(TEXT("max_data_interface_property_value_length"), MaxDataInterfacePropertyValueLength);
+    MaxDataInterfacePropertyValueLength = FMath::Clamp(MaxDataInterfacePropertyValueLength, 64, 4096);
+
     UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
     if (!System)
     {
@@ -4999,7 +8408,14 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraDataInter
                     InputObject->SetStringField(TEXT("aliased_input_handle"), AliasedInputHandle.GetParameterHandleString().ToString());
                     InputObject->SetBoolField(TEXT("has_override_pin"), OverridePin != nullptr);
                     InputObject->SetNumberField(TEXT("override_link_count"), LinkCount);
-                    InputObject->SetObjectField(TEXT("override"), BuildNiagaraDataInterfaceOverrideJson(OverridePin, System));
+                    InputObject->SetObjectField(
+                        TEXT("override"),
+                        BuildNiagaraDataInterfaceOverrideJson(
+                            OverridePin,
+                            System,
+                            bIncludeDataInterfaceProperties,
+                            MaxDataInterfaceProperties,
+                            MaxDataInterfacePropertyValueLength));
                     DataInterfaceInputValues.Add(MakeShared<FJsonValueObject>(InputObject));
                 }
 
@@ -5051,6 +8467,7 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleInspectNiagaraDataInter
     Result->SetNumberField(TEXT("included_module_count"), TotalIncludedModuleCount);
     Result->SetNumberField(TEXT("data_interface_input_count"), TotalDataInterfaceInputCount);
     Result->SetNumberField(TEXT("overridden_input_count"), TotalOverriddenInputCount);
+    Result->SetBoolField(TEXT("include_data_interface_properties"), bIncludeDataInterfaceProperties);
     Result->SetStringField(TEXT("authoring_status"), TEXT("read_only; inspects Data Interface override graph nodes and user-parameter object bindings without compiling or saving"));
     Result->SetArrayField(TEXT("emitters"), EmitterValues);
     return Result;
@@ -5558,13 +8975,13 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRenderTarget2
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
     }
 
-    UTextureRenderTarget* RenderTargetAsset = nullptr;
+    UTextureRenderTarget2D* RenderTargetAsset = nullptr;
     if (!RenderTargetAssetPath.IsEmpty())
     {
-        RenderTargetAsset = LoadObject<UTextureRenderTarget>(nullptr, *NormalizeNiagaraObjectPathForLoad(RenderTargetAssetPath));
+        RenderTargetAsset = LoadObject<UTextureRenderTarget2D>(nullptr, *NormalizeNiagaraObjectPathForLoad(RenderTargetAssetPath));
         if (!RenderTargetAsset)
         {
-            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load render target asset: %s"), *RenderTargetAssetPath));
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load TextureRenderTarget2D asset: %s"), *RenderTargetAssetPath));
         }
     }
 
@@ -5719,16 +9136,6 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRenderTarget2
     }
 
     System->Modify();
-
-    if (!bUserParameterAlreadyExisted)
-    {
-        if (!UserParameterStore.AddParameter(UserRenderTargetParameter, true, true))
-        {
-            return FUnrealMCPCommonUtils::CreateErrorResponse(
-                FString::Printf(TEXT("Failed to add Niagara user parameter: %s"), *UserRenderTargetParameter.GetName().ToString()));
-        }
-    }
-
     MatchedFunctionCall->Modify();
 
     UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
@@ -5757,7 +9164,20 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRenderTarget2
     UNiagaraDataInterfaceRenderTarget2D* RenderTargetDataInterface = Cast<UNiagaraDataInterfaceRenderTarget2D>(CreatedDataInterface);
     if (!RenderTargetDataInterface)
     {
+        FString CleanupError;
+        ClearLinkedNiagaraDataInterfaceInputNode(OverridePin, CleanupError);
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Niagara RenderTarget2D data interface override"));
+    }
+
+    if (!bUserParameterAlreadyExisted)
+    {
+        if (!UserParameterStore.AddParameter(UserRenderTargetParameter, true, true))
+        {
+            FString CleanupError;
+            ClearLinkedNiagaraDataInterfaceInputNode(OverridePin, CleanupError);
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to add Niagara user parameter: %s"), *UserRenderTargetParameter.GetName().ToString()));
+        }
     }
 
     RenderTargetDataInterface->Modify();
@@ -5807,6 +9227,555 @@ TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraRenderTarget2
     Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
     Result->SetBoolField(TEXT("saved"), bSaved);
     Result->SetStringField(TEXT("write_scope"), TEXT("render_target2d_data_interface_module_input"));
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputUserParameter(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SystemPath;
+    FString InputName;
+    FString UserParameterName;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("input_name"), InputName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'input_name' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("user_parameter_name"), UserParameterName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'user_parameter_name' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara module input user parameter outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    UserParameterName.TrimStartAndEndInline();
+    if (UserParameterName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'user_parameter_name' cannot be empty"));
+    }
+    if (!UserParameterName.StartsWith(TEXT("User.")))
+    {
+        UserParameterName = FString::Printf(TEXT("User.%s"), *UserParameterName);
+    }
+
+    bool bOverwriteExisting = false;
+    Params->TryGetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    int32 TargetEmitterIndex = INDEX_NONE;
+    int32 TargetModuleIndex = INDEX_NONE;
+    FString TargetEmitterName;
+    FString TargetModuleName;
+    FString TargetModuleGuid;
+    Params->TryGetNumberField(TEXT("emitter_index"), TargetEmitterIndex);
+    Params->TryGetNumberField(TEXT("module_index"), TargetModuleIndex);
+    Params->TryGetStringField(TEXT("emitter_name"), TargetEmitterName);
+    Params->TryGetStringField(TEXT("module_name"), TargetModuleName);
+    Params->TryGetStringField(TEXT("module_node_guid"), TargetModuleGuid);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraNodeFunctionCall* MatchedFunctionCall = nullptr;
+    FVersionedNiagaraEmitterData* MatchedEmitterData = nullptr;
+    FVersionedNiagaraEmitter MatchedOwningEmitter;
+    FString MatchedEmitterName;
+    FString MatchedModuleName;
+    int32 MatchedEmitterIndex = INDEX_NONE;
+    int32 MatchedModuleIndex = INDEX_NONE;
+
+    int32 CurrentEmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        const bool bEmitterMatches =
+            (TargetEmitterIndex == INDEX_NONE || TargetEmitterIndex == CurrentEmitterIndex) &&
+            (TargetEmitterName.IsEmpty() || TargetEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase));
+
+        if (bEmitterMatches)
+        {
+            if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+            {
+                const TArray<UNiagaraNodeFunctionCall*> FunctionCalls = CollectSortedNiagaraFunctionCalls(EmitterData->GraphSource);
+                for (int32 ModuleIndex = 0; ModuleIndex < FunctionCalls.Num(); ++ModuleIndex)
+                {
+                    UNiagaraNodeFunctionCall* FunctionCall = FunctionCalls[ModuleIndex];
+                    if (!FunctionCall)
+                    {
+                        continue;
+                    }
+
+                    FString FunctionName = FunctionCall->GetFunctionName();
+                    if (FunctionName.IsEmpty())
+                    {
+                        FunctionName = FunctionCall->Signature.GetNameString();
+                    }
+                    const FString FunctionGuid = FunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+                    const bool bModuleMatches =
+                        (TargetModuleIndex == INDEX_NONE || TargetModuleIndex == ModuleIndex) &&
+                        (TargetModuleName.IsEmpty() || TargetModuleName.Equals(FunctionName, ESearchCase::IgnoreCase)) &&
+                        (TargetModuleGuid.IsEmpty() || TargetModuleGuid.Equals(FunctionGuid, ESearchCase::IgnoreCase));
+
+                    if (bModuleMatches)
+                    {
+                        MatchedFunctionCall = FunctionCall;
+                        MatchedEmitterData = EmitterData;
+                        MatchedOwningEmitter = EmitterHandle.GetInstance();
+                        MatchedEmitterName = EmitterName;
+                        MatchedModuleName = FunctionName;
+                        MatchedEmitterIndex = CurrentEmitterIndex;
+                        MatchedModuleIndex = ModuleIndex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (MatchedFunctionCall)
+        {
+            break;
+        }
+        ++CurrentEmitterIndex;
+    }
+
+    if (!MatchedFunctionCall || !MatchedEmitterData)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching Niagara module was found"));
+    }
+
+    const ENiagaraScriptUsage OutputUsage = FNiagaraStackGraphUtilities::GetOutputNodeUsage(*MatchedFunctionCall);
+    FCompileConstantResolver ConstantResolver(MatchedOwningEmitter, OutputUsage, MatchedFunctionCall->DebugState);
+    TArray<FNiagaraVariable> InputVariables;
+    TSet<FNiagaraVariable> HiddenVariables;
+    FNiagaraStackGraphUtilities::GetStackFunctionInputs(
+        *MatchedFunctionCall,
+        InputVariables,
+        HiddenVariables,
+        ConstantResolver,
+        FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly,
+        true);
+
+    FNiagaraVariable* MatchedInputVariable = InputVariables.FindByPredicate(
+        [&InputName](const FNiagaraVariable& Candidate)
+        {
+            return NiagaraModuleInputNameMatches(Candidate, InputName);
+        });
+
+    if (!MatchedInputVariable)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching module input was found: %s"), *InputName));
+    }
+
+    const FNiagaraTypeDefinition InputType = MatchedInputVariable->GetType();
+    if (InputType.IsDataInterface() || InputType.IsUObject() || !IsSettableNiagaraUserParameterType(InputType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input '%s' cannot be linked by this command. Use a dedicated command for data interfaces or object inputs. Actual type: %s"),
+                *MatchedInputVariable->GetName().ToString(),
+                *NiagaraTypeName(InputType)));
+    }
+
+    const TSharedPtr<FJsonValue> DefaultValue = Params->TryGetField(TEXT("default_value"));
+    const bool bHasDefaultValue = DefaultValue.IsValid();
+    if (bHasDefaultValue)
+    {
+        FNiagaraVariable DefaultValidationVariable(InputType, FName(*UserParameterName));
+        FString DefaultValidationError;
+        if (!SetNiagaraVariableDataFromJson(DefaultValidationVariable, DefaultValue, DefaultValidationError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(DefaultValidationError);
+        }
+    }
+
+    FNiagaraVariable UserParameter(InputType, FName(*UserParameterName));
+    FNiagaraUserRedirectionParameterStore& UserParameterStore = System->GetExposedParameters();
+
+    bool bUserParameterAlreadyExisted = false;
+    TArray<FNiagaraVariable> UserParameters;
+    UserParameterStore.GetUserParameters(UserParameters);
+    for (const FNiagaraVariable& Candidate : UserParameters)
+    {
+        if (NiagaraUserParameterNameMatches(Candidate, UserParameterName))
+        {
+            bUserParameterAlreadyExisted = true;
+            if (Candidate.GetType() != InputType)
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FString::Printf(TEXT("Existing user parameter '%s' has incompatible type: %s. Expected: %s"),
+                        *UserParameterName,
+                        *NiagaraTypeName(Candidate.GetType()),
+                        *NiagaraTypeName(InputType)));
+            }
+            UserParameter = Candidate;
+            break;
+        }
+    }
+
+    const FNiagaraParameterHandle AliasedInputHandle = BuildAliasedModuleParameterHandleForInput(MatchedFunctionCall, *MatchedInputVariable);
+
+    UEdGraphPin* ExistingOverridePin = FindNiagaraStackFunctionInputOverridePin(MatchedFunctionCall, AliasedInputHandle);
+    const int32 PreviousLinkCount = ExistingOverridePin ? ExistingOverridePin->LinkedTo.Num() : 0;
+    if (PreviousLinkCount > 0 && !bOverwriteExisting)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input override already exists for %s. Use overwrite_existing=true to replace it."),
+                *MatchedInputVariable->GetName().ToString()));
+    }
+    if (PreviousLinkCount > 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input override for %s has %d links; refusing to overwrite an unexpected graph shape."),
+                *MatchedInputVariable->GetName().ToString(),
+                PreviousLinkCount));
+    }
+    if (PreviousLinkCount == 1 && ExistingOverridePin)
+    {
+        FString ValidateError;
+        if (!ValidateLinkedNiagaraDataInterfaceInputNode(*ExistingOverridePin, ValidateError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ValidateError);
+        }
+    }
+
+    System->Modify();
+    if (!bUserParameterAlreadyExisted)
+    {
+        if (!UserParameterStore.AddParameter(UserParameter, true, true))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FString::Printf(TEXT("Failed to add Niagara user parameter: %s"), *UserParameter.GetName().ToString()));
+        }
+    }
+    if (bHasDefaultValue)
+    {
+        FString DefaultSetError;
+        if (!SetNiagaraUserParameterValue(UserParameterStore, UserParameter, DefaultValue, DefaultSetError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(DefaultSetError);
+        }
+    }
+
+    MatchedFunctionCall->Modify();
+    UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+        *MatchedFunctionCall,
+        AliasedInputHandle,
+        InputType,
+        FGuid(),
+        FGuid());
+
+    if (PreviousLinkCount == 1)
+    {
+        FString ClearError;
+        if (!ClearLinkedNiagaraDataInterfaceInputNode(OverridePin, ClearError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ClearError);
+        }
+    }
+
+    const FNiagaraVariable LinkUserParameter(InputType, FName(*UserParameterName));
+    TSet<FNiagaraVariableBase> KnownParameters;
+    KnownParameters.Add(LinkUserParameter);
+    FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(
+        OverridePin,
+        LinkUserParameter,
+        KnownParameters);
+
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after module input user parameter update"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("emitter_name"), MatchedEmitterName);
+    Result->SetNumberField(TEXT("emitter_index"), MatchedEmitterIndex);
+    Result->SetStringField(TEXT("module_name"), MatchedModuleName);
+    Result->SetStringField(TEXT("module_node_guid"), MatchedFunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("module_index"), MatchedModuleIndex);
+    Result->SetStringField(TEXT("input_name"), MatchedInputVariable->GetName().ToString());
+    Result->SetStringField(TEXT("input_type"), NiagaraTypeName(InputType));
+    Result->SetStringField(TEXT("aliased_input_handle"), AliasedInputHandle.GetParameterHandleString().ToString());
+    Result->SetStringField(TEXT("user_parameter_name"), UserParameter.GetName().ToString());
+    Result->SetStringField(TEXT("linked_parameter_name"), LinkUserParameter.GetName().ToString());
+    Result->SetBoolField(TEXT("user_parameter_created"), !bUserParameterAlreadyExisted);
+    Result->SetBoolField(TEXT("default_value_set"), bHasDefaultValue);
+    if (bHasDefaultValue)
+    {
+        Result->SetField(TEXT("default_value"), NiagaraParameterValueToJson(UserParameterStore, UserParameter));
+    }
+    Result->SetNumberField(TEXT("previous_override_link_count"), PreviousLinkCount);
+    Result->SetBoolField(TEXT("overwrote_existing"), PreviousLinkCount > 0);
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("module_input_user_parameter_link"));
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPNiagaraCommands::HandleSetNiagaraModuleInputLinkedParameter(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SystemPath;
+    FString InputName;
+    FString LinkedParameterName;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("system_path"), SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'system_path' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("input_name"), InputName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'input_name' parameter"));
+    }
+    if (!Params->TryGetStringField(TEXT("linked_parameter_name"), LinkedParameterName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'linked_parameter_name' parameter"));
+    }
+
+    bool bAllowSourceEdit = false;
+    Params->TryGetBoolField(TEXT("allow_source_edit"), bAllowSourceEdit);
+    if (!bAllowSourceEdit && !IsTempGeneratedNiagaraPath(SystemPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to edit Niagara module input linked parameter outside %s: %s"), NiagaraTempGenerationRoot, *SystemPath));
+    }
+
+    LinkedParameterName.TrimStartAndEndInline();
+    if (LinkedParameterName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'linked_parameter_name' cannot be empty"));
+    }
+    if (!LinkedParameterName.Contains(TEXT(".")))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("'linked_parameter_name' must include a Niagara namespace, for example Emitter.Grid2D Collection or User.MyParameter"));
+    }
+
+    bool bOverwriteExisting = false;
+    Params->TryGetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    bool bRequestCompile = true;
+    Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+
+    int32 TargetEmitterIndex = INDEX_NONE;
+    int32 TargetModuleIndex = INDEX_NONE;
+    FString TargetEmitterName;
+    FString TargetModuleName;
+    FString TargetModuleGuid;
+    Params->TryGetNumberField(TEXT("emitter_index"), TargetEmitterIndex);
+    Params->TryGetNumberField(TEXT("module_index"), TargetModuleIndex);
+    Params->TryGetStringField(TEXT("emitter_name"), TargetEmitterName);
+    Params->TryGetStringField(TEXT("module_name"), TargetModuleName);
+    Params->TryGetStringField(TEXT("module_node_guid"), TargetModuleGuid);
+
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *NormalizeNiagaraObjectPathForLoad(SystemPath));
+    if (!System)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to load Niagara system: %s"), *SystemPath));
+    }
+
+    UNiagaraNodeFunctionCall* MatchedFunctionCall = nullptr;
+    FVersionedNiagaraEmitterData* MatchedEmitterData = nullptr;
+    FVersionedNiagaraEmitter MatchedOwningEmitter;
+    FString MatchedEmitterName;
+    FString MatchedModuleName;
+    int32 MatchedEmitterIndex = INDEX_NONE;
+    int32 MatchedModuleIndex = INDEX_NONE;
+
+    int32 CurrentEmitterIndex = 0;
+    for (const FNiagaraEmitterHandle& EmitterHandle : System->GetEmitterHandles())
+    {
+        const FString EmitterName = EmitterHandle.GetName().ToString();
+        const bool bEmitterMatches =
+            (TargetEmitterIndex == INDEX_NONE || TargetEmitterIndex == CurrentEmitterIndex) &&
+            (TargetEmitterName.IsEmpty() || TargetEmitterName.Equals(EmitterName, ESearchCase::IgnoreCase));
+
+        if (bEmitterMatches)
+        {
+            if (FVersionedNiagaraEmitterData* EmitterData = EmitterHandle.GetEmitterData())
+            {
+                const TArray<UNiagaraNodeFunctionCall*> FunctionCalls = CollectSortedNiagaraFunctionCalls(EmitterData->GraphSource);
+                for (int32 ModuleIndex = 0; ModuleIndex < FunctionCalls.Num(); ++ModuleIndex)
+                {
+                    UNiagaraNodeFunctionCall* FunctionCall = FunctionCalls[ModuleIndex];
+                    if (!FunctionCall)
+                    {
+                        continue;
+                    }
+
+                    FString FunctionName = FunctionCall->GetFunctionName();
+                    if (FunctionName.IsEmpty())
+                    {
+                        FunctionName = FunctionCall->Signature.GetNameString();
+                    }
+                    const FString FunctionGuid = FunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens);
+                    const bool bModuleMatches =
+                        (TargetModuleIndex == INDEX_NONE || TargetModuleIndex == ModuleIndex) &&
+                        (TargetModuleName.IsEmpty() || TargetModuleName.Equals(FunctionName, ESearchCase::IgnoreCase)) &&
+                        (TargetModuleGuid.IsEmpty() || TargetModuleGuid.Equals(FunctionGuid, ESearchCase::IgnoreCase));
+
+                    if (bModuleMatches)
+                    {
+                        MatchedFunctionCall = FunctionCall;
+                        MatchedEmitterData = EmitterData;
+                        MatchedOwningEmitter = EmitterHandle.GetInstance();
+                        MatchedEmitterName = EmitterName;
+                        MatchedModuleName = FunctionName;
+                        MatchedEmitterIndex = CurrentEmitterIndex;
+                        MatchedModuleIndex = ModuleIndex;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (MatchedFunctionCall)
+        {
+            break;
+        }
+        ++CurrentEmitterIndex;
+    }
+
+    if (!MatchedFunctionCall || !MatchedEmitterData)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No matching Niagara module was found"));
+    }
+
+    const ENiagaraScriptUsage OutputUsage = FNiagaraStackGraphUtilities::GetOutputNodeUsage(*MatchedFunctionCall);
+    FCompileConstantResolver ConstantResolver(MatchedOwningEmitter, OutputUsage, MatchedFunctionCall->DebugState);
+    TArray<FNiagaraVariable> InputVariables;
+    TSet<FNiagaraVariable> HiddenVariables;
+    FNiagaraStackGraphUtilities::GetStackFunctionInputs(
+        *MatchedFunctionCall,
+        InputVariables,
+        HiddenVariables,
+        ConstantResolver,
+        FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly,
+        true);
+
+    FNiagaraVariable* MatchedInputVariable = InputVariables.FindByPredicate(
+        [&InputName](const FNiagaraVariable& Candidate)
+        {
+            return NiagaraModuleInputNameMatches(Candidate, InputName);
+        });
+
+    if (!MatchedInputVariable)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("No matching module input was found: %s"), *InputName));
+    }
+
+    const FNiagaraTypeDefinition InputType = MatchedInputVariable->GetType();
+    const FNiagaraParameterHandle AliasedInputHandle = BuildAliasedModuleParameterHandleForInput(MatchedFunctionCall, *MatchedInputVariable);
+    UEdGraphPin* ExistingOverridePin = FindNiagaraStackFunctionInputOverridePin(MatchedFunctionCall, AliasedInputHandle);
+    const int32 PreviousLinkCount = ExistingOverridePin ? ExistingOverridePin->LinkedTo.Num() : 0;
+    if (PreviousLinkCount > 0 && !bOverwriteExisting)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input override already exists for %s. Use overwrite_existing=true to replace it."),
+                *MatchedInputVariable->GetName().ToString()));
+    }
+    if (PreviousLinkCount > 1)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Module input override for %s has %d links; refusing to overwrite an unexpected graph shape."),
+                *MatchedInputVariable->GetName().ToString(),
+                PreviousLinkCount));
+    }
+    if (PreviousLinkCount == 1 && ExistingOverridePin)
+    {
+        FString ValidateError;
+        if (!ValidateLinkedNiagaraDataInterfaceInputNode(*ExistingOverridePin, ValidateError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ValidateError);
+        }
+    }
+
+    System->Modify();
+    MatchedFunctionCall->Modify();
+    UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+        *MatchedFunctionCall,
+        AliasedInputHandle,
+        InputType,
+        FGuid(),
+        FGuid());
+
+    if (PreviousLinkCount == 1)
+    {
+        FString ClearError;
+        if (!ClearLinkedNiagaraDataInterfaceInputNode(OverridePin, ClearError))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(ClearError);
+        }
+    }
+
+    const FNiagaraVariable LinkParameter(InputType, FName(*LinkedParameterName));
+    TSet<FNiagaraVariableBase> KnownParameters;
+    KnownParameters.Add(LinkParameter);
+    FNiagaraStackGraphUtilities::SetLinkedParameterValueForFunctionInput(
+        OverridePin,
+        LinkParameter,
+        KnownParameters);
+
+    System->MarkPackageDirty();
+    if (bRequestCompile)
+    {
+        System->RequestCompile(false);
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(System, false);
+        if (!bSaved)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to save Niagara system after module input linked parameter update"));
+        }
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetStringField(TEXT("system_path"), System->GetPathName());
+    Result->SetStringField(TEXT("emitter_name"), MatchedEmitterName);
+    Result->SetNumberField(TEXT("emitter_index"), MatchedEmitterIndex);
+    Result->SetStringField(TEXT("module_name"), MatchedModuleName);
+    Result->SetStringField(TEXT("module_node_guid"), MatchedFunctionCall->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+    Result->SetNumberField(TEXT("module_index"), MatchedModuleIndex);
+    Result->SetStringField(TEXT("input_name"), MatchedInputVariable->GetName().ToString());
+    Result->SetStringField(TEXT("input_type"), NiagaraTypeName(InputType));
+    Result->SetStringField(TEXT("aliased_input_handle"), AliasedInputHandle.GetParameterHandleString().ToString());
+    Result->SetStringField(TEXT("linked_parameter_name"), LinkParameter.GetName().ToString());
+    Result->SetNumberField(TEXT("previous_override_link_count"), PreviousLinkCount);
+    Result->SetBoolField(TEXT("overwrote_existing"), PreviousLinkCount > 0);
+    Result->SetBoolField(TEXT("compile_requested"), bRequestCompile);
+    Result->SetBoolField(TEXT("saved"), bSaved);
+    Result->SetStringField(TEXT("write_scope"), TEXT("module_input_linked_parameter"));
     return Result;
 }
 

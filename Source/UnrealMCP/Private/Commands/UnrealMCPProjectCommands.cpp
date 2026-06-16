@@ -24,6 +24,7 @@
 #include "Engine/TextureCube.h"
 #include "Engine/UserDefinedEnum.h"
 #include "Engine/VolumeTexture.h"
+#include "Editor.h"
 #include "FileHelpers.h"
 #include "GameFramework/InputSettings.h"
 #include "GameFramework/Actor.h"
@@ -74,6 +75,33 @@
 
 namespace
 {
+bool IsPlaySessionActive()
+{
+    return GEditor && GEditor->IsPlaySessionInProgress();
+}
+
+bool FindUnsafeEditorScriptingPattern(const FString& Code, FString& MatchedPattern)
+{
+    static const TCHAR* UnsafePatterns[] =
+    {
+        TEXT("EditorLevelLibrary.destroy_actor"),
+        TEXT("EditorLevelLibrary.destroy_actors"),
+        TEXT("EditorActorSubsystem.destroy_actor"),
+        TEXT("EditorActorSubsystem.destroy_actors")
+    };
+
+    for (const TCHAR* Pattern : UnsafePatterns)
+    {
+        if (Code.Contains(Pattern, ESearchCase::IgnoreCase))
+        {
+            MatchedPattern = Pattern;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct FPathStringReplacement
 {
     FString Source;
@@ -8652,6 +8680,17 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleExecutePython(const TSh
     if (!PythonPlugin || !PythonPlugin->IsPythonAvailable())
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("PythonScriptPlugin is not available"));
+    }
+
+    bool bAllowUnsafeEditorScriptingDuringPIE = false;
+    Params->TryGetBoolField(TEXT("allow_unsafe_editor_scripting_during_pie"), bAllowUnsafeEditorScriptingDuringPIE);
+
+    FString UnsafePattern;
+    if (!bAllowUnsafeEditorScriptingDuringPIE && IsPlaySessionActive() && FindUnsafeEditorScriptingPattern(Code, UnsafePattern))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Unsafe editor scripting call '%s' is blocked while PIE/SIE is active. End play mode first or rerun outside PIE."),
+            *UnsafePattern));
     }
 
     FString Mode;

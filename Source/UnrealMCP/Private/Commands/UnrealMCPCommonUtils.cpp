@@ -186,6 +186,26 @@ FVector2D FUnrealMCPCommonUtils::GetVector2DFromJson(const TSharedPtr<FJsonObjec
         Result.X = (float)(*JsonArray)[0]->AsNumber();
         Result.Y = (float)(*JsonArray)[1]->AsNumber();
     }
+    else
+    {
+        FString PositionString;
+        if (JsonObject->TryGetStringField(FieldName, PositionString))
+        {
+            PositionString.TrimStartAndEndInline();
+            PositionString.RemoveFromStart(TEXT("["));
+            PositionString.RemoveFromEnd(TEXT("]"));
+            PositionString.RemoveFromStart(TEXT("("));
+            PositionString.RemoveFromEnd(TEXT(")"));
+
+            TArray<FString> Parts;
+            PositionString.ParseIntoArray(Parts, TEXT(","), true);
+            if (Parts.Num() >= 2)
+            {
+                Result.X = FCString::Atof(*Parts[0].TrimStartAndEnd());
+                Result.Y = FCString::Atof(*Parts[1].TrimStartAndEnd());
+            }
+        }
+    }
     
     return Result;
 }
@@ -752,6 +772,95 @@ bool FUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString& Pr
     else if (Property->IsA<FStrProperty>())
     {
         ((FStrProperty*)Property)->SetPropertyValue(PropertyAddr, Value->AsString());
+        return true;
+    }
+    else if (FStructProperty* StructProp = CastField<FStructProperty>(Property))
+    {
+        if (StructProp->Struct == TBaseStructure<FLinearColor>::Get())
+        {
+            if (Value->Type != EJson::Array)
+            {
+                OutErrorMessage = FString::Printf(TEXT("LinearColor property %s requires an array [r,g,b,a]"), *PropertyName);
+                return false;
+            }
+
+            const TArray<TSharedPtr<FJsonValue>>& Arr = Value->AsArray();
+            if (Arr.Num() != 4)
+            {
+                OutErrorMessage = FString::Printf(TEXT("LinearColor property %s requires 4 values, got %d"), *PropertyName, Arr.Num());
+                return false;
+            }
+
+            const FLinearColor Color(
+                Arr[0]->AsNumber(),
+                Arr[1]->AsNumber(),
+                Arr[2]->AsNumber(),
+                Arr[3]->AsNumber()
+            );
+            StructProp->CopySingleValue(PropertyAddr, &Color);
+            return true;
+        }
+    }
+    else if (FClassProperty* ClassProp = CastField<FClassProperty>(Property))
+    {
+        if (Value->Type != EJson::String)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Class property %s requires a class path string"), *PropertyName);
+            return false;
+        }
+
+        const FString ClassPath = Value->AsString();
+        UClass* LoadedClass = ClassPath.IsEmpty()
+            ? nullptr
+            : Cast<UClass>(StaticLoadObject(UClass::StaticClass(), nullptr, *ClassPath));
+        if (!ClassPath.IsEmpty() && !LoadedClass)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Could not load class for property %s from path: %s"), *PropertyName, *ClassPath);
+            return false;
+        }
+        if (LoadedClass && ClassProp->MetaClass && !LoadedClass->IsChildOf(ClassProp->MetaClass))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("Class %s is not a child of required metaclass %s for property %s"),
+                *LoadedClass->GetPathName(),
+                *ClassProp->MetaClass->GetPathName(),
+                *PropertyName
+            );
+            return false;
+        }
+
+        ClassProp->SetObjectPropertyValue(PropertyAddr, LoadedClass);
+        return true;
+    }
+    else if (FObjectPropertyBase* ObjectProp = CastField<FObjectPropertyBase>(Property))
+    {
+        if (Value->Type != EJson::String)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Object property %s requires an object path string"), *PropertyName);
+            return false;
+        }
+
+        const FString ObjectPath = Value->AsString();
+        UObject* LoadedObject = ObjectPath.IsEmpty()
+            ? nullptr
+            : StaticLoadObject(ObjectProp->PropertyClass, nullptr, *ObjectPath);
+        if (!ObjectPath.IsEmpty() && !LoadedObject)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Could not load object for property %s from path: %s"), *PropertyName, *ObjectPath);
+            return false;
+        }
+        if (LoadedObject && ObjectProp->PropertyClass && !LoadedObject->IsA(ObjectProp->PropertyClass))
+        {
+            OutErrorMessage = FString::Printf(
+                TEXT("Object %s is not of required class %s for property %s"),
+                *LoadedObject->GetPathName(),
+                *ObjectProp->PropertyClass->GetPathName(),
+                *PropertyName
+            );
+            return false;
+        }
+
+        ObjectProp->SetObjectPropertyValue(PropertyAddr, LoadedObject);
         return true;
     }
     else if (Property->IsA<FByteProperty>())

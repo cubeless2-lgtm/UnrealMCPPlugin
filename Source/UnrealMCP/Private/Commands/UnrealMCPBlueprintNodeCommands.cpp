@@ -5,6 +5,7 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "Editor.h"
 #include "K2Node_Event.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_VariableGet.h"
@@ -57,6 +58,11 @@ namespace
 UClass* LoadClassForPin(const FString& ClassPathOrName);
 UEnum* LoadEnumForPin(const FString& EnumPathOrName);
 FString GetPinDefaultStringForType(const TSharedPtr<FJsonValue>& Value, const FEdGraphPinType& PinType);
+
+bool IsBlueprintNodePlaySessionActive()
+{
+    return GEditor && GEditor->IsPlaySessionInProgress();
+}
 
 FString GetPinDirectionName(const UEdGraphPin* Pin)
 {
@@ -2216,6 +2222,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     {
         return HandleConnectBlueprintNodes(Params);
     }
+    else if (CommandType == TEXT("delete_blueprint_node"))
+    {
+        return HandleDeleteBlueprintNode(Params);
+    }
     else if (CommandType == TEXT("resolve_blueprint"))
     {
         return HandleResolveBlueprint(Params);
@@ -2398,6 +2408,155 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown blueprint node command: %s"), *CommandType));
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleDeleteBlueprintNode(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!Params.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing parameters"));
+    }
+
+    if (IsBlueprintNodePlaySessionActive())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Blueprint node deletion is blocked while PIE/SIE is active. End play mode before mutating Blueprint graphs through UnrealMCP."));
+    }
+
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    FString NodeId;
+    if (!Params->TryGetStringField(TEXT("node_id"), NodeId))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'node_id' parameter"));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    FString GraphError;
+    UEdGraph* TargetGraph = ResolveBlueprintGraphForNodeCommand(Blueprint, Params, GraphError);
+    if (!TargetGraph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(GraphError);
+    }
+
+    UEdGraphNode* Node = FindNodeById(TargetGraph, NodeId);
+    if (!Node)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Node not found: %s"), *NodeId));
+    }
+
+    FString ExpectedNodeName;
+    Params->TryGetStringField(TEXT("expected_node_name"), ExpectedNodeName);
+    if (!ExpectedNodeName.IsEmpty() && !Node->GetName().Equals(ExpectedNodeName, ESearchCase::IgnoreCase))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Expected node name '%s' but found '%s'"), *ExpectedNodeName, *Node->GetName()));
+    }
+
+    FString ExpectedNodeClass;
+    Params->TryGetStringField(TEXT("expected_node_class"), ExpectedNodeClass);
+    const FString ActualNodeClass = Node->GetClass() ? Node->GetClass()->GetName() : FString();
+    if (!ExpectedNodeClass.IsEmpty() &&
+        !ActualNodeClass.Equals(ExpectedNodeClass, ESearchCase::IgnoreCase) &&
+        !ActualNodeClass.EndsWith(ExpectedNodeClass, ESearchCase::IgnoreCase))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Expected node class '%s' but found '%s'"), *ExpectedNodeClass, *ActualNodeClass));
+    }
+
+    FString ExpectedTitleContains;
+    Params->TryGetStringField(TEXT("expected_title_contains"), ExpectedTitleContains);
+    const FString NodeTitle = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+    if (!ExpectedTitleContains.IsEmpty() && !NodeTitle.Contains(ExpectedTitleContains, ESearchCase::IgnoreCase))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Expected node title containing '%s' but found '%s'"), *ExpectedTitleContains, *NodeTitle));
+    }
+
+    if (Node->IsA<UK2Node_Event>() || Node->IsA<UK2Node_FunctionEntry>() || Node->IsA<UK2Node_FunctionResult>())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Refusing to delete structural Blueprint node '%s'. delete_blueprint_node only supports ordinary graph cleanup nodes."), *NodeTitle));
+    }
+
+    int32 TotalLinkCount = 0;
+    int32 ExecLinkCount = 0;
+    int32 NonExecLinkCount = 0;
+    TArray<TSharedPtr<FJsonValue>> LinkedPinValues;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (!Pin || Pin->LinkedTo.Num() == 0)
+        {
+            continue;
+        }
+
+        const bool bIsExecPin = Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+        TotalLinkCount += Pin->LinkedTo.Num();
+        if (bIsExecPin)
+        {
+            ExecLinkCount += Pin->LinkedTo.Num();
+        }
+        else
+        {
+            NonExecLinkCount += Pin->LinkedTo.Num();
+        }
+
+        for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+        {
+            TSharedPtr<FJsonObject> LinkObj = MakeShared<FJsonObject>();
+            LinkObj->SetStringField(TEXT("pin_name"), Pin->PinName.ToString());
+            LinkObj->SetStringField(TEXT("pin_direction"), GetPinDirectionName(Pin));
+            LinkObj->SetBoolField(TEXT("is_exec"), bIsExecPin);
+            LinkObj->SetStringField(TEXT("linked_node_name"), LinkedPin && LinkedPin->GetOwningNode() ? LinkedPin->GetOwningNode()->GetName() : FString());
+            LinkObj->SetStringField(TEXT("linked_node_class"), LinkedPin && LinkedPin->GetOwningNode() && LinkedPin->GetOwningNode()->GetClass() ? LinkedPin->GetOwningNode()->GetClass()->GetName() : FString());
+            LinkObj->SetStringField(TEXT("linked_pin_name"), LinkedPin ? LinkedPin->PinName.ToString() : FString());
+            LinkedPinValues.Add(MakeShared<FJsonValueObject>(LinkObj));
+        }
+    }
+
+    const bool bAllowAnyLinkedDelete = GetBoolParam(Params, TEXT("allow_any_linked_delete"), false);
+    const bool bAllowExecLinkedDelete = GetBoolParam(Params, TEXT("allow_exec_linked_delete"), false);
+    const bool bAllowNonExecLinkedDelete = GetBoolParam(Params, TEXT("allow_non_exec_linked_delete"), false);
+    if (ExecLinkCount > 0 && !bAllowAnyLinkedDelete && !bAllowExecLinkedDelete)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Node has %d exec link(s). Pass allow_exec_linked_delete=true to delete it."), ExecLinkCount));
+    }
+    if (NonExecLinkCount > 0 && !bAllowAnyLinkedDelete && !bAllowNonExecLinkedDelete)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FString::Printf(TEXT("Node has %d non-exec link(s). Pass allow_non_exec_linked_delete=true to delete it."), NonExecLinkCount));
+    }
+
+    TSharedPtr<FJsonObject> DeletedNodeJson = NodeToJson(Node, true);
+    TargetGraph->Modify();
+    Node->Modify();
+    Node->BreakAllNodeLinks();
+    Node->DestroyNode();
+    TargetGraph->NotifyGraphChanged();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("deleted"), true);
+    ResultObj->SetStringField(TEXT("node_id"), NodeId);
+    ResultObj->SetStringField(TEXT("node_name"), DeletedNodeJson->GetStringField(TEXT("name")));
+    ResultObj->SetStringField(TEXT("node_class"), DeletedNodeJson->GetStringField(TEXT("class")));
+    ResultObj->SetStringField(TEXT("node_title"), NodeTitle);
+    ResultObj->SetNumberField(TEXT("total_link_count"), TotalLinkCount);
+    ResultObj->SetNumberField(TEXT("exec_link_count"), ExecLinkCount);
+    ResultObj->SetNumberField(TEXT("non_exec_link_count"), NonExecLinkCount);
+    ResultObj->SetArrayField(TEXT("broken_links"), LinkedPinValues);
+    ResultObj->SetObjectField(TEXT("deleted_node"), DeletedNodeJson);
+    AddGraphField(ResultObj, Blueprint, TargetGraph);
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleConnectBlueprintNodes(const TSharedPtr<FJsonObject>& Params)
@@ -3309,9 +3468,16 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintVaria
     }
 
     const TSharedPtr<FJsonObject>* MetadataObject = nullptr;
-    if (!Params->TryGetObjectField(TEXT("metadata"), MetadataObject) || !MetadataObject || !MetadataObject->IsValid())
+    const bool bHasMetadata = Params->TryGetObjectField(TEXT("metadata"), MetadataObject) && MetadataObject && MetadataObject->IsValid();
+    const bool bHasFlagEdit =
+        Params->HasField(TEXT("is_editable")) ||
+        Params->HasField(TEXT("is_exposed")) ||
+        Params->HasField(TEXT("instance_editable")) ||
+        Params->HasField(TEXT("is_instance_editable")) ||
+        Params->HasField(TEXT("expose_on_spawn"));
+    if (!bHasMetadata && !bHasFlagEdit)
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing or invalid 'metadata' object"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'metadata' object or variable flag fields"));
     }
 
     UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
@@ -3347,35 +3513,96 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintVaria
     }
 
     TSharedPtr<FJsonObject> AppliedMetadata = MakeShared<FJsonObject>();
-    for (const TPair<FString, TSharedPtr<FJsonValue>>& MetadataPair : (*MetadataObject)->Values)
+    if (bHasMetadata)
     {
-        FString MetadataValue;
-        if (MetadataPair.Value->Type == EJson::String)
+        for (const TPair<FString, TSharedPtr<FJsonValue>>& MetadataPair : (*MetadataObject)->Values)
         {
-            MetadataValue = MetadataPair.Value->AsString();
+            FString MetadataValue;
+            if (MetadataPair.Value->Type == EJson::String)
+            {
+                MetadataValue = MetadataPair.Value->AsString();
+            }
+            else if (MetadataPair.Value->Type == EJson::Boolean)
+            {
+                MetadataValue = MetadataPair.Value->AsBool() ? TEXT("true") : TEXT("false");
+            }
+            else if (MetadataPair.Value->Type == EJson::Number)
+            {
+                MetadataValue = FString::SanitizeFloat(MetadataPair.Value->AsNumber());
+            }
+            else
+            {
+                continue;
+            }
+
+            const FName MetadataKey(*MetadataPair.Key);
+            TargetVariable->SetMetaData(MetadataKey, MetadataValue);
+            FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, MetadataKey, MetadataValue);
+            AppliedMetadata->SetStringField(MetadataPair.Key, MetadataValue);
         }
-        else if (MetadataPair.Value->Type == EJson::Boolean)
+    }
+
+    TSharedPtr<FJsonObject> AppliedFlags = MakeShared<FJsonObject>();
+    uint64* PropertyFlags = FBlueprintEditorUtils::GetBlueprintVariablePropertyFlags(Blueprint, TargetVariableName);
+    if (!PropertyFlags)
+    {
+        PropertyFlags = &TargetVariable->PropertyFlags;
+    }
+
+    auto ApplyInstanceEditable = [&](bool bEnable)
+    {
+        if (bEnable)
         {
-            MetadataValue = MetadataPair.Value->AsBool() ? TEXT("true") : TEXT("false");
-        }
-        else if (MetadataPair.Value->Type == EJson::Number)
-        {
-            MetadataValue = FString::SanitizeFloat(MetadataPair.Value->AsNumber());
+            *PropertyFlags |= static_cast<uint64>(CPF_Edit);
+            *PropertyFlags &= ~static_cast<uint64>(CPF_DisableEditOnInstance);
         }
         else
         {
-            continue;
+            *PropertyFlags |= static_cast<uint64>(CPF_DisableEditOnInstance);
         }
+        TargetVariable->PropertyFlags = *PropertyFlags;
+        AppliedFlags->SetBoolField(TEXT("instance_editable"), bEnable);
+    };
 
-        const FName MetadataKey(*MetadataPair.Key);
-        TargetVariable->SetMetaData(MetadataKey, MetadataValue);
-        FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, MetadataKey, MetadataValue);
-        AppliedMetadata->SetStringField(MetadataPair.Key, MetadataValue);
+    if (Params->HasField(TEXT("is_editable")))
+    {
+        ApplyInstanceEditable(Params->GetBoolField(TEXT("is_editable")));
+        AppliedFlags->SetBoolField(TEXT("is_editable"), Params->GetBoolField(TEXT("is_editable")));
+    }
+    if (Params->HasField(TEXT("is_exposed")))
+    {
+        ApplyInstanceEditable(Params->GetBoolField(TEXT("is_exposed")));
+        AppliedFlags->SetBoolField(TEXT("is_exposed"), Params->GetBoolField(TEXT("is_exposed")));
+    }
+    if (Params->HasField(TEXT("instance_editable")))
+    {
+        ApplyInstanceEditable(Params->GetBoolField(TEXT("instance_editable")));
+    }
+    if (Params->HasField(TEXT("is_instance_editable")))
+    {
+        ApplyInstanceEditable(Params->GetBoolField(TEXT("is_instance_editable")));
+        AppliedFlags->SetBoolField(TEXT("is_instance_editable"), Params->GetBoolField(TEXT("is_instance_editable")));
+    }
+    if (Params->HasField(TEXT("expose_on_spawn")))
+    {
+        const bool bExposeOnSpawn = Params->GetBoolField(TEXT("expose_on_spawn"));
+        if (bExposeOnSpawn)
+        {
+            *PropertyFlags |= static_cast<uint64>(CPF_ExposeOnSpawn);
+            FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, TEXT("ExposeOnSpawn"), TEXT("true"));
+        }
+        else
+        {
+            *PropertyFlags &= ~static_cast<uint64>(CPF_ExposeOnSpawn);
+            FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(Blueprint, TargetVariableName, nullptr, TEXT("ExposeOnSpawn"));
+        }
+        TargetVariable->PropertyFlags = *PropertyFlags;
+        AppliedFlags->SetBoolField(TEXT("expose_on_spawn"), bExposeOnSpawn);
     }
 
-    if (AppliedMetadata->Values.IsEmpty())
+    if (AppliedMetadata->Values.IsEmpty() && AppliedFlags->Values.IsEmpty())
     {
-        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No supported metadata values were provided"));
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("No supported metadata or flag values were provided"));
     }
 
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
@@ -3395,6 +3622,8 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintVaria
     ResultObj->SetStringField(TEXT("variable_name"), VariableName);
     ResultObj->SetObjectField(TEXT("metadata"), AppliedMetadata);
     ResultObj->SetObjectField(TEXT("verified_metadata"), VerifiedMetadata);
+    ResultObj->SetObjectField(TEXT("flags"), AppliedFlags);
+    ResultObj->SetNumberField(TEXT("property_flags"), static_cast<double>(*PropertyFlags));
     return ResultObj;
 }
 
@@ -5159,7 +5388,41 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintVaria
         return FUnrealMCPCommonUtils::CreateErrorResponse(GraphError);
     }
 
-    UK2Node_VariableGet* VariableGetNode = FUnrealMCPCommonUtils::CreateVariableGetNode(TargetGraph, Blueprint, VariableName, NodePosition);
+    UK2Node_VariableGet* VariableGetNode = nullptr;
+    FString TargetClassName;
+    if (Params->TryGetStringField(TEXT("target_class"), TargetClassName) && !TargetClassName.IsEmpty())
+    {
+        UClass* TargetClass = LoadClassForPin(TargetClassName);
+        if (!TargetClass || !TargetClass->IsChildOf(UObject::StaticClass()))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Target class not found or not a UObject class: %s"), *TargetClassName));
+        }
+
+        FProperty* Property = FindFProperty<FProperty>(TargetClass, FName(*VariableName));
+        if (!Property)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Variable not found on target class %s: %s"), *TargetClass->GetName(), *VariableName));
+        }
+
+        VariableGetNode = NewObject<UK2Node_VariableGet>(TargetGraph);
+        if (!VariableGetNode)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create variable get node"));
+        }
+
+        VariableGetNode->VariableReference.SetFromField<FProperty>(Property, false);
+        VariableGetNode->NodePosX = NodePosition.X;
+        VariableGetNode->NodePosY = NodePosition.Y;
+        TargetGraph->AddNode(VariableGetNode, true);
+        VariableGetNode->CreateNewGuid();
+        VariableGetNode->PostPlacedNewNode();
+        VariableGetNode->AllocateDefaultPins();
+    }
+    else
+    {
+        VariableGetNode = FUnrealMCPCommonUtils::CreateVariableGetNode(TargetGraph, Blueprint, VariableName, NodePosition);
+    }
+
     if (!VariableGetNode)
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Variable not found: %s"), *VariableName));

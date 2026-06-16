@@ -27,14 +27,21 @@ private:
     TSharedPtr<FJsonObject> HandleInspectNiagaraGraph(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraCompileStatus(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraSimulationStages(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetNiagaraSimulationStageSettings(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraScratchPadInterface(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleDuplicateOrAttachEmitterFromSource(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCreateOrDuplicateScratchPadModule(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAddScratchPadModuleToStack(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetNiagaraScratchPadFunctionInputDefault(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleLinkNiagaraScratchPadPinToUserParameter(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleInsertNiagaraScratchPadCustomHlslForPin(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleWrapNiagaraScratchPadOutputWithStackContext(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraModuleInputs(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleInspectNiagaraDataInterfaceOverrides(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCreateNiagaraModuleInputOverride(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetNiagaraRenderTarget2DModuleInput(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputUserParameter(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputLinkedParameter(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputsBatch(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetNiagaraModuleInputValue(const TSharedPtr<FJsonObject>& Params);
 
