@@ -103,6 +103,53 @@ bool FindUnsafeEditorScriptingPattern(const FString& Code, FString& MatchedPatte
     return false;
 }
 
+FString NormalizePythonCodeForGuard(const FString& Code)
+{
+    FString Normalized;
+    Normalized.Reserve(Code.Len());
+
+    for (const TCHAR Character : Code)
+    {
+        if (!FChar::IsWhitespace(Character))
+        {
+            Normalized.AppendChar(FChar::ToLower(Character));
+        }
+    }
+
+    return Normalized;
+}
+
+bool FindBlockedPythonMapTransitionPattern(const FString& Code, FString& MatchedPattern)
+{
+    const FString NormalizedCode = NormalizePythonCodeForGuard(Code);
+    static const TCHAR* BlockedPatterns[] =
+    {
+        TEXT("editorloadingandsavingutils.new_blank_map("),
+        TEXT(".new_blank_map("),
+        TEXT("new_blank_map("),
+        TEXT("editorloadingandsavingutils.new_map_from_template("),
+        TEXT(".new_map_from_template("),
+        TEXT("new_map_from_template("),
+        TEXT("editorloadingandsavingutils.load_map("),
+        TEXT(".load_map("),
+        TEXT("load_map("),
+        TEXT("editorloadingandsavingutils.load_map_with_dialog("),
+        TEXT(".load_map_with_dialog("),
+        TEXT("load_map_with_dialog(")
+    };
+
+    for (const TCHAR* Pattern : BlockedPatterns)
+    {
+        if (NormalizedCode.Contains(Pattern, ESearchCase::CaseSensitive))
+        {
+            MatchedPattern = Pattern;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct FPathStringReplacement
 {
     FString Source;
@@ -8751,6 +8798,14 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleExecutePython(const TSh
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
             TEXT("Unsafe editor scripting call '%s' is blocked while PIE/SIE is active. End play mode first or rerun outside PIE."),
             *UnsafePattern));
+    }
+
+    FString BlockedMapTransitionPattern;
+    if (FindBlockedPythonMapTransitionPattern(Code, BlockedMapTransitionPattern))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Blocked Python map transition call '%s' in execute_python. Map load/new-map calls through this Python bridge can keep old world packages referenced by FPyReferenceCollector and crash the editor with World Memory Leaks. Use the native open_editor_level command for existing maps, or switch maps manually in the editor."),
+            *BlockedMapTransitionPattern));
     }
 
     FString Mode;
