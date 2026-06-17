@@ -8804,7 +8804,7 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleExecutePython(const TSh
     if (FindBlockedPythonMapTransitionPattern(Code, BlockedMapTransitionPattern))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
-            TEXT("Blocked Python map transition call '%s' in execute_python. Map load/new-map calls through this Python bridge can keep old world packages referenced by FPyReferenceCollector and crash the editor with World Memory Leaks. Use the native open_editor_level command for existing maps, or switch maps manually in the editor."),
+            TEXT("Blocked Python map transition call '%s' in execute_python. Map load/new-map calls through this Python bridge can keep old world packages referenced by FPyReferenceCollector and crash the editor with World Memory Leaks. Use native open_editor_level for existing maps, native safe_new_preview_map for temporary preview maps, or switch maps manually in the editor."),
             *BlockedMapTransitionPattern));
     }
 

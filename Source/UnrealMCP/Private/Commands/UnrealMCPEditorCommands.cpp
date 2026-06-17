@@ -1,6 +1,7 @@
 #include "Commands/UnrealMCPEditorCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
 #include "Bookmarks/IBookmarkTypeTools.h"
+#include "CoreGlobals.h"
 #include "Editor.h"
 #include "EditorViewportClient.h"
 #include "FileHelpers.h"
@@ -11,6 +12,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Templates/UnrealTemplate.h"
 #include "HAL/FileManager.h"
 #include "GameFramework/Actor.h"
 #include "Engine/Selection.h"
@@ -654,6 +656,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleOpenEditorLevel(Params);
     }
+    else if (CommandType == TEXT("safe_new_preview_map"))
+    {
+        return HandleSafeNewPreviewMap(Params);
+    }
     else if (CommandType == TEXT("open_niagara_preview_player"))
     {
         return HandleOpenNiagaraPreviewPlayer(Params);
@@ -917,6 +923,151 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TS
     {
         ResultObj->SetBoolField(TEXT("success"), false);
         ResultObj->SetStringField(TEXT("message"), TEXT("FEditorFileUtils::LoadMap returned false"));
+    }
+
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleSafeNewPreviewMap(const TSharedPtr<FJsonObject>& Params)
+{
+    FString RequestedMapPath;
+    if (!Params->TryGetStringField(TEXT("map_path"), RequestedMapPath) &&
+        !Params->TryGetStringField(TEXT("level_path"), RequestedMapPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'map_path' parameter"));
+    }
+
+    bool bDryRun = true;
+    Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
+
+    bool bAllowDirtyPackages = false;
+    Params->TryGetBoolField(TEXT("allow_dirty_packages"), bAllowDirtyPackages);
+
+    bool bOverwriteExisting = false;
+    Params->TryGetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+
+    bool bAllowNonTempPath = false;
+    Params->TryGetBoolField(TEXT("allow_non_temp_path"), bAllowNonTempPath);
+
+    bool bIsPartitionedWorld = false;
+    Params->TryGetBoolField(TEXT("is_partitioned_world"), bIsPartitionedWorld);
+
+    FString RequiredRoot = TEXT("/Game/_MCP_Temp");
+    Params->TryGetStringField(TEXT("required_root"), RequiredRoot);
+    RequiredRoot.TrimStartAndEndInline();
+    RequiredRoot.TrimQuotesInline();
+    RequiredRoot.ReplaceInline(TEXT("\\"), TEXT("/"));
+    while (RequiredRoot.Len() > 1 && RequiredRoot.EndsWith(TEXT("/")))
+    {
+        RequiredRoot.LeftChopInline(1);
+    }
+
+    const FString TargetLongPackageName = NormalizeLevelPackageName(RequestedMapPath);
+    FText InvalidPackageReason;
+    if (TargetLongPackageName.IsEmpty() ||
+        TargetLongPackageName.Contains(TEXT("//")) ||
+        !FPackageName::IsValidLongPackageName(TargetLongPackageName, true, &InvalidPackageReason))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Invalid preview map package path '%s': %s"),
+            *RequestedMapPath,
+            *InvalidPackageReason.ToString()));
+    }
+
+    const FString TargetFilename = FPackageName::LongPackageNameToFilename(
+        TargetLongPackageName,
+        FPackageName::GetMapPackageExtension());
+    const bool bTargetPackageExists = FPackageName::DoesPackageExist(TargetLongPackageName);
+    const bool bTargetFileExists = FPaths::FileExists(TargetFilename);
+    const bool bTargetExists = bTargetPackageExists || bTargetFileExists;
+    const FString CurrentWorldPackageName = GetCurrentEditorWorldPackageName();
+    const TArray<FString> DirtyPackagesBeforeCommand = GetDirtyPackageNames();
+    const bool bUnderRequiredRoot =
+        RequiredRoot.IsEmpty() ||
+        TargetLongPackageName.StartsWith(RequiredRoot + TEXT("/"));
+
+    TArray<FString> BlockedReasons;
+    if (!bAllowNonTempPath && !bUnderRequiredRoot)
+    {
+        BlockedReasons.Add(TEXT("target_outside_required_root"));
+    }
+    if (bTargetExists && !bOverwriteExisting)
+    {
+        BlockedReasons.Add(TEXT("target_map_already_exists"));
+    }
+    if (DirtyPackagesBeforeCommand.Num() > 0 && !bAllowDirtyPackages)
+    {
+        BlockedReasons.Add(TEXT("dirty_packages_present"));
+    }
+    if (!GEditor)
+    {
+        BlockedReasons.Add(TEXT("editor_unavailable"));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("requested_map_path"), RequestedMapPath);
+    ResultObj->SetStringField(TEXT("target_long_package_name"), TargetLongPackageName);
+    ResultObj->SetStringField(TEXT("target_filename"), TargetFilename);
+    ResultObj->SetStringField(TEXT("required_root"), RequiredRoot);
+    ResultObj->SetBoolField(TEXT("target_exists"), bTargetExists);
+    ResultObj->SetBoolField(TEXT("target_package_exists"), bTargetPackageExists);
+    ResultObj->SetBoolField(TEXT("target_file_exists"), bTargetFileExists);
+    ResultObj->SetBoolField(TEXT("overwrite_existing"), bOverwriteExisting);
+    ResultObj->SetBoolField(TEXT("allow_non_temp_path"), bAllowNonTempPath);
+    ResultObj->SetBoolField(TEXT("target_under_required_root"), bUnderRequiredRoot);
+    ResultObj->SetStringField(TEXT("current_world_package_name"), CurrentWorldPackageName);
+    ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
+    ResultObj->SetBoolField(TEXT("allow_dirty_packages"), bAllowDirtyPackages);
+    ResultObj->SetBoolField(TEXT("is_partitioned_world"), bIsPartitionedWorld);
+    ResultObj->SetBoolField(TEXT("can_create"), BlockedReasons.Num() == 0);
+    ResultObj->SetArrayField(TEXT("blocked_reasons"), StringArrayToJsonArray(BlockedReasons));
+    ResultObj->SetNumberField(TEXT("dirty_package_count_before"), DirtyPackagesBeforeCommand.Num());
+    ResultObj->SetArrayField(TEXT("dirty_packages_before"), StringArrayToJsonArray(DirtyPackagesBeforeCommand));
+
+    if (bDryRun || BlockedReasons.Num() > 0)
+    {
+        ResultObj->SetBoolField(TEXT("create_attempted"), false);
+        ResultObj->SetBoolField(TEXT("created"), false);
+        ResultObj->SetBoolField(TEXT("saved"), false);
+        ResultObj->SetStringField(
+            TEXT("message"),
+            bDryRun
+                ? TEXT("Dry run only; no new preview map was created")
+                : TEXT("New preview map creation blocked"));
+        return ResultObj;
+    }
+
+    IFileManager::Get().MakeDirectory(*FPaths::GetPath(TargetFilename), true);
+
+    TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript, true);
+
+    UWorld* NewWorld = GEditor->NewMap(bIsPartitionedWorld);
+
+    ResultObj->SetBoolField(TEXT("create_attempted"), true);
+    ResultObj->SetBoolField(TEXT("created"), NewWorld != nullptr);
+    if (!NewWorld)
+    {
+        ResultObj->SetBoolField(TEXT("success"), false);
+        ResultObj->SetBoolField(TEXT("saved"), false);
+        ResultObj->SetStringField(TEXT("message"), TEXT("GEditor->NewMap returned null"));
+        AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+        return ResultObj;
+    }
+
+    const bool bSaved = UEditorLoadingAndSavingUtils::SaveMap(NewWorld, TargetLongPackageName);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetStringField(TEXT("current_world_package_name_after"), GetCurrentEditorWorldPackageName());
+    AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+
+    if (!bSaved)
+    {
+        ResultObj->SetBoolField(TEXT("success"), false);
+        ResultObj->SetStringField(TEXT("message"), TEXT("UEditorLoadingAndSavingUtils::SaveMap returned false"));
+    }
+    else
+    {
+        ResultObj->SetStringField(TEXT("message"), TEXT("New preview map created and saved"));
     }
 
     return ResultObj;
