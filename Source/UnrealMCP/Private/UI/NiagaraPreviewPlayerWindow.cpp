@@ -617,7 +617,7 @@ public:
     FNiagaraPreviewViewportClient(FPreviewScene* InPreviewScene, const TWeakPtr<SEditorViewport>& InEditorViewportWidget)
         : FEditorViewportClient(nullptr, InPreviewScene, InEditorViewportWidget)
     {
-        SetRealtime(true);
+        SetRealtime(false);
         SetViewMode(VMI_Lit);
         SetViewLocation(FVector(-360.0, -520.0, 240.0));
         SetViewRotation(FRotator(-18.0, 38.0, 0.0));
@@ -632,9 +632,24 @@ public:
         EngineShowFlags.SetSelectionOutline(false);
     }
 
+    void SetPreviewWorldTickEnabled(bool bInEnabled)
+    {
+        bPreviewWorldTickEnabled = bInEnabled;
+        SetRealtime(bPreviewWorldTickEnabled);
+        if (bPreviewWorldTickEnabled)
+        {
+            Invalidate();
+        }
+    }
+
     virtual void Tick(float DeltaSeconds) override
     {
         FEditorViewportClient::Tick(DeltaSeconds);
+
+        if (!bPreviewWorldTickEnabled)
+        {
+            return;
+        }
 
         if (FPreviewScene* LocalPreviewScene = GetPreviewScene())
         {
@@ -644,6 +659,9 @@ public:
             }
         }
     }
+
+private:
+    bool bPreviewWorldTickEnabled = false;
 };
 
 class SNiagaraPreviewViewport : public SEditorViewport, public FGCObject
@@ -666,6 +684,7 @@ public:
             .AllowAudioPlayback(false));
 
         SEditorViewport::Construct(SEditorViewport::FArguments());
+        SetPreviewTickEnabled(false);
     }
 
     virtual ~SNiagaraPreviewViewport() override
@@ -709,6 +728,8 @@ public:
         PreviewComponent->SetPaused(false);
         bPreviewPlaying = true;
         bLooping = true;
+        bPreviewCompletionHandled = false;
+        SetPreviewTickEnabled(true);
         FNiagaraPreviewPlayerWindow::SetLoopingState(bLooping);
 
         LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
@@ -729,6 +750,7 @@ public:
         {
             PreviewComponent->SetPaused(true);
             bPreviewPlaying = false;
+            SetPreviewTickEnabled(false);
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("paused"));
         }
         else
@@ -741,6 +763,8 @@ public:
             PreviewComponent->Activate(false);
             PreviewComponent->SetPaused(false);
             bPreviewPlaying = true;
+            bPreviewCompletionHandled = false;
+            SetPreviewTickEnabled(true);
             FNiagaraPreviewPlayerWindow::SetPlaybackState(TEXT("playing"));
         }
 
@@ -767,7 +791,9 @@ public:
         bPreviewPlaying = false;
         bLooping = true;
         PendingFrameTicks = 0;
+        bPreviewCompletionHandled = false;
         LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
+        SetPreviewTickEnabled(false);
         if (bInvalidateWidget)
         {
             InvalidatePreviewViewport();
@@ -816,11 +842,23 @@ public:
             }
         }
 
-        if (!PreviewComponent || !bPreviewPlaying || !PreviewComponent->IsComplete())
+        if (!PreviewComponent || !bPreviewPlaying)
         {
             return;
         }
 
+        if (!PreviewComponent->IsComplete())
+        {
+            bPreviewCompletionHandled = false;
+            return;
+        }
+
+        if (bPreviewCompletionHandled)
+        {
+            return;
+        }
+
+        bPreviewCompletionHandled = true;
         if (bLooping)
         {
             PreviewComponent->ResetSystem();
@@ -845,6 +883,15 @@ protected:
     }
 
 private:
+    void SetPreviewTickEnabled(bool bEnabled)
+    {
+        SetCanTick(bEnabled);
+        if (ViewportClient.IsValid())
+        {
+            ViewportClient->SetPreviewWorldTickEnabled(bEnabled);
+        }
+    }
+
     void InvalidatePreviewViewport()
     {
         if (ViewportClient.IsValid())
@@ -955,6 +1002,7 @@ private:
     TObjectPtr<UNiagaraSystem> PreviewSystem = nullptr;
     bool bPreviewPlaying = false;
     bool bLooping = true;
+    bool bPreviewCompletionHandled = false;
     double LastViewportAspectRatio = 16.0 / 9.0;
     int32 PendingFrameTicks = 0;
     FBoxSphereBounds LastFramedBounds = FBoxSphereBounds(FSphere(FVector::ZeroVector, 0.0f));
@@ -1044,6 +1092,7 @@ public:
                         + SOverlay::Slot()
                         [
                             SAssignNew(PreviewViewport, SNiagaraPreviewViewport)
+                            .Visibility(this, &SNiagaraPreviewPlayerWidget::GetPreviewViewportVisibility)
                         ]
 
                         + SOverlay::Slot()
@@ -1221,6 +1270,11 @@ private:
     EVisibility GetViewportOverlayVisibility() const
     {
         return bHasRenderablePreview ? EVisibility::Collapsed : EVisibility::Visible;
+    }
+
+    EVisibility GetPreviewViewportVisibility() const
+    {
+        return bHasRenderablePreview ? EVisibility::Visible : EVisibility::Collapsed;
     }
 
     FText GetDropDetailsText() const
@@ -1523,7 +1577,10 @@ void FNiagaraPreviewPlayerWindow::PresentPlayerWindow(const TSharedRef<SWindow>&
 
     FSlateApplication& SlateApplication = FSlateApplication::Get();
     SlateApplication.PumpMessages();
-    SlateApplication.ForceRedrawWindow(Window);
+    if (bLastPreviewRenderable)
+    {
+        SlateApplication.ForceRedrawWindow(Window);
+    }
 }
 
 TSharedPtr<SWindow> FNiagaraPreviewPlayerWindow::GetTargetParentWindow()
