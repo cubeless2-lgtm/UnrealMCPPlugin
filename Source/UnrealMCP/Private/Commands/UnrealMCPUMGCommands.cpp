@@ -1,30 +1,268 @@
 #include "Commands/UnrealMCPUMGCommands.h"
 #include "Commands/UnrealMCPCommonUtils.h"
-#include "Editor.h"
-#include "EditorAssetLibrary.h"
+
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Blueprint/UserWidget.h"
-#include "Components/TextBlock.h"
-#include "WidgetBlueprint.h"
-// We'll create widgets using regular Factory classes
-#include "Factories/Factory.h"
-// Remove problematic includes that don't exist in UE 5.5
-// #include "UMGEditorSubsystem.h"
-// #include "WidgetBlueprintFactory.h"
-#include "WidgetBlueprintEditor.h"
+#include "Blueprint/WidgetBlueprintGeneratedClass.h"
 #include "Blueprint/WidgetTree.h"
+#include "Components/Button.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
+#include "Components/TextBlock.h"
+#include "EdGraphSchema_K2.h"
+#include "EditorAssetLibrary.h"
 #include "JsonObjectConverter.h"
-#include "Kismet2/BlueprintEditorUtils.h"
-#include "Components/Button.h"
-#include "K2Node_FunctionEntry.h"
-#include "K2Node_CallFunction.h"
-#include "K2Node_VariableGet.h"
-#include "K2Node_VariableSet.h"
-#include "Kismet/GameplayStatics.h"
-#include "Kismet2/KismetEditorUtilities.h"
 #include "K2Node_Event.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_VariableGet.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Misc/PackageName.h"
+#include "WidgetBlueprint.h"
+#include "WidgetBlueprintEditor.h"
+
+namespace
+{
+constexpr const TCHAR* DefaultSafeWidgetRoot = TEXT("/Game/_MCP_Temp/DurableSaveGate/UserWidgetActual");
+constexpr const TCHAR* SafeTempRoot = TEXT("/Game/_MCP_Temp/");
+
+bool TryGetStringFieldAny(const TSharedPtr<FJsonObject>& Params, const TArray<FString>& FieldNames, FString& OutValue)
+{
+	if (!Params.IsValid())
+	{
+		return false;
+	}
+
+	for (const FString& FieldName : FieldNames)
+	{
+		if (Params->TryGetStringField(FieldName, OutValue) && !OutValue.TrimStartAndEnd().IsEmpty())
+		{
+			OutValue.TrimStartAndEndInline();
+			OutValue.TrimQuotesInline();
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool IsSafeTempPackagePath(const FString& PackageName)
+{
+	return PackageName == TEXT("/Game/_MCP_Temp") || PackageName.StartsWith(SafeTempRoot);
+}
+
+FString NormalizePackagePath(FString PackagePath)
+{
+	PackagePath.TrimStartAndEndInline();
+	PackagePath.TrimQuotesInline();
+	while (PackagePath.EndsWith(TEXT("/")))
+	{
+		PackagePath.LeftChopInline(1);
+	}
+	return PackagePath.IsEmpty() ? FString(DefaultSafeWidgetRoot) : PackagePath;
+}
+
+FString NormalizeObjectPath(FString ObjectPath)
+{
+	ObjectPath = FPackageName::ExportTextPathToObjectPath(ObjectPath).TrimStartAndEnd();
+	ObjectPath.TrimQuotesInline();
+	if ((ObjectPath.StartsWith(TEXT("/Game/")) || ObjectPath.StartsWith(TEXT("/Engine/"))) && !ObjectPath.Contains(TEXT(".")))
+	{
+		const FString AssetName = FPackageName::GetShortName(ObjectPath);
+		ObjectPath = FString::Printf(TEXT("%s.%s"), *ObjectPath, *AssetName);
+	}
+	return ObjectPath;
+}
+
+FString JoinPackagePath(const FString& PackagePath, const FString& AssetName)
+{
+	return FString::Printf(TEXT("%s/%s"), *NormalizePackagePath(PackagePath), *AssetName);
+}
+
+bool ValidateSafePackageName(const FString& PackageName, const TSharedPtr<FJsonObject>& Params, FString& OutError)
+{
+	FText InvalidReason;
+	if (PackageName.IsEmpty() || PackageName.Contains(TEXT("//")) || !FPackageName::IsValidLongPackageName(PackageName, true, &InvalidReason))
+	{
+		OutError = FString::Printf(TEXT("Invalid package path '%s': %s"), *PackageName, *InvalidReason.ToString());
+		return false;
+	}
+
+	bool bAllowProductionPath = false;
+	Params->TryGetBoolField(TEXT("allow_production_path"), bAllowProductionPath);
+	if (!bAllowProductionPath && !IsSafeTempPackagePath(PackageName))
+	{
+		OutError = FString::Printf(TEXT("UMG durable route blocked production path '%s'; use /Game/_MCP_Temp/... or set allow_production_path=true explicitly"), *PackageName);
+		return false;
+	}
+
+	return true;
+}
+
+bool ResolveWidgetBlueprintObjectPath(const TSharedPtr<FJsonObject>& Params, FString& OutObjectPath, FString& OutPackageName, FString& OutError)
+{
+	FString ExplicitPath;
+	if (TryGetStringFieldAny(Params, {TEXT("blueprint_path"), TEXT("target_asset_path"), TEXT("asset_path")}, ExplicitPath))
+	{
+		OutObjectPath = NormalizeObjectPath(ExplicitPath);
+		OutPackageName = FPackageName::ObjectPathToPackageName(OutObjectPath);
+		return ValidateSafePackageName(OutPackageName, Params, OutError);
+	}
+
+	FString BlueprintName;
+	if (!TryGetStringFieldAny(Params, {TEXT("blueprint_name"), TEXT("widget_blueprint_name"), TEXT("widget_name"), TEXT("name")}, BlueprintName))
+	{
+		OutError = TEXT("Missing widget blueprint target; provide blueprint_path, blueprint_name, widget_blueprint_name, widget_name, or name");
+		return false;
+	}
+
+	if (BlueprintName.StartsWith(TEXT("/Game/")) || BlueprintName.StartsWith(TEXT("/Engine/")))
+	{
+		OutObjectPath = NormalizeObjectPath(BlueprintName);
+		OutPackageName = FPackageName::ObjectPathToPackageName(OutObjectPath);
+		return ValidateSafePackageName(OutPackageName, Params, OutError);
+	}
+
+	FString PackageRoot;
+	if (!Params->TryGetStringField(TEXT("path"), PackageRoot))
+	{
+		PackageRoot = DefaultSafeWidgetRoot;
+	}
+	const FString PackagePath = JoinPackagePath(PackageRoot, BlueprintName);
+	OutObjectPath = FString::Printf(TEXT("%s.%s"), *PackagePath, *BlueprintName);
+	OutPackageName = PackagePath;
+	return ValidateSafePackageName(OutPackageName, Params, OutError);
+}
+
+bool ResolveCreateTarget(const TSharedPtr<FJsonObject>& Params, FString& OutAssetName, FString& OutPackageName, FString& OutObjectPath, FString& OutError)
+{
+	if (!TryGetStringFieldAny(Params, {TEXT("name"), TEXT("widget_name"), TEXT("blueprint_name"), TEXT("widget_blueprint_name")}, OutAssetName))
+	{
+		OutError = TEXT("Missing widget blueprint name; provide name or widget_name");
+		return false;
+	}
+
+	if (OutAssetName.StartsWith(TEXT("/Game/")) || OutAssetName.StartsWith(TEXT("/Engine/")))
+	{
+		OutObjectPath = NormalizeObjectPath(OutAssetName);
+		OutPackageName = FPackageName::ObjectPathToPackageName(OutObjectPath);
+		OutAssetName = FPackageName::GetShortName(OutPackageName);
+		return ValidateSafePackageName(OutPackageName, Params, OutError);
+	}
+
+	FString PackageRoot;
+	if (!Params->TryGetStringField(TEXT("path"), PackageRoot))
+	{
+		PackageRoot = DefaultSafeWidgetRoot;
+	}
+	OutPackageName = JoinPackagePath(PackageRoot, OutAssetName);
+	OutObjectPath = FString::Printf(TEXT("%s.%s"), *OutPackageName, *OutAssetName);
+	return ValidateSafePackageName(OutPackageName, Params, OutError);
+}
+
+bool TryGetChildWidgetName(const TSharedPtr<FJsonObject>& Params, const TArray<FString>& PreferredNames, FString& OutWidgetName)
+{
+	if (TryGetStringFieldAny(Params, PreferredNames, OutWidgetName))
+	{
+		return true;
+	}
+
+	if (Params->HasField(TEXT("blueprint_name")) || Params->HasField(TEXT("blueprint_path")) || Params->HasField(TEXT("target_asset_path")))
+	{
+		return Params->TryGetStringField(TEXT("widget_name"), OutWidgetName);
+	}
+
+	return false;
+}
+
+UWidgetBlueprint* LoadWidgetBlueprintForParams(const TSharedPtr<FJsonObject>& Params, FString& OutObjectPath, FString& OutPackageName, FString& OutError)
+{
+	if (!ResolveWidgetBlueprintObjectPath(Params, OutObjectPath, OutPackageName, OutError))
+	{
+		return nullptr;
+	}
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(OutObjectPath);
+	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(LoadedAsset);
+	if (!WidgetBlueprint)
+	{
+		OutError = FString::Printf(TEXT("Failed to load Widget Blueprint: %s"), *OutObjectPath);
+		return nullptr;
+	}
+	if (!WidgetBlueprint->WidgetTree)
+	{
+		OutError = FString::Printf(TEXT("Widget Blueprint has no WidgetTree: %s"), *OutObjectPath);
+		return nullptr;
+	}
+
+	return WidgetBlueprint;
+}
+
+UCanvasPanel* GetOrCreateRootCanvas(UWidgetBlueprint* WidgetBlueprint, bool bCreateIfMissing, bool& bOutRootCreated, FString& OutError)
+{
+	bOutRootCreated = false;
+	if (!WidgetBlueprint || !WidgetBlueprint->WidgetTree)
+	{
+		OutError = TEXT("Widget Blueprint has no WidgetTree");
+		return nullptr;
+	}
+
+	if (!WidgetBlueprint->WidgetTree->RootWidget && bCreateIfMissing)
+	{
+		WidgetBlueprint->Modify();
+		WidgetBlueprint->WidgetTree->Modify();
+		UCanvasPanel* RootCanvas = WidgetBlueprint->WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass(), TEXT("RootCanvas"));
+		WidgetBlueprint->WidgetTree->RootWidget = RootCanvas;
+		bOutRootCreated = RootCanvas != nullptr;
+	}
+
+	UCanvasPanel* RootCanvas = Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget);
+	if (!RootCanvas)
+	{
+		OutError = TEXT("Root widget is not a Canvas Panel");
+	}
+	return RootCanvas;
+}
+
+FVector2D ReadPosition(const TSharedPtr<FJsonObject>& Params)
+{
+	FVector2D Position(0.0f, 0.0f);
+	const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray && PosArray->Num() >= 2)
+	{
+		Position.X = (*PosArray)[0]->AsNumber();
+		Position.Y = (*PosArray)[1]->AsNumber();
+	}
+	return Position;
+}
+
+void FinalizeWidgetBlueprintMutation(const TSharedPtr<FJsonObject>& Params, UWidgetBlueprint* WidgetBlueprint, const FString& ObjectPath, TSharedPtr<FJsonObject>& Response)
+{
+	bool bRequestCompile = true;
+	Params->TryGetBoolField(TEXT("request_compile"), bRequestCompile);
+	bool bSave = false;
+	Params->TryGetBoolField(TEXT("save"), bSave);
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBlueprint);
+	Response->SetBoolField(TEXT("compile_executed"), false);
+	Response->SetBoolField(TEXT("save_executed"), false);
+	Response->SetBoolField(TEXT("save_requested"), bSave);
+	Response->SetBoolField(TEXT("production_path_write_allowed"), false);
+	Response->SetStringField(TEXT("blueprint_path"), ObjectPath);
+
+	if (bRequestCompile)
+	{
+		FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
+		Response->SetBoolField(TEXT("compile_executed"), true);
+	}
+
+	if (bSave)
+	{
+		Response->SetBoolField(TEXT("save_succeeded"), UEditorAssetLibrary::SaveAsset(ObjectPath, false));
+		Response->SetBoolField(TEXT("save_executed"), true);
+	}
+}
+}
 
 FUnrealMCPUMGCommands::FUnrealMCPUMGCommands()
 {
@@ -62,174 +300,134 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleCommand(const FString& Comm
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleCreateUMGWidgetBlueprint(const TSharedPtr<FJsonObject>& Params)
 {
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("name"), BlueprintName))
+	FString AssetName;
+	FString PackageName;
+	FString ObjectPath;
+	FString Error;
+	if (!ResolveCreateTarget(Params, AssetName, PackageName, ObjectPath, Error))
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'name' parameter"));
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Create the full asset path
-	FString PackagePath = TEXT("/Game/Widgets/");
-	FString AssetName = BlueprintName;
-	FString FullPath = PackagePath + AssetName;
-
-	// Check if asset already exists
-	if (UEditorAssetLibrary::DoesAssetExist(FullPath))
+	if (UEditorAssetLibrary::DoesAssetExist(ObjectPath))
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Widget Blueprint '%s' already exists"), *BlueprintName));
+		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Widget Blueprint already exists: %s"), *ObjectPath));
 	}
 
-	// Create package
-	UPackage* Package = CreatePackage(*FullPath);
+	UPackage* Package = CreatePackage(*PackageName);
 	if (!Package)
 	{
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create package"));
 	}
 
-	// Create Widget Blueprint using KismetEditorUtilities
 	UBlueprint* NewBlueprint = FKismetEditorUtilities::CreateBlueprint(
-		UUserWidget::StaticClass(),  // Parent class
-		Package,                     // Outer package
-		FName(*AssetName),           // Blueprint name
-		BPTYPE_Normal,               // Blueprint type
-		UBlueprint::StaticClass(),   // Blueprint class
-		UBlueprintGeneratedClass::StaticClass(), // Generated class
-		FName("CreateUMGWidget")     // Creation method name
+		UUserWidget::StaticClass(),
+		Package,
+		FName(*AssetName),
+		BPTYPE_Normal,
+		UWidgetBlueprint::StaticClass(),
+		UWidgetBlueprintGeneratedClass::StaticClass(),
+		FName("CreateUMGWidget")
 	);
 
-	// Make sure the Blueprint was created successfully
 	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(NewBlueprint);
-	if (!WidgetBlueprint)
+	if (!WidgetBlueprint || !WidgetBlueprint->WidgetTree)
 	{
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Widget Blueprint"));
 	}
 
-	// Add a default Canvas Panel if one doesn't exist
-	if (!WidgetBlueprint->WidgetTree->RootWidget)
+	bool bRootCreated = false;
+	UCanvasPanel* RootCanvas = GetOrCreateRootCanvas(WidgetBlueprint, true, bRootCreated, Error);
+	if (!RootCanvas)
 	{
-		UCanvasPanel* RootCanvas = WidgetBlueprint->WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass());
-		WidgetBlueprint->WidgetTree->RootWidget = RootCanvas;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Mark the package dirty and notify asset registry
-	Package->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(WidgetBlueprint);
 
-	// Compile the blueprint
-	FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-
-	// Create success response
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetStringField(TEXT("name"), BlueprintName);
-	ResultObj->SetStringField(TEXT("path"), FullPath);
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("name"), AssetName);
+	ResultObj->SetStringField(TEXT("path"), ObjectPath);
+	ResultObj->SetBoolField(TEXT("root_widget_created"), bRootCreated);
+	FinalizeWidgetBlueprintMutation(Params, WidgetBlueprint, ObjectPath, ResultObj);
 	return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddTextBlockToWidget(const TSharedPtr<FJsonObject>& Params)
 {
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
-	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
-	}
-
-	FString WidgetName;
-	if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName))
-	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'widget_name' parameter"));
-	}
-
-	// Find the Widget Blueprint
-	FString FullPath = TEXT("/Game/Widgets/") + BlueprintName;
-	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(FullPath));
+	FString ObjectPath;
+	FString PackageName;
+	FString Error;
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintForParams(Params, ObjectPath, PackageName, Error);
 	if (!WidgetBlueprint)
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Widget Blueprint '%s' not found"), *BlueprintName));
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Get optional parameters
+	FString TextBlockName;
+	if (!TryGetChildWidgetName(Params, {TEXT("text_block_name"), TEXT("child_widget_name")}, TextBlockName))
+	{
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing text block widget name; provide text_block_name"));
+	}
+
 	FString InitialText = TEXT("New Text Block");
 	Params->TryGetStringField(TEXT("text"), InitialText);
 
-	FVector2D Position(0.0f, 0.0f);
-	if (Params->HasField(TEXT("position")))
+	bool bRootCreated = false;
+	UCanvasPanel* RootCanvas = GetOrCreateRootCanvas(WidgetBlueprint, true, bRootCreated, Error);
+	if (!RootCanvas)
 	{
-		const TArray<TSharedPtr<FJsonValue>>* PosArray;
-		if (Params->TryGetArrayField(TEXT("position"), PosArray) && PosArray->Num() >= 2)
-		{
-			Position.X = (*PosArray)[0]->AsNumber();
-			Position.Y = (*PosArray)[1]->AsNumber();
-		}
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Create Text Block widget
-	UTextBlock* TextBlock = WidgetBlueprint->WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), *WidgetName);
+	WidgetBlueprint->Modify();
+	WidgetBlueprint->WidgetTree->Modify();
+	UTextBlock* TextBlock = WidgetBlueprint->WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), *TextBlockName);
 	if (!TextBlock)
 	{
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Text Block widget"));
 	}
-
-	// Set initial text
 	TextBlock->SetText(FText::FromString(InitialText));
 
-	// Add to canvas panel
-	UCanvasPanel* RootCanvas = Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget);
-	if (!RootCanvas)
+	UCanvasPanelSlot* PanelSlot = RootCanvas->AddChildToCanvas(TextBlock);
+	if (PanelSlot)
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Root Canvas Panel not found"));
+		PanelSlot->SetPosition(ReadPosition(Params));
 	}
 
-	UCanvasPanelSlot* PanelSlot = RootCanvas->AddChildToCanvas(TextBlock);
-	PanelSlot->SetPosition(Position);
-
-	// Mark the package dirty and compile
-	WidgetBlueprint->MarkPackageDirty();
-	FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-
-	// Create success response
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetStringField(TEXT("widget_name"), WidgetName);
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("widget_name"), TextBlockName);
 	ResultObj->SetStringField(TEXT("text"), InitialText);
+	ResultObj->SetBoolField(TEXT("root_widget_created"), bRootCreated);
+	ResultObj->SetBoolField(TEXT("child_widget_added"), true);
+	FinalizeWidgetBlueprintMutation(Params, WidgetBlueprint, ObjectPath, ResultObj);
 	return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddWidgetToViewport(const TSharedPtr<FJsonObject>& Params)
 {
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
-	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
-	}
-
-	// Find the Widget Blueprint
-	FString FullPath = TEXT("/Game/Widgets/") + BlueprintName;
-	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(FullPath));
+	FString ObjectPath;
+	FString PackageName;
+	FString Error;
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintForParams(Params, ObjectPath, PackageName, Error);
 	if (!WidgetBlueprint)
 	{
-		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Widget Blueprint '%s' not found"), *BlueprintName));
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Get optional Z-order parameter
 	int32 ZOrder = 0;
 	Params->TryGetNumberField(TEXT("z_order"), ZOrder);
-
-	// Create widget instance
 	UClass* WidgetClass = WidgetBlueprint->GeneratedClass;
 	if (!WidgetClass)
 	{
 		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get widget class"));
 	}
 
-	// Note: This creates the widget but doesn't add it to viewport
-	// The actual addition to viewport should be done through Blueprint nodes
-	// as it requires a game context
-
-	// Create success response with instructions
 	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
-	ResultObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("blueprint_path"), ObjectPath);
 	ResultObj->SetStringField(TEXT("class_path"), WidgetClass->GetPathName());
 	ResultObj->SetNumberField(TEXT("z_order"), ZOrder);
 	ResultObj->SetStringField(TEXT("note"), TEXT("Widget class ready. Use CreateWidget and AddToViewport nodes in Blueprint to display in game."));
@@ -238,307 +436,160 @@ TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddWidgetToViewport(const T
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleAddButtonToWidget(const TSharedPtr<FJsonObject>& Params)
 {
-	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
-
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
-	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing blueprint_name parameter"));
-		return Response;
-	}
-
-	FString WidgetName;
-	if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName))
-	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing widget_name parameter"));
-		return Response;
-	}
-
-	FString ButtonText;
-	if (!Params->TryGetStringField(TEXT("text"), ButtonText))
-	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing text parameter"));
-		return Response;
-	}
-
-	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
-	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
+	FString ObjectPath;
+	FString PackageName;
+	FString Error;
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintForParams(Params, ObjectPath, PackageName, Error);
 	if (!WidgetBlueprint)
 	{
-		Response->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to load Widget Blueprint: %s"), *BlueprintPath));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	// Create Button widget
-	UButton* Button = NewObject<UButton>(WidgetBlueprint->GeneratedClass->GetDefaultObject(), UButton::StaticClass(), *WidgetName);
+	FString ButtonName;
+	if (!TryGetChildWidgetName(Params, {TEXT("button_name"), TEXT("child_widget_name")}, ButtonName))
+	{
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing button widget name; provide button_name"));
+	}
+
+	FString ButtonText = TEXT("Button");
+	Params->TryGetStringField(TEXT("text"), ButtonText);
+
+	bool bRootCreated = false;
+	UCanvasPanel* RootCanvas = GetOrCreateRootCanvas(WidgetBlueprint, true, bRootCreated, Error);
+	if (!RootCanvas)
+	{
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
+	}
+
+	WidgetBlueprint->Modify();
+	WidgetBlueprint->WidgetTree->Modify();
+	UButton* Button = WidgetBlueprint->WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), *ButtonName);
 	if (!Button)
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Failed to create Button widget"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create Button widget"));
 	}
 
-	// Set button text
-	UTextBlock* ButtonTextBlock = NewObject<UTextBlock>(Button, UTextBlock::StaticClass(), *(WidgetName + TEXT("_Text")));
+	UTextBlock* ButtonTextBlock = WidgetBlueprint->WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), *(ButtonName + TEXT("_Text")));
 	if (ButtonTextBlock)
 	{
 		ButtonTextBlock->SetText(FText::FromString(ButtonText));
 		Button->AddChild(ButtonTextBlock);
 	}
 
-	// Get canvas panel and add button
-	UCanvasPanel* RootCanvas = Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget);
-	if (!RootCanvas)
-	{
-		Response->SetStringField(TEXT("error"), TEXT("Root widget is not a Canvas Panel"));
-		return Response;
-	}
-
-	// Add to canvas and set position
 	UCanvasPanelSlot* ButtonSlot = RootCanvas->AddChildToCanvas(Button);
 	if (ButtonSlot)
 	{
-		const TArray<TSharedPtr<FJsonValue>>* Position;
-		if (Params->TryGetArrayField(TEXT("position"), Position) && Position->Num() >= 2)
-		{
-			FVector2D Pos(
-				(*Position)[0]->AsNumber(),
-				(*Position)[1]->AsNumber()
-			);
-			ButtonSlot->SetPosition(Pos);
-		}
+		ButtonSlot->SetPosition(ReadPosition(Params));
 	}
 
-	// Save the Widget Blueprint
-	FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-	UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
-
-	Response->SetBoolField(TEXT("success"), true);
-	Response->SetStringField(TEXT("widget_name"), WidgetName);
-	return Response;
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("widget_name"), ButtonName);
+	ResultObj->SetBoolField(TEXT("root_widget_created"), bRootCreated);
+	ResultObj->SetBoolField(TEXT("child_widget_added"), true);
+	FinalizeWidgetBlueprintMutation(Params, WidgetBlueprint, ObjectPath, ResultObj);
+	return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleBindWidgetEvent(const TSharedPtr<FJsonObject>& Params)
 {
-	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
-
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+	FString ObjectPath;
+	FString PackageName;
+	FString Error;
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintForParams(Params, ObjectPath, PackageName, Error);
+	if (!WidgetBlueprint)
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing blueprint_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
 	FString WidgetName;
-	if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName))
+	if (!TryGetChildWidgetName(Params, {TEXT("widget_component_name"), TEXT("child_widget_name")}, WidgetName))
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing widget_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing widget component name"));
 	}
 
 	FString EventName;
 	if (!Params->TryGetStringField(TEXT("event_name"), EventName))
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing event_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing event_name parameter"));
 	}
 
-	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
-	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
-	if (!WidgetBlueprint)
-	{
-		Response->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to load Widget Blueprint: %s"), *BlueprintPath));
-		return Response;
-	}
-
-	// Create the event graph if it doesn't exist
 	UEdGraph* EventGraph = FBlueprintEditorUtils::FindEventGraph(WidgetBlueprint);
 	if (!EventGraph)
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Failed to find or create event graph"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to find event graph"));
 	}
 
-	// Find the widget in the blueprint
 	UWidget* Widget = WidgetBlueprint->WidgetTree->FindWidget(*WidgetName);
 	if (!Widget)
 	{
-		Response->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to find widget: %s"), *WidgetName));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to find widget: %s"), *WidgetName));
 	}
 
-	// Create the event node (e.g., OnClicked for buttons)
 	UK2Node_Event* EventNode = nullptr;
-	
-	// Find existing nodes first
 	TArray<UK2Node_Event*> AllEventNodes;
 	FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_Event>(WidgetBlueprint, AllEventNodes);
-	
 	for (UK2Node_Event* Node : AllEventNodes)
 	{
-		if (Node->CustomFunctionName == FName(*EventName) && Node->EventReference.GetMemberParentClass() == Widget->GetClass())
+		if (Node && Node->CustomFunctionName == FName(*EventName) && Node->EventReference.GetMemberParentClass() == Widget->GetClass())
 		{
 			EventNode = Node;
 			break;
 		}
 	}
 
-	// If no existing node, create a new one
 	if (!EventNode)
 	{
-		// Calculate position - place it below existing nodes
-		float MaxHeight = 0.0f;
-		for (UEdGraphNode* Node : EventGraph->Nodes)
-		{
-			MaxHeight = FMath::Max(MaxHeight, Node->NodePosY);
-		}
-		
-		const FVector2D NodePos(200, MaxHeight + 200);
-
-		// Call CreateNewBoundEventForClass, which returns void, so we can't capture the return value directly
-		// We'll need to find the node after creating it
-		FKismetEditorUtilities::CreateNewBoundEventForClass(
-			Widget->GetClass(),
-			FName(*EventName),
-			WidgetBlueprint,
-			nullptr  // We don't need a specific property binding
-		);
-
-		// Now find the newly created node
-		TArray<UK2Node_Event*> UpdatedEventNodes;
-		FBlueprintEditorUtils::GetAllNodesOfClass<UK2Node_Event>(WidgetBlueprint, UpdatedEventNodes);
-		
-		for (UK2Node_Event* Node : UpdatedEventNodes)
-		{
-			if (Node->CustomFunctionName == FName(*EventName) && Node->EventReference.GetMemberParentClass() == Widget->GetClass())
-			{
-				EventNode = Node;
-				
-				// Set position of the node
-				EventNode->NodePosX = NodePos.X;
-				EventNode->NodePosY = NodePos.Y;
-				
-				break;
-			}
-		}
+		FKismetEditorUtilities::CreateNewBoundEventForClass(Widget->GetClass(), FName(*EventName), WidgetBlueprint, nullptr);
 	}
 
-	if (!EventNode)
-	{
-		Response->SetStringField(TEXT("error"), TEXT("Failed to create event node"));
-		return Response;
-	}
-
-	// Save the Widget Blueprint
-	FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-	UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
-
-	Response->SetBoolField(TEXT("success"), true);
-	Response->SetStringField(TEXT("event_name"), EventName);
-	return Response;
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("event_name"), EventName);
+	ResultObj->SetBoolField(TEXT("event_graph_mutation_performed"), true);
+	FinalizeWidgetBlueprintMutation(Params, WidgetBlueprint, ObjectPath, ResultObj);
+	return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPUMGCommands::HandleSetTextBlockBinding(const TSharedPtr<FJsonObject>& Params)
 {
-	TSharedPtr<FJsonObject> Response = MakeShared<FJsonObject>();
-
-	// Get required parameters
-	FString BlueprintName;
-	if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+	FString ObjectPath;
+	FString PackageName;
+	FString Error;
+	UWidgetBlueprint* WidgetBlueprint = LoadWidgetBlueprintForParams(Params, ObjectPath, PackageName, Error);
+	if (!WidgetBlueprint)
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing blueprint_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(Error);
 	}
 
-	FString WidgetName;
-	if (!Params->TryGetStringField(TEXT("widget_name"), WidgetName))
+	FString TextBlockName;
+	if (!TryGetChildWidgetName(Params, {TEXT("text_block_name"), TEXT("widget_component_name"), TEXT("child_widget_name")}, TextBlockName))
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing widget_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing text block widget name"));
 	}
 
 	FString BindingName;
-	if (!Params->TryGetStringField(TEXT("binding_name"), BindingName))
+	if (!TryGetStringFieldAny(Params, {TEXT("binding_name"), TEXT("binding_property")}, BindingName))
 	{
-		Response->SetStringField(TEXT("error"), TEXT("Missing binding_name parameter"));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing binding_name parameter"));
 	}
 
-	// Load the Widget Blueprint
-	const FString BlueprintPath = FString::Printf(TEXT("/Game/Widgets/%s.%s"), *BlueprintName, *BlueprintName);
-	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(BlueprintPath));
-	if (!WidgetBlueprint)
+	UTextBlock* TextBlock = Cast<UTextBlock>(WidgetBlueprint->WidgetTree->FindWidget(FName(*TextBlockName)));
+	if (!TextBlock)
 	{
-		Response->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to load Widget Blueprint: %s"), *BlueprintPath));
-		return Response;
+		return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to find TextBlock widget: %s"), *TextBlockName));
 	}
 
-	// Create a variable for binding if it doesn't exist
 	FBlueprintEditorUtils::AddMemberVariable(
 		WidgetBlueprint,
 		FName(*BindingName),
 		FEdGraphPinType(UEdGraphSchema_K2::PC_Text, NAME_None, nullptr, EPinContainerType::None, false, FEdGraphTerminalType())
 	);
 
-	// Find the TextBlock widget
-	UTextBlock* TextBlock = Cast<UTextBlock>(WidgetBlueprint->WidgetTree->FindWidget(FName(*WidgetName)));
-	if (!TextBlock)
-	{
-		Response->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to find TextBlock widget: %s"), *WidgetName));
-		return Response;
-	}
-
-	// Create binding function
-	const FString FunctionName = FString::Printf(TEXT("Get%s"), *BindingName);
-	UEdGraph* FuncGraph = FBlueprintEditorUtils::CreateNewGraph(
-		WidgetBlueprint,
-		FName(*FunctionName),
-		UEdGraph::StaticClass(),
-		UEdGraphSchema_K2::StaticClass()
-	);
-
-	if (FuncGraph)
-	{
-		// Add the function to the blueprint with proper template parameter
-		// Template requires null for last parameter when not using a signature-source
-		FBlueprintEditorUtils::AddFunctionGraph<UClass>(WidgetBlueprint, FuncGraph, false, nullptr);
-
-		// Create entry node
-		UK2Node_FunctionEntry* EntryNode = nullptr;
-		
-		// Create entry node - use the API that exists in UE 5.5
-		EntryNode = NewObject<UK2Node_FunctionEntry>(FuncGraph);
-		FuncGraph->AddNode(EntryNode, false, false);
-		EntryNode->NodePosX = 0;
-		EntryNode->NodePosY = 0;
-		EntryNode->FunctionReference.SetExternalMember(FName(*FunctionName), WidgetBlueprint->GeneratedClass);
-		EntryNode->AllocateDefaultPins();
-
-		// Create get variable node
-		UK2Node_VariableGet* GetVarNode = NewObject<UK2Node_VariableGet>(FuncGraph);
-		GetVarNode->VariableReference.SetSelfMember(FName(*BindingName));
-		FuncGraph->AddNode(GetVarNode, false, false);
-		GetVarNode->NodePosX = 200;
-		GetVarNode->NodePosY = 0;
-		GetVarNode->AllocateDefaultPins();
-
-		// Connect nodes
-		UEdGraphPin* EntryThenPin = EntryNode->FindPin(UEdGraphSchema_K2::PN_Then);
-		UEdGraphPin* GetVarOutPin = GetVarNode->FindPin(UEdGraphSchema_K2::PN_ReturnValue);
-		if (EntryThenPin && GetVarOutPin)
-		{
-			EntryThenPin->MakeLinkTo(GetVarOutPin);
-		}
-	}
-
-	// Save the Widget Blueprint
-	FKismetEditorUtilities::CompileBlueprint(WidgetBlueprint);
-	UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
-
-	Response->SetBoolField(TEXT("success"), true);
-	Response->SetStringField(TEXT("binding_name"), BindingName);
-	return Response;
-} 
+	TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+	ResultObj->SetBoolField(TEXT("success"), true);
+	ResultObj->SetStringField(TEXT("binding_name"), BindingName);
+	ResultObj->SetBoolField(TEXT("widget_binding_mutation_performed"), true);
+	FinalizeWidgetBlueprintMutation(Params, WidgetBlueprint, ObjectPath, ResultObj);
+	return ResultObj;
+}
