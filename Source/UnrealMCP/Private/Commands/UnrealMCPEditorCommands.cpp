@@ -92,6 +92,11 @@ namespace
         return DirtyPackageNames;
     }
 
+    bool IsPlayInEditorActive()
+    {
+        return GEditor && GEditor->PlayWorld != nullptr;
+    }
+
     FString NormalizeLevelPackageName(const FString& InLevelPath)
     {
         FString LevelPath = FPackageName::ExportTextPathToObjectPath(InLevelPath).TrimStartAndEnd();
@@ -772,6 +777,11 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCaptureViewportBookmarkS
     if (!Params->TryGetStringField(TEXT("filepath"), FilePath))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'filepath' parameter"));
+    }
+
+    if (IsPlayInEditorActive())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("capture_viewport_bookmark_screenshot is disabled during PIE/SIE; stop PIE before capturing the active editor viewport"));
     }
 
     if (!GEditor || !GEditor->GetActiveViewport())
@@ -1568,6 +1578,11 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSh
     if (!FilePath.EndsWith(TEXT(".png")))
     {
         FilePath += TEXT(".png");
+    }
+
+    if (IsPlayInEditorActive())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("take_screenshot is disabled during PIE/SIE; stop PIE before capturing the active editor viewport"));
     }
 
     // Get the active viewport
