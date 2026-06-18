@@ -22,5 +22,6 @@ private:
     TSharedPtr<FJsonObject> HandlePostprocessContentFolderMCP(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleRepairWorldActorInstancesMCP(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleRunContentValidationPipelineMCP(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleAuditContentRootMCP(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAnalyzeBlueprintWidgetFallbacksMCP(const TSharedPtr<FJsonObject>& Params);
 }; 

@@ -501,6 +501,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("postprocess_content_folder_mcp") ||
                      CommandType == TEXT("repair_world_actor_instances_mcp") ||
                      CommandType == TEXT("run_content_validation_pipeline_mcp") ||
+                     CommandType == TEXT("audit_content_root_mcp") ||
                      CommandType == TEXT("analyze_blueprint_widget_fallbacks_mcp"))
             {
                 ResultJson = ProjectCommands->HandleCommand(CommandType, Params);

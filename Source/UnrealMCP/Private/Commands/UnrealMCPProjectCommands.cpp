@@ -5987,6 +5987,150 @@ TSharedPtr<FJsonObject> StringIntMapToJsonObject(const TMap<FString, int32>& Map
     return Object;
 }
 
+TArray<FString> GetStringArrayParamForMCP(
+    const TSharedPtr<FJsonObject>& Params,
+    const TCHAR* FieldName,
+    const TArray<FString>& DefaultValues)
+{
+    TArray<FString> Values = DefaultValues;
+    const TArray<TSharedPtr<FJsonValue>>* JsonValues = nullptr;
+    if (!Params.IsValid() || !Params->TryGetArrayField(FieldName, JsonValues) || !JsonValues)
+    {
+        return Values;
+    }
+
+    Values.Reset();
+    for (const TSharedPtr<FJsonValue>& JsonValue : *JsonValues)
+    {
+        if (!JsonValue.IsValid() || JsonValue->Type != EJson::String)
+        {
+            continue;
+        }
+
+        FString Value = JsonValue->AsString();
+        Value.TrimStartAndEndInline();
+        if (!Value.IsEmpty())
+        {
+            Values.Add(Value);
+        }
+    }
+    return Values;
+}
+
+TMap<FString, int32> GetStringIntObjectParamForMCP(const TSharedPtr<FJsonObject>& Params, const TCHAR* FieldName)
+{
+    TMap<FString, int32> Values;
+    const TSharedPtr<FJsonObject>* JsonObject = nullptr;
+    if (!Params.IsValid() || !Params->TryGetObjectField(FieldName, JsonObject) || !JsonObject || !JsonObject->IsValid())
+    {
+        return Values;
+    }
+
+    for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*JsonObject)->Values)
+    {
+        if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::Number)
+        {
+            continue;
+        }
+        Values.Add(Pair.Key, FMath::Max(0, FMath::RoundToInt(Pair.Value->AsNumber())));
+    }
+    return Values;
+}
+
+bool TryGetOptionalIntParamForMCP(const TSharedPtr<FJsonObject>& Params, const TCHAR* FieldName, int32& OutValue)
+{
+    double NumberValue = 0.0;
+    if (!Params.IsValid() || !Params->TryGetNumberField(FieldName, NumberValue))
+    {
+        return false;
+    }
+
+    OutValue = FMath::Max(0, FMath::RoundToInt(NumberValue));
+    return true;
+}
+
+FString NormalizeAuditPackagePathForMCP(FString Path)
+{
+    Path = FPackageName::ExportTextPathToObjectPath(Path).TrimStartAndEnd();
+    Path.TrimQuotesInline();
+    Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+    return NormalizePackagePathParam(Path);
+}
+
+TArray<FString> NormalizeAuditPathArrayForMCP(const TArray<FString>& Paths)
+{
+    TArray<FString> NormalizedPaths;
+    TSet<FString> SeenPaths;
+    for (const FString& Path : Paths)
+    {
+        const FString NormalizedPath = NormalizeAuditPackagePathForMCP(Path);
+        if (NormalizedPath.IsEmpty() || SeenPaths.Contains(NormalizedPath))
+        {
+            continue;
+        }
+        SeenPaths.Add(NormalizedPath);
+        NormalizedPaths.Add(NormalizedPath);
+    }
+    NormalizedPaths.Sort();
+    return NormalizedPaths;
+}
+
+bool PackagePathMatchesRootForMCP(const FString& PackagePath, const FString& RootPath)
+{
+    return PackagePath.Equals(RootPath) || PackagePath.StartsWith(RootPath + TEXT("/"));
+}
+
+bool PackagePathMatchesAnyRootForMCP(const FString& PackagePath, const TArray<FString>& RootPaths)
+{
+    for (const FString& RootPath : RootPaths)
+    {
+        if (!RootPath.IsEmpty() && PackagePathMatchesRootForMCP(PackagePath, RootPath))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+TArray<FString> GetDirtyPackageNamesForProjectMCP()
+{
+    TArray<UPackage*> DirtyPackages;
+    FEditorFileUtils::GetDirtyPackages(DirtyPackages);
+
+    TArray<FString> DirtyPackageNames;
+    TSet<FString> SeenPackageNames;
+    for (UPackage* Package : DirtyPackages)
+    {
+        if (!Package)
+        {
+            continue;
+        }
+
+        const FString PackageName = Package->GetName();
+        if (PackageName.IsEmpty() || SeenPackageNames.Contains(PackageName))
+        {
+            continue;
+        }
+
+        SeenPackageNames.Add(PackageName);
+        DirtyPackageNames.Add(PackageName);
+    }
+
+    DirtyPackageNames.Sort();
+    return DirtyPackageNames;
+}
+
+TSharedPtr<FJsonObject> AssetDataSummaryToJsonForMCP(const FAssetData& Asset)
+{
+    TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+    Object->SetStringField(TEXT("package_name"), Asset.PackageName.ToString());
+    Object->SetStringField(TEXT("asset_name"), Asset.AssetName.ToString());
+    Object->SetStringField(TEXT("object_path"), FString::Printf(TEXT("%s.%s"), *Asset.PackageName.ToString(), *Asset.AssetName.ToString()));
+    Object->SetStringField(TEXT("package_path"), Asset.PackagePath.ToString());
+    Object->SetStringField(TEXT("class"), Asset.AssetClassPath.GetAssetName().ToString());
+    return Object;
+}
+
 FString ProjectObjectPathOrEmpty(const UObject* Object)
 {
     return Object ? Object->GetPathName() : FString();
@@ -6165,12 +6309,222 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleCommand(const FString& 
     {
         return HandleRunContentValidationPipelineMCP(Params);
     }
+    if (CommandType == TEXT("audit_content_root_mcp"))
+    {
+        return HandleAuditContentRootMCP(Params);
+    }
     if (CommandType == TEXT("analyze_blueprint_widget_fallbacks_mcp"))
     {
         return HandleAnalyzeBlueprintWidgetFallbacksMCP(Params);
     }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown project command: %s"), *CommandType));
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleAuditContentRootMCP(const TSharedPtr<FJsonObject>& Params)
+{
+    FString RootPath;
+    FString RootParamError;
+    if (!TryGetRequiredContentRootParamForMCP(Params, TEXT("root_path"), RootPath, RootParamError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(RootParamError);
+    }
+
+    const bool bRecursive = GetBoolParam(Params, TEXT("recursive"), true);
+    const bool bScanPaths = GetBoolParam(Params, TEXT("scan_paths"), true);
+    const bool bIncludeDependencies = GetBoolParam(Params, TEXT("include_dependencies"), true);
+    const bool bIncludeAssets = GetBoolParam(Params, TEXT("include_assets"), false);
+    const bool bWriteReport = GetBoolParam(Params, TEXT("write_report"), false);
+    const bool bFailOnDirtyPackages = GetBoolParam(Params, TEXT("fail_on_dirty_packages"), false);
+    const bool bFailOnRedirectors = GetBoolParam(Params, TEXT("fail_on_redirectors"), true);
+    const bool bFailOnForbiddenDependencies = GetBoolParam(Params, TEXT("fail_on_forbidden_dependencies"), true);
+    const int32 MaxSamples = FMath::Max(1, GetIntParam(Params, TEXT("max_samples"), 50));
+
+    TArray<FString> DefaultForbiddenPrefixes;
+    DefaultForbiddenPrefixes.Add(TEXT("/Game/_MCP_Temp"));
+    const TArray<FString> ForbiddenDependencyPrefixes = NormalizeAuditPathArrayForMCP(
+        GetStringArrayParamForMCP(Params, TEXT("forbidden_dependency_prefixes"), DefaultForbiddenPrefixes));
+    const TArray<FString> RequiredAssetPaths = NormalizeAuditPathArrayForMCP(
+        GetStringArrayParamForMCP(Params, TEXT("required_asset_paths"), TArray<FString>()));
+    const TMap<FString, int32> ExpectedClassCounts = GetStringIntObjectParamForMCP(Params, TEXT("expected_class_counts"));
+
+    int32 ExpectedAssetCount = 0;
+    const bool bHasExpectedAssetCount = TryGetOptionalIntParamForMCP(Params, TEXT("expected_asset_count"), ExpectedAssetCount);
+
+    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+    if (bScanPaths)
+    {
+        TArray<FString> PathsToScan;
+        PathsToScan.Add(RootPath);
+        AssetRegistry.ScanPathsSynchronous(PathsToScan, true);
+    }
+
+    TArray<FAssetData> Assets;
+    AssetRegistry.GetAssetsByPath(FName(*RootPath), Assets, bRecursive);
+    Assets.Sort([](const FAssetData& A, const FAssetData& B)
+    {
+        return A.PackageName.LexicalLess(B.PackageName);
+    });
+
+    TMap<FString, int32> ClassCounts;
+    TMap<FString, int32> FolderCounts;
+    TSet<FString> AssetPackageNames;
+    TArray<FString> RedirectorSamples;
+    TArray<TSharedPtr<FJsonValue>> AssetValues;
+    int32 RedirectorCount = 0;
+
+    for (const FAssetData& Asset : Assets)
+    {
+        const FString PackageName = Asset.PackageName.ToString();
+        const FString ClassName = Asset.AssetClassPath.GetAssetName().ToString();
+        ClassCounts.FindOrAdd(ClassName)++;
+        FolderCounts.FindOrAdd(Asset.PackagePath.ToString())++;
+        AssetPackageNames.Add(PackageName);
+
+        if (ClassName == TEXT("ObjectRedirector"))
+        {
+            ++RedirectorCount;
+            if (RedirectorSamples.Num() < MaxSamples)
+            {
+                RedirectorSamples.Add(PackageName);
+            }
+        }
+
+        if (bIncludeAssets)
+        {
+            AssetValues.Add(MakeShared<FJsonValueObject>(AssetDataSummaryToJsonForMCP(Asset)));
+        }
+    }
+
+    TSet<FName> PackagesWithForbiddenDependencies;
+    TArray<FString> ForbiddenDependencySamples;
+    int32 DependencyScannedAssetCount = 0;
+    int32 ForbiddenDependencyHitCount = 0;
+    if (bIncludeDependencies && !ForbiddenDependencyPrefixes.IsEmpty())
+    {
+        for (const FAssetData& Asset : Assets)
+        {
+            ++DependencyScannedAssetCount;
+            TArray<FName> Dependencies;
+            AssetRegistry.GetDependencies(Asset.PackageName, Dependencies);
+            for (const FName& Dependency : Dependencies)
+            {
+                const FString DependencyPath = Dependency.ToString();
+                if (!PackagePathMatchesAnyRootForMCP(DependencyPath, ForbiddenDependencyPrefixes))
+                {
+                    continue;
+                }
+
+                ++ForbiddenDependencyHitCount;
+                PackagesWithForbiddenDependencies.Add(Asset.PackageName);
+                if (ForbiddenDependencySamples.Num() < MaxSamples)
+                {
+                    ForbiddenDependencySamples.Add(FString::Printf(TEXT("%s -> %s"), *Asset.PackageName.ToString(), *DependencyPath));
+                }
+            }
+        }
+    }
+
+    TArray<FString> MissingRequiredAssets;
+    for (const FString& RequiredAssetPath : RequiredAssetPaths)
+    {
+        if (!AssetPackageNames.Contains(RequiredAssetPath))
+        {
+            MissingRequiredAssets.Add(RequiredAssetPath);
+        }
+    }
+
+    TArray<FString> ExpectedClassCountMismatches;
+    for (const TPair<FString, int32>& Pair : ExpectedClassCounts)
+    {
+        const int32 ActualCount = ClassCounts.FindRef(Pair.Key);
+        if (ActualCount != Pair.Value)
+        {
+            ExpectedClassCountMismatches.Add(FString::Printf(
+                TEXT("%s expected=%d actual=%d"),
+                *Pair.Key,
+                Pair.Value,
+                ActualCount));
+        }
+    }
+    ExpectedClassCountMismatches.Sort();
+
+    const bool bAssetCountMatchesExpected = !bHasExpectedAssetCount || Assets.Num() == ExpectedAssetCount;
+    const bool bExpectedClassCountsMatch = ExpectedClassCountMismatches.IsEmpty();
+
+    const TArray<FString> DirtyPackages = GetDirtyPackageNamesForProjectMCP();
+    TArray<FString> DirtyPackagesUnderRoot;
+    for (const FString& DirtyPackage : DirtyPackages)
+    {
+        if (PackagePathMatchesRootForMCP(DirtyPackage, RootPath))
+        {
+            DirtyPackagesUnderRoot.Add(DirtyPackage);
+        }
+    }
+
+    const bool bValidationPass =
+        (!bFailOnRedirectors || RedirectorCount == 0) &&
+        (!bFailOnForbiddenDependencies || ForbiddenDependencyHitCount == 0) &&
+        (!bFailOnDirtyPackages || DirtyPackagesUnderRoot.IsEmpty()) &&
+        MissingRequiredAssets.IsEmpty() &&
+        bAssetCountMatchesExpected &&
+        bExpectedClassCountsMatch;
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("operation"), TEXT("audit_content_root_mcp"));
+    ResultObj->SetStringField(TEXT("root_path"), RootPath);
+    ResultObj->SetBoolField(TEXT("recursive"), bRecursive);
+    ResultObj->SetBoolField(TEXT("scan_paths"), bScanPaths);
+    ResultObj->SetBoolField(TEXT("include_dependencies"), bIncludeDependencies);
+    ResultObj->SetBoolField(TEXT("include_assets"), bIncludeAssets);
+    ResultObj->SetBoolField(TEXT("validation_pass"), bValidationPass);
+    ResultObj->SetNumberField(TEXT("asset_count"), Assets.Num());
+    ResultObj->SetObjectField(TEXT("class_counts"), StringIntMapToJsonObject(ClassCounts));
+    ResultObj->SetObjectField(TEXT("folder_counts"), StringIntMapToJsonObject(FolderCounts));
+    ResultObj->SetNumberField(TEXT("redirector_count"), RedirectorCount);
+    AddStringArrayField(ResultObj, TEXT("redirector_samples"), RedirectorSamples);
+    AddStringArrayField(ResultObj, TEXT("forbidden_dependency_prefixes"), ForbiddenDependencyPrefixes);
+    ResultObj->SetNumberField(TEXT("dependency_scanned_asset_count"), DependencyScannedAssetCount);
+    ResultObj->SetNumberField(TEXT("forbidden_dependency_asset_count"), PackagesWithForbiddenDependencies.Num());
+    ResultObj->SetNumberField(TEXT("forbidden_dependency_hit_count"), ForbiddenDependencyHitCount);
+    AddStringArrayField(ResultObj, TEXT("forbidden_dependency_samples"), ForbiddenDependencySamples);
+    ResultObj->SetNumberField(TEXT("required_asset_count"), RequiredAssetPaths.Num());
+    ResultObj->SetNumberField(TEXT("missing_required_asset_count"), MissingRequiredAssets.Num());
+    AddStringArrayField(ResultObj, TEXT("required_asset_paths"), RequiredAssetPaths);
+    AddStringArrayField(ResultObj, TEXT("missing_required_assets"), MissingRequiredAssets);
+    ResultObj->SetBoolField(TEXT("has_expected_asset_count"), bHasExpectedAssetCount);
+    if (bHasExpectedAssetCount)
+    {
+        ResultObj->SetNumberField(TEXT("expected_asset_count"), ExpectedAssetCount);
+    }
+    ResultObj->SetBoolField(TEXT("asset_count_matches_expected"), bAssetCountMatchesExpected);
+    ResultObj->SetObjectField(TEXT("expected_class_counts"), StringIntMapToJsonObject(ExpectedClassCounts));
+    ResultObj->SetBoolField(TEXT("expected_class_counts_match"), bExpectedClassCountsMatch);
+    AddStringArrayField(ResultObj, TEXT("expected_class_count_mismatches"), ExpectedClassCountMismatches);
+    ResultObj->SetBoolField(TEXT("fail_on_dirty_packages"), bFailOnDirtyPackages);
+    ResultObj->SetBoolField(TEXT("fail_on_redirectors"), bFailOnRedirectors);
+    ResultObj->SetBoolField(TEXT("fail_on_forbidden_dependencies"), bFailOnForbiddenDependencies);
+    ResultObj->SetNumberField(TEXT("dirty_package_count"), DirtyPackages.Num());
+    AddStringArrayField(ResultObj, TEXT("dirty_packages"), DirtyPackages);
+    ResultObj->SetNumberField(TEXT("dirty_package_under_root_count"), DirtyPackagesUnderRoot.Num());
+    AddStringArrayField(ResultObj, TEXT("dirty_packages_under_root"), DirtyPackagesUnderRoot);
+    if (bIncludeAssets)
+    {
+        ResultObj->SetArrayField(TEXT("assets"), AssetValues);
+    }
+
+    if (bWriteReport)
+    {
+        const FString ReportPath = SaveJsonReportForMCP(
+            ResultObj,
+            BuildMCPReportFilename(RootPath, TEXT("content_root_audit")));
+        ResultObj->SetStringField(TEXT("report_path"), ReportPath);
+    }
+
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleAnalyzeBlueprintWidgetFallbacksMCP(const TSharedPtr<FJsonObject>& Params)
