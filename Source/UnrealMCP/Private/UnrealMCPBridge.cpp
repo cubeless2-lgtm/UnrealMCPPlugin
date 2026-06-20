@@ -449,6 +449,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("add_blueprint_function_parameter") ||
                      CommandType == TEXT("add_blueprint_local_variable") ||
                      CommandType == TEXT("set_blueprint_variable_metadata") ||
+                     CommandType == TEXT("set_blueprint_category_sorting") ||
                      CommandType == TEXT("add_blueprint_variable"))
             {
                 ResultJson = BlueprintNodeCommands->HandleCommand(CommandType, Params);

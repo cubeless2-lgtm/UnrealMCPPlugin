@@ -34,6 +34,7 @@
 #include "K2Node_MakeArray.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "EditorAssetLibrary.h"
 #include "GameFramework/InputSettings.h"
 #include "Camera/CameraActor.h"
 #include "Kismet/GameplayStatics.h"
@@ -2266,6 +2267,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     {
         return HandleSetBlueprintVariableMetadata(Params);
     }
+    else if (CommandType == TEXT("set_blueprint_category_sorting"))
+    {
+        return HandleSetBlueprintCategorySorting(Params);
+    }
     else if (CommandType == TEXT("add_blueprint_event_dispatcher"))
     {
         return HandleAddBlueprintEventDispatcher(Params);
@@ -3624,6 +3629,143 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintVaria
     ResultObj->SetObjectField(TEXT("verified_metadata"), VerifiedMetadata);
     ResultObj->SetObjectField(TEXT("flags"), AppliedFlags);
     ResultObj->SetNumberField(TEXT("property_flags"), static_cast<double>(*PropertyFlags));
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintCategorySorting(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    bool bAppendExisting = true;
+    if (Params->HasField(TEXT("append_existing")))
+    {
+        bAppendExisting = Params->GetBoolField(TEXT("append_existing"));
+    }
+
+    bool bSave = true;
+    if (Params->HasField(TEXT("save")))
+    {
+        bSave = Params->GetBoolField(TEXT("save"));
+    }
+
+    bool bCompile = false;
+    if (Params->HasField(TEXT("compile")))
+    {
+        bCompile = Params->GetBoolField(TEXT("compile"));
+    }
+
+    TArray<FName> PreviousOrder = Blueprint->CategorySorting;
+    TArray<FName> NewOrder;
+
+    auto AddCategory = [&NewOrder](const FString& InCategory)
+    {
+        FString CategoryString = InCategory.TrimStartAndEnd();
+        if (CategoryString.IsEmpty())
+        {
+            return;
+        }
+
+        int32 RootCategoryDelim = INDEX_NONE;
+        if (CategoryString.FindChar(TEXT('|'), RootCategoryDelim) && RootCategoryDelim != INDEX_NONE)
+        {
+            CategoryString = CategoryString.Left(RootCategoryDelim).TrimStartAndEnd();
+        }
+
+        if (!CategoryString.IsEmpty())
+        {
+            NewOrder.AddUnique(FName(*CategoryString));
+        }
+    };
+
+    const TArray<TSharedPtr<FJsonValue>>* CategoryOrderValues = nullptr;
+    if (Params->TryGetArrayField(TEXT("category_order"), CategoryOrderValues) && CategoryOrderValues)
+    {
+        for (const TSharedPtr<FJsonValue>& CategoryValue : *CategoryOrderValues)
+        {
+            if (CategoryValue.IsValid() && CategoryValue->Type == EJson::String)
+            {
+                AddCategory(CategoryValue->AsString());
+            }
+        }
+    }
+
+    FString SingleCategory;
+    if (Params->TryGetStringField(TEXT("category_to_front"), SingleCategory) ||
+        Params->TryGetStringField(TEXT("category"), SingleCategory))
+    {
+        AddCategory(SingleCategory);
+    }
+
+    if (NewOrder.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'category_order', 'category_to_front', or 'category' parameter"));
+    }
+
+    if (bAppendExisting)
+    {
+        for (const FName& CategoryName : PreviousOrder)
+        {
+            NewOrder.AddUnique(CategoryName);
+        }
+
+        for (const FBPVariableDescription& Variable : Blueprint->NewVariables)
+        {
+            AddCategory(Variable.Category.ToString());
+        }
+
+        for (const FBPVariableDescription& Variable : Blueprint->GeneratedVariables)
+        {
+            AddCategory(Variable.Category.ToString());
+        }
+    }
+
+    const bool bChanged = NewOrder != PreviousOrder;
+    if (bChanged)
+    {
+        Blueprint->Modify();
+        Blueprint->CategorySorting = NewOrder;
+        FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+        Blueprint->MarkPackageDirty();
+
+        if (bCompile)
+        {
+            FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        }
+    }
+
+    bool bSaved = false;
+    if (bSave && (bChanged || Blueprint->GetOutermost()->IsDirty()))
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
+    }
+
+    auto NamesToJson = [](const TArray<FName>& Names)
+    {
+        TArray<TSharedPtr<FJsonValue>> Values;
+        for (const FName& Name : Names)
+        {
+            Values.Add(MakeShared<FJsonValueString>(Name.ToString()));
+        }
+        return Values;
+    };
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+    ResultObj->SetArrayField(TEXT("previous_category_order"), NamesToJson(PreviousOrder));
+    ResultObj->SetArrayField(TEXT("category_order"), NamesToJson(NewOrder));
+    ResultObj->SetBoolField(TEXT("changed"), bChanged);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("compiled"), bCompile && bChanged);
     return ResultObj;
 }
 
