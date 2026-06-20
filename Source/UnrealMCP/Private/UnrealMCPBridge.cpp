@@ -24,6 +24,9 @@
 #include "Kismet/GameplayStatics.h"
 #include "Async/Async.h"
 #include "Containers/Ticker.h"
+#include "HAL/PlatformMisc.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 // Add Blueprint related includes
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
@@ -67,6 +70,30 @@
 #define MCP_SERVER_HOST "127.0.0.1"
 #define MCP_SERVER_PORT 55557
 
+namespace
+{
+uint16 ResolveUnrealMCPBridgePort()
+{
+    int32 ParsedPort = MCP_SERVER_PORT;
+
+    const FString EnvPort = FPlatformMisc::GetEnvironmentVariable(TEXT("UNREAL_MCP_PORT"));
+    if (!EnvPort.IsEmpty())
+    {
+        ParsedPort = FCString::Atoi(*EnvPort);
+    }
+
+    FParse::Value(FCommandLine::Get(), TEXT("UnrealMCPPort="), ParsedPort);
+
+    if (ParsedPort <= 0 || ParsedPort > TNumericLimits<uint16>::Max())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("UnrealMCPBridge: Invalid port override '%d'; falling back to %d"), ParsedPort, MCP_SERVER_PORT);
+        return MCP_SERVER_PORT;
+    }
+
+    return static_cast<uint16>(ParsedPort);
+}
+}
+
 UUnrealMCPBridge::UUnrealMCPBridge()
 {
     EditorCommands = MakeShared<FUnrealMCPEditorCommands>();
@@ -101,7 +128,7 @@ void UUnrealMCPBridge::Initialize(FSubsystemCollectionBase& Collection)
     ConnectionSocket = nullptr;
     ServerRunnable = nullptr;
     ServerThread = nullptr;
-    Port = MCP_SERVER_PORT;
+    Port = ResolveUnrealMCPBridgePort();
     FIPv4Address::Parse(MCP_SERVER_HOST, ServerAddress);
 
     // Start the server automatically
