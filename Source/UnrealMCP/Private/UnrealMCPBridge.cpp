@@ -375,6 +375,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("list_viewport_bookmarks") ||
                      CommandType == TEXT("capture_viewport_bookmark_screenshot") ||
                      CommandType == TEXT("open_editor_level") ||
+                     CommandType == TEXT("get_editor_level_open_status") ||
                      CommandType == TEXT("safe_new_preview_map") ||
                      CommandType == TEXT("open_niagara_preview_player") ||
                      CommandType == TEXT("get_niagara_preview_player_state") ||
@@ -450,6 +451,7 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("add_blueprint_local_variable") ||
                      CommandType == TEXT("set_blueprint_variable_metadata") ||
                      CommandType == TEXT("set_blueprint_category_sorting") ||
+                     CommandType == TEXT("bind_pcg_generation_settings_to_blueprint") ||
                      CommandType == TEXT("add_blueprint_variable"))
             {
                 ResultJson = BlueprintNodeCommands->HandleCommand(CommandType, Params);

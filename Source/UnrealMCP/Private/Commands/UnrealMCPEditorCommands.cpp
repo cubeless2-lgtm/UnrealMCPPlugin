@@ -14,6 +14,8 @@
 #include "Misc/Paths.h"
 #include "Templates/UnrealTemplate.h"
 #include "HAL/FileManager.h"
+#include "Containers/Ticker.h"
+#include "Misc/Guid.h"
 #include "GameFramework/Actor.h"
 #include "Engine/Selection.h"
 #include "Engine/World.h"
@@ -36,6 +38,15 @@
 
 namespace
 {
+    struct FDeferredEditorLevelOpenState
+    {
+        bool bPending = false;
+        FString RequestId;
+        TSharedPtr<FJsonObject> LastStatus;
+    };
+
+    FDeferredEditorLevelOpenState GDeferredEditorLevelOpenState;
+
     TArray<TSharedPtr<FJsonValue>> EditorVectorToJsonArray(const FVector& Value)
     {
         TArray<TSharedPtr<FJsonValue>> Array;
@@ -136,14 +147,14 @@ namespace
         return World->GetOutermost()->GetName();
     }
 
-    void AddDirtyPackageSummary(TSharedPtr<FJsonObject>& ResultObj)
+    void AddDirtyPackageSummary(const TSharedPtr<FJsonObject>& ResultObj)
     {
         const TArray<FString> DirtyPackageNames = GetDirtyPackageNames();
         ResultObj->SetNumberField(TEXT("dirty_package_count"), DirtyPackageNames.Num());
         ResultObj->SetArrayField(TEXT("dirty_packages"), StringArrayToJsonArray(DirtyPackageNames));
     }
 
-    void AddDirtyPackageCommandDelta(TSharedPtr<FJsonObject>& ResultObj, const TArray<FString>& DirtyPackagesBefore)
+    void AddDirtyPackageCommandDelta(const TSharedPtr<FJsonObject>& ResultObj, const TArray<FString>& DirtyPackagesBefore)
     {
         const TArray<FString> DirtyPackagesAfter = GetDirtyPackageNames();
 
@@ -188,6 +199,12 @@ namespace
         ResultObj->SetArrayField(TEXT("dirty_packages_added_by_command"), StringArrayToJsonArray(AddedPackages));
         ResultObj->SetNumberField(TEXT("dirty_package_removed_count"), RemovedPackages.Num());
         ResultObj->SetArrayField(TEXT("dirty_packages_removed_by_command"), StringArrayToJsonArray(RemovedPackages));
+    }
+
+    void AddCurrentEditorLevelState(const TSharedPtr<FJsonObject>& ResultObj)
+    {
+        ResultObj->SetStringField(TEXT("current_world_package_name_now"), GetCurrentEditorWorldPackageName());
+        AddDirtyPackageSummary(ResultObj);
     }
 
     TSharedPtr<FJsonObject> CaptureActiveEditorViewportToPng(
@@ -661,6 +678,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleOpenEditorLevel(Params);
     }
+    else if (CommandType == TEXT("get_editor_level_open_status"))
+    {
+        return HandleGetEditorLevelOpenStatus(Params);
+    }
     else if (CommandType == TEXT("safe_new_preview_map"))
     {
         return HandleSafeNewPreviewMap(Params);
@@ -866,6 +887,10 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TS
     bool bShowProgress = true;
     Params->TryGetBoolField(TEXT("show_progress"), bShowProgress);
 
+    double DeferredLoadDelaySeconds = 1.0;
+    Params->TryGetNumberField(TEXT("deferred_load_delay_seconds"), DeferredLoadDelaySeconds);
+    DeferredLoadDelaySeconds = FMath::Clamp(DeferredLoadDelaySeconds, 0.0, 30.0);
+
     const FString TargetLongPackageName = NormalizeLevelPackageName(RequestedLevelPath);
     FText InvalidPackageReason;
     if (TargetLongPackageName.IsEmpty() ||
@@ -895,6 +920,14 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TS
     {
         BlockedReasons.Add(TEXT("dirty_packages_present"));
     }
+    if (!bAlreadyOpen && IsPlayInEditorActive())
+    {
+        BlockedReasons.Add(TEXT("pie_or_sie_active"));
+    }
+    if (!bAlreadyOpen && GDeferredEditorLevelOpenState.bPending)
+    {
+        BlockedReasons.Add(TEXT("editor_level_open_already_pending"));
+    }
 
     TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
     ResultObj->SetBoolField(TEXT("success"), true);
@@ -907,6 +940,8 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TS
     ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
     ResultObj->SetBoolField(TEXT("allow_dirty_packages"), bAllowDirtyPackages);
     ResultObj->SetBoolField(TEXT("can_load"), BlockedReasons.Num() == 0 || bAlreadyOpen);
+    ResultObj->SetBoolField(TEXT("deferred_real_load"), true);
+    ResultObj->SetNumberField(TEXT("deferred_load_delay_seconds"), DeferredLoadDelaySeconds);
     ResultObj->SetArrayField(TEXT("blocked_reasons"), StringArrayToJsonArray(BlockedReasons));
     ResultObj->SetNumberField(TEXT("dirty_package_count_before"), DirtyPackagesBeforeCommand.Num());
     ResultObj->SetArrayField(TEXT("dirty_packages_before"), StringArrayToJsonArray(DirtyPackagesBeforeCommand));
@@ -923,18 +958,97 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleOpenEditorLevel(const TS
         return ResultObj;
     }
 
-    const bool bLoaded = FEditorFileUtils::LoadMap(TargetFilename, bLoadAsTemplate, bShowProgress);
-    ResultObj->SetBoolField(TEXT("load_attempted"), true);
-    ResultObj->SetBoolField(TEXT("loaded"), bLoaded);
-    ResultObj->SetStringField(TEXT("current_world_package_name_after"), GetCurrentEditorWorldPackageName());
-    AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+    const FString RequestId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
+    ResultObj->SetStringField(TEXT("request_id"), RequestId);
+    ResultObj->SetStringField(TEXT("open_status"), TEXT("scheduled"));
+    ResultObj->SetBoolField(TEXT("load_attempted"), false);
+    ResultObj->SetBoolField(TEXT("load_scheduled"), true);
+    ResultObj->SetBoolField(TEXT("loaded"), false);
+    ResultObj->SetStringField(TEXT("message"), TEXT("Editor level load was scheduled for a later editor tick. Poll get_editor_level_open_status for completion."));
 
-    if (!bLoaded)
+    GDeferredEditorLevelOpenState.bPending = true;
+    GDeferredEditorLevelOpenState.RequestId = RequestId;
+    GDeferredEditorLevelOpenState.LastStatus = ResultObj;
+
+    FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateLambda([
+            RequestId,
+            TargetFilename,
+            TargetLongPackageName,
+            bLoadAsTemplate,
+            bShowProgress,
+            DirtyPackagesBeforeCommand,
+            ResultObj](float)
+        {
+            if (GDeferredEditorLevelOpenState.RequestId != RequestId)
+            {
+                return false;
+            }
+
+            ResultObj->SetStringField(TEXT("open_status"), TEXT("loading"));
+            ResultObj->SetBoolField(TEXT("load_attempted"), true);
+            ResultObj->SetBoolField(TEXT("load_scheduled"), false);
+            ResultObj->SetStringField(TEXT("load_started_world_package_name"), GetCurrentEditorWorldPackageName());
+
+            const bool bLoaded = FEditorFileUtils::LoadMap(TargetFilename, bLoadAsTemplate, bShowProgress);
+            ResultObj->SetBoolField(TEXT("loaded"), bLoaded);
+            ResultObj->SetStringField(TEXT("current_world_package_name_after"), GetCurrentEditorWorldPackageName());
+            ResultObj->SetBoolField(TEXT("target_world_is_current"), GetCurrentEditorWorldPackageName() == TargetLongPackageName);
+            AddDirtyPackageCommandDelta(ResultObj, DirtyPackagesBeforeCommand);
+            AddCurrentEditorLevelState(ResultObj);
+
+            GDeferredEditorLevelOpenState.bPending = false;
+            if (!bLoaded)
+            {
+                ResultObj->SetBoolField(TEXT("success"), false);
+                ResultObj->SetStringField(TEXT("open_status"), TEXT("failed"));
+                ResultObj->SetStringField(TEXT("message"), TEXT("FEditorFileUtils::LoadMap returned false"));
+            }
+            else
+            {
+                ResultObj->SetBoolField(TEXT("success"), true);
+                ResultObj->SetStringField(TEXT("open_status"), TEXT("loaded"));
+                ResultObj->SetStringField(TEXT("message"), TEXT("Editor level load completed"));
+            }
+
+            return false;
+        }),
+        static_cast<float>(DeferredLoadDelaySeconds));
+
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleGetEditorLevelOpenStatus(const TSharedPtr<FJsonObject>& Params)
+{
+    FString RequestId;
+    if (Params.IsValid())
     {
-        ResultObj->SetBoolField(TEXT("success"), false);
-        ResultObj->SetStringField(TEXT("message"), TEXT("FEditorFileUtils::LoadMap returned false"));
+        Params->TryGetStringField(TEXT("request_id"), RequestId);
     }
 
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetBoolField(TEXT("has_request"), GDeferredEditorLevelOpenState.LastStatus.IsValid());
+    ResultObj->SetBoolField(TEXT("pending"), GDeferredEditorLevelOpenState.bPending);
+    AddCurrentEditorLevelState(ResultObj);
+
+    if (!GDeferredEditorLevelOpenState.LastStatus.IsValid())
+    {
+        ResultObj->SetStringField(TEXT("open_status"), TEXT("none"));
+        return ResultObj;
+    }
+
+    const bool bRequestMatches = RequestId.IsEmpty() || RequestId == GDeferredEditorLevelOpenState.RequestId;
+    ResultObj->SetBoolField(TEXT("request_matches"), bRequestMatches);
+    ResultObj->SetStringField(TEXT("request_id"), GDeferredEditorLevelOpenState.RequestId);
+    if (!bRequestMatches)
+    {
+        ResultObj->SetStringField(TEXT("open_status"), TEXT("request_id_mismatch"));
+        ResultObj->SetObjectField(TEXT("last_open_status"), GDeferredEditorLevelOpenState.LastStatus);
+        return ResultObj;
+    }
+
+    ResultObj->SetObjectField(TEXT("last_open_status"), GDeferredEditorLevelOpenState.LastStatus);
     return ResultObj;
 }
 

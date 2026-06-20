@@ -45,5 +45,6 @@ private:
 
     // Level management commands
     TSharedPtr<FJsonObject> HandleOpenEditorLevel(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleGetEditorLevelOpenStatus(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSafeNewPreviewMap(const TSharedPtr<FJsonObject>& Params);
 };

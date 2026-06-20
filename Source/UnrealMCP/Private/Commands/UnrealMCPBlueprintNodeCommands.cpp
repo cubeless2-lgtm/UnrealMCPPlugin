@@ -2,6 +2,8 @@
 #include "Commands/UnrealMCPCommonUtils.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
@@ -48,6 +50,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/Class.h"
+#include "PCGComponent.h"
 
 #include <initializer_list>
 
@@ -2111,6 +2114,341 @@ void AddGraphField(TSharedPtr<FJsonObject> ResultObj, const UBlueprint* Blueprin
     }
 }
 
+UEdGraphPin* FindFirstPinByCategory(UEdGraphNode* Node, EEdGraphPinDirection Direction, const FName& Category)
+{
+    if (!Node)
+    {
+        return nullptr;
+    }
+
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == Direction && Pin->PinType.PinCategory == Category)
+        {
+            return Pin;
+        }
+    }
+
+    return nullptr;
+}
+
+UEdGraphPin* FindFirstDataOutputPin(UEdGraphNode* Node)
+{
+    if (!Node)
+    {
+        return nullptr;
+    }
+
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (Pin && Pin->Direction == EGPD_Output && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+        {
+            return Pin;
+        }
+    }
+
+    return nullptr;
+}
+
+UEdGraphPin* FindInputPinByNames(UEdGraphNode* Node, std::initializer_list<const TCHAR*> Names)
+{
+    if (!Node)
+    {
+        return nullptr;
+    }
+
+    for (const TCHAR* Name : Names)
+    {
+        if (UEdGraphPin* Pin = FUnrealMCPCommonUtils::FindPin(Node, Name, EGPD_Input))
+        {
+            return Pin;
+        }
+    }
+
+    return nullptr;
+}
+
+UK2Node_FunctionEntry* FindFunctionEntryNode(UEdGraph* Graph)
+{
+    if (!Graph)
+    {
+        return nullptr;
+    }
+
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (UK2Node_FunctionEntry* EntryNode = Cast<UK2Node_FunctionEntry>(Node))
+        {
+            return EntryNode;
+        }
+    }
+
+    return nullptr;
+}
+
+UK2Node_VariableGet* CreateSelfVariableGetNode(UEdGraph* Graph, const FString& VariableName, const FVector2D& Position)
+{
+    if (!Graph || VariableName.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    UK2Node_VariableGet* VariableGetNode = NewObject<UK2Node_VariableGet>(Graph);
+    if (!VariableGetNode)
+    {
+        return nullptr;
+    }
+
+    VariableGetNode->VariableReference.SetSelfMember(FName(*VariableName));
+    VariableGetNode->NodePosX = Position.X;
+    VariableGetNode->NodePosY = Position.Y;
+    Graph->AddNode(VariableGetNode, true);
+    VariableGetNode->CreateNewGuid();
+    VariableGetNode->PostPlacedNewNode();
+    VariableGetNode->AllocateDefaultPins();
+    VariableGetNode->ReconstructNode();
+
+    return VariableGetNode;
+}
+
+bool BlueprintHasMemberVariableOrComponent(UBlueprint* Blueprint, const FString& VariableName)
+{
+    if (!Blueprint || VariableName.IsEmpty())
+    {
+        return false;
+    }
+
+    const FName VarName(*VariableName);
+    if ((Blueprint->GeneratedClass && FindFProperty<FProperty>(Blueprint->GeneratedClass, VarName)) ||
+        (Blueprint->SkeletonGeneratedClass && FindFProperty<FProperty>(Blueprint->SkeletonGeneratedClass, VarName)) ||
+        (Blueprint->ParentClass && FindFProperty<FProperty>(Blueprint->ParentClass, VarName)))
+    {
+        return true;
+    }
+
+    for (const FBPVariableDescription& VariableDescription : Blueprint->NewVariables)
+    {
+        if (VariableDescription.VarName == VarName)
+        {
+            return true;
+        }
+    }
+
+    if (Blueprint->SimpleConstructionScript)
+    {
+        for (USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
+        {
+            if (Node && Node->GetVariableName() == VarName)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+UPCGComponent* FindPCGComponentTemplate(UBlueprint* Blueprint, const FString& ComponentVariableName)
+{
+    if (!Blueprint || !Blueprint->SimpleConstructionScript)
+    {
+        return nullptr;
+    }
+
+    const FName ComponentName(*ComponentVariableName);
+    for (USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
+    {
+        if (Node && Node->GetVariableName() == ComponentName)
+        {
+            return Cast<UPCGComponent>(Node->ComponentTemplate);
+        }
+    }
+
+    return nullptr;
+}
+
+bool TryReadBoolDefaultFromBlueprintCDO(UBlueprint* Blueprint, const FString& VariableName, bool& OutValue)
+{
+    if (!Blueprint || !Blueprint->GeneratedClass)
+    {
+        return false;
+    }
+
+    UObject* CDO = Blueprint->GeneratedClass->GetDefaultObject();
+    FBoolProperty* BoolProperty = FindFProperty<FBoolProperty>(Blueprint->GeneratedClass, FName(*VariableName));
+    if (!CDO || !BoolProperty)
+    {
+        return false;
+    }
+
+    OutValue = BoolProperty->GetPropertyValue_InContainer(CDO);
+    return true;
+}
+
+bool TryReadGenerationTriggerDefaultFromBlueprintCDO(UBlueprint* Blueprint, const FString& VariableName, EPCGComponentGenerationTrigger& OutValue)
+{
+    if (!Blueprint || !Blueprint->GeneratedClass)
+    {
+        return false;
+    }
+
+    UObject* CDO = Blueprint->GeneratedClass->GetDefaultObject();
+    FProperty* Property = FindFProperty<FProperty>(Blueprint->GeneratedClass, FName(*VariableName));
+    if (!CDO || !Property)
+    {
+        return false;
+    }
+
+    if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+    {
+        const void* PropertyAddress = EnumProperty->ContainerPtrToValuePtr<void>(CDO);
+        const int64 IntegerValue = EnumProperty->GetUnderlyingProperty()->GetSignedIntPropertyValue(PropertyAddress);
+        OutValue = static_cast<EPCGComponentGenerationTrigger>(IntegerValue);
+        return true;
+    }
+
+    if (FByteProperty* ByteProperty = CastField<FByteProperty>(Property))
+    {
+        const uint8 ByteValue = ByteProperty->GetPropertyValue_InContainer(CDO);
+        OutValue = static_cast<EPCGComponentGenerationTrigger>(ByteValue);
+        return true;
+    }
+
+    return false;
+}
+
+FString GetPCGGenerationTriggerName(EPCGComponentGenerationTrigger Trigger)
+{
+    if (const UEnum* Enum = StaticEnum<EPCGComponentGenerationTrigger>())
+    {
+        return Enum->GetNameStringByValue(static_cast<int64>(Trigger));
+    }
+
+    return FString::FromInt(static_cast<int32>(Trigger));
+}
+
+FString GetBlueprintNodeStatusName(EBlueprintStatus Status)
+{
+    switch (Status)
+    {
+    case BS_Unknown:
+        return TEXT("unknown");
+    case BS_Dirty:
+        return TEXT("dirty");
+    case BS_Error:
+        return TEXT("error");
+    case BS_UpToDate:
+        return TEXT("up_to_date");
+    case BS_BeingCreated:
+        return TEXT("being_created");
+    case BS_UpToDateWithWarnings:
+        return TEXT("up_to_date_with_warnings");
+    default:
+        return TEXT("unknown");
+    }
+}
+
+bool ConnectPinsWithSchema(const UEdGraphSchema_K2* K2Schema, UEdGraphPin* SourcePin, UEdGraphPin* TargetPin, FString& OutError)
+{
+    if (!K2Schema || !SourcePin || !TargetPin)
+    {
+        OutError = TEXT("Invalid pin connection request");
+        return false;
+    }
+
+    const FPinConnectionResponse Response = K2Schema->CanCreateConnection(SourcePin, TargetPin);
+    if (!Response.CanSafeConnect() && Response.Response == CONNECT_RESPONSE_DISALLOW)
+    {
+        OutError = Response.Message.ToString();
+        return false;
+    }
+
+    if (!K2Schema->TryCreateConnection(SourcePin, TargetPin))
+    {
+        OutError = TEXT("K2 schema failed to create connection");
+        return false;
+    }
+
+    return true;
+}
+
+void DestroyCreatedNodes(const TArray<UEdGraphNode*>& Nodes)
+{
+    for (UEdGraphNode* Node : Nodes)
+    {
+        if (Node)
+        {
+            Node->DestroyNode();
+        }
+    }
+}
+
+void RestoreExecLinks(const UEdGraphSchema_K2* K2Schema, UEdGraphPin* ExecSourcePin, const TArray<UEdGraphPin*>& ExecTargetPins)
+{
+    if (!K2Schema || !ExecSourcePin)
+    {
+        return;
+    }
+
+    ExecSourcePin->BreakAllPinLinks();
+    for (UEdGraphPin* TargetPin : ExecTargetPins)
+    {
+        if (TargetPin)
+        {
+            K2Schema->TryCreateConnection(ExecSourcePin, TargetPin);
+        }
+    }
+}
+
+int32 RemoveExistingFunctionCallNodesAndBridgeExec(
+    UEdGraph* Graph,
+    UFunction* Function,
+    const UEdGraphSchema_K2* K2Schema,
+    const TArray<UEdGraphNode*>& NodesToKeep)
+{
+    if (!Graph || !Function || !K2Schema)
+    {
+        return 0;
+    }
+
+    TArray<UK2Node_CallFunction*> NodesToRemove;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        UK2Node_CallFunction* FunctionNode = Cast<UK2Node_CallFunction>(Node);
+        if (FunctionNode && FunctionNode->GetTargetFunction() == Function && !NodesToKeep.Contains(FunctionNode))
+        {
+            NodesToRemove.Add(FunctionNode);
+        }
+    }
+
+    int32 RemovedCount = 0;
+    for (UK2Node_CallFunction* FunctionNode : NodesToRemove)
+    {
+        UEdGraphPin* ExecInputPin = FindFirstPinByCategory(FunctionNode, EGPD_Input, UEdGraphSchema_K2::PC_Exec);
+        UEdGraphPin* ExecOutputPin = FindFirstPinByCategory(FunctionNode, EGPD_Output, UEdGraphSchema_K2::PC_Exec);
+
+        TArray<UEdGraphPin*> InputSourcePins = ExecInputPin ? ExecInputPin->LinkedTo : TArray<UEdGraphPin*>();
+        TArray<UEdGraphPin*> OutputTargetPins = ExecOutputPin ? ExecOutputPin->LinkedTo : TArray<UEdGraphPin*>();
+
+        FunctionNode->BreakAllNodeLinks();
+        for (UEdGraphPin* SourcePin : InputSourcePins)
+        {
+            for (UEdGraphPin* TargetPin : OutputTargetPins)
+            {
+                if (SourcePin && TargetPin)
+                {
+                    K2Schema->TryCreateConnection(SourcePin, TargetPin);
+                }
+            }
+        }
+
+        FunctionNode->DestroyNode();
+        ++RemovedCount;
+    }
+
+    return RemovedCount;
+}
+
 template <typename NodeType>
 NodeType* AddK2NodeToGraph(UEdGraph* Graph, const FVector2D& NodePosition)
 {
@@ -2270,6 +2608,10 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleCommand(const FSt
     else if (CommandType == TEXT("set_blueprint_category_sorting"))
     {
         return HandleSetBlueprintCategorySorting(Params);
+    }
+    else if (CommandType == TEXT("bind_pcg_generation_settings_to_blueprint"))
+    {
+        return HandleBindPCGGenerationSettingsToBlueprint(Params);
     }
     else if (CommandType == TEXT("add_blueprint_event_dispatcher"))
     {
@@ -3766,6 +4108,310 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintCateg
     ResultObj->SetBoolField(TEXT("changed"), bChanged);
     ResultObj->SetBoolField(TEXT("saved"), bSaved);
     ResultObj->SetBoolField(TEXT("compiled"), bCompile && bChanged);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleBindPCGGenerationSettingsToBlueprint(const TSharedPtr<FJsonObject>& Params)
+{
+    FString BlueprintName;
+    if (!Params->TryGetStringField(TEXT("blueprint_name"), BlueprintName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'blueprint_name' parameter"));
+    }
+
+    const FString ComponentVariableName = GetStringParam(Params, TEXT("component_variable"), TEXT("ForestPCG"));
+    const FString GenerationTriggerVariableName = GetStringParam(Params, TEXT("generation_trigger_variable"), TEXT("PCGGenerationTrigger"));
+    const FString RegenerateInEditorVariableName = GetStringParam(Params, TEXT("regenerate_in_editor_variable"), TEXT("PCGRegenerateInEditor"));
+    const FString GenerateOnDropVariableName = GetStringParam(Params, TEXT("generate_on_drop_variable"));
+    const bool bGenerateOnDropDefault = GetBoolParam(Params, TEXT("generate_on_drop_default"), false);
+    const bool bReplaceExisting = GetBoolParam(Params, TEXT("replace_existing"), true);
+    const bool bSyncComponentTemplateDefaults = GetBoolParam(Params, TEXT("sync_component_template_defaults"), true);
+    const bool bCompile = GetBoolParam(Params, TEXT("compile"), false);
+    const bool bSave = GetBoolParam(Params, TEXT("save"), false);
+    const FString FunctionClassName = GetStringParam(
+        Params,
+        TEXT("function_class"),
+        GetStringParam(Params, TEXT("function_class_path")));
+    const FString FunctionName = GetStringParam(Params, TEXT("function_name"), TEXT("ApplyPCGGenerationSettings"));
+
+    if (FunctionClassName.IsEmpty())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            TEXT("Missing 'function_class' parameter. Provide a runtime BlueprintFunctionLibrary class that owns ApplyPCGGenerationSettings."));
+    }
+
+    UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
+    if (!Blueprint)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint not found: %s"), *BlueprintName));
+    }
+
+    if (!BlueprintHasMemberVariableOrComponent(Blueprint, ComponentVariableName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint component variable not found: %s"), *ComponentVariableName));
+    }
+    if (!BlueprintHasMemberVariableOrComponent(Blueprint, GenerationTriggerVariableName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint generation trigger variable not found: %s"), *GenerationTriggerVariableName));
+    }
+    if (!BlueprintHasMemberVariableOrComponent(Blueprint, RegenerateInEditorVariableName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint regenerate-in-editor variable not found: %s"), *RegenerateInEditorVariableName));
+    }
+    if (!GenerateOnDropVariableName.IsEmpty() && !BlueprintHasMemberVariableOrComponent(Blueprint, GenerateOnDropVariableName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Blueprint generate-on-drop variable not found: %s"), *GenerateOnDropVariableName));
+    }
+
+    FString GraphName = GetStringParam(Params, TEXT("graph_name"), TEXT("UserConstructionScript"));
+    FString GraphId = GetStringParam(Params, TEXT("graph_id"));
+    FString GraphType = GetStringParam(Params, TEXT("graph_type"), TEXT("function"));
+    TSharedPtr<FJsonObject> GraphParams = MakeShared<FJsonObject>();
+    GraphParams->SetStringField(TEXT("graph_name"), GraphName);
+    GraphParams->SetStringField(TEXT("graph_id"), GraphId);
+    GraphParams->SetStringField(TEXT("graph_type"), GraphType);
+
+    FString GraphError;
+    bool bGraphCreated = false;
+    UEdGraph* TargetGraph = ResolveBlueprintGraph(Blueprint, GraphParams, false, bGraphCreated, GraphError);
+    if (!TargetGraph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(GraphError.IsEmpty() ? TEXT("Failed to resolve UserConstructionScript graph") : GraphError);
+    }
+
+    UK2Node_FunctionEntry* EntryNode = FindFunctionEntryNode(TargetGraph);
+    if (!EntryNode)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Function entry node not found in target Blueprint graph"));
+    }
+
+    const UEdGraphSchema_K2* K2Schema = Cast<const UEdGraphSchema_K2>(TargetGraph->GetSchema());
+    if (!K2Schema)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get K2 schema"));
+    }
+
+    UClass* ApplyFunctionClass = LoadClassForPin(FunctionClassName);
+    if (!ApplyFunctionClass)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Apply function class not found: %s"), *FunctionClassName));
+    }
+
+    FString FunctionError;
+    UFunction* ApplyFunction = ResolveFunctionByName(ApplyFunctionClass, FunctionName, FunctionError);
+    if (!ApplyFunction)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FunctionError.IsEmpty() ? TEXT("ApplyPCGGenerationSettings function not found") : FunctionError);
+    }
+
+    FString ValidationError;
+    if (!ValidateBlueprintCallableFunction(ApplyFunction, false, false, true, true, false, ValidationError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ValidationError);
+    }
+
+    TargetGraph->Modify();
+    Blueprint->Modify();
+
+    UEdGraphPin* EntryThenPin = FindFirstPinByCategory(EntryNode, EGPD_Output, UEdGraphSchema_K2::PC_Exec);
+    if (!EntryThenPin)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Function entry exec output pin not found"));
+    }
+
+    const FVector2D EntryPosition(EntryNode->NodePosX, EntryNode->NodePosY);
+    UK2Node_CallFunction* ApplyNode = FUnrealMCPCommonUtils::CreateFunctionCallNode(
+        TargetGraph,
+        ApplyFunction,
+        EntryPosition + FVector2D(300.0f, 0.0f));
+    if (!ApplyNode)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create ApplyPCGGenerationSettings node"));
+    }
+
+    UK2Node_VariableGet* ComponentGetNode = CreateSelfVariableGetNode(
+        TargetGraph,
+        ComponentVariableName,
+        EntryPosition + FVector2D(40.0f, 160.0f));
+    UK2Node_VariableGet* GenerationTriggerGetNode = CreateSelfVariableGetNode(
+        TargetGraph,
+        GenerationTriggerVariableName,
+        EntryPosition + FVector2D(40.0f, 300.0f));
+    UK2Node_VariableGet* RegenerateGetNode = CreateSelfVariableGetNode(
+        TargetGraph,
+        RegenerateInEditorVariableName,
+        EntryPosition + FVector2D(40.0f, 430.0f));
+    UK2Node_VariableGet* GenerateOnDropGetNode = GenerateOnDropVariableName.IsEmpty()
+        ? nullptr
+        : CreateSelfVariableGetNode(TargetGraph, GenerateOnDropVariableName, EntryPosition + FVector2D(40.0f, 560.0f));
+
+    TArray<UEdGraphNode*> CreatedNodes;
+    CreatedNodes.Add(ApplyNode);
+    if (ComponentGetNode) { CreatedNodes.Add(ComponentGetNode); }
+    if (GenerationTriggerGetNode) { CreatedNodes.Add(GenerationTriggerGetNode); }
+    if (RegenerateGetNode) { CreatedNodes.Add(RegenerateGetNode); }
+    if (GenerateOnDropGetNode) { CreatedNodes.Add(GenerateOnDropGetNode); }
+
+    if (!ComponentGetNode || !GenerationTriggerGetNode || !RegenerateGetNode || (!GenerateOnDropVariableName.IsEmpty() && !GenerateOnDropGetNode))
+    {
+        DestroyCreatedNodes(CreatedNodes);
+        TargetGraph->NotifyGraphChanged();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to create one or more variable getter nodes"));
+    }
+
+    FString ConnectError;
+    UEdGraphPin* ApplyExecInputPin = FindFirstPinByCategory(ApplyNode, EGPD_Input, UEdGraphSchema_K2::PC_Exec);
+    UEdGraphPin* ApplyExecOutputPin = FindFirstPinByCategory(ApplyNode, EGPD_Output, UEdGraphSchema_K2::PC_Exec);
+
+    UEdGraphPin* ComponentOutputPin = FindFirstDataOutputPin(ComponentGetNode);
+    UEdGraphPin* GenerationTriggerOutputPin = FindFirstDataOutputPin(GenerationTriggerGetNode);
+    UEdGraphPin* RegenerateOutputPin = FindFirstDataOutputPin(RegenerateGetNode);
+    UEdGraphPin* GenerateOnDropOutputPin = GenerateOnDropGetNode ? FindFirstDataOutputPin(GenerateOnDropGetNode) : nullptr;
+
+    UEdGraphPin* ComponentInputPin = FindInputPinByNames(ApplyNode, { TEXT("PCGComponent") });
+    UEdGraphPin* GenerationTriggerInputPin = FindInputPinByNames(ApplyNode, { TEXT("GenerationTrigger") });
+    UEdGraphPin* RegenerateInputPin = FindInputPinByNames(ApplyNode, { TEXT("bRegenerateInEditor"), TEXT("RegenerateInEditor") });
+    UEdGraphPin* GenerateOnDropInputPin = FindInputPinByNames(ApplyNode, { TEXT("bGenerateOnDropWhenTriggerOnDemand"), TEXT("GenerateOnDropWhenTriggerOnDemand") });
+
+    if (!ConnectPinsWithSchema(K2Schema, ComponentOutputPin, ComponentInputPin, ConnectError) ||
+        !ConnectPinsWithSchema(K2Schema, GenerationTriggerOutputPin, GenerationTriggerInputPin, ConnectError) ||
+        !ConnectPinsWithSchema(K2Schema, RegenerateOutputPin, RegenerateInputPin, ConnectError))
+    {
+        DestroyCreatedNodes(CreatedNodes);
+        TargetGraph->NotifyGraphChanged();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to connect PCG generation settings pins: %s"), *ConnectError));
+    }
+
+    bool bGenerateOnDropConnected = false;
+    if (GenerateOnDropOutputPin)
+    {
+        bGenerateOnDropConnected = ConnectPinsWithSchema(K2Schema, GenerateOnDropOutputPin, GenerateOnDropInputPin, ConnectError);
+        if (!bGenerateOnDropConnected)
+        {
+            DestroyCreatedNodes(CreatedNodes);
+            TargetGraph->NotifyGraphChanged();
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to connect generate-on-drop pin: %s"), *ConnectError));
+        }
+    }
+    else if (GenerateOnDropInputPin)
+    {
+        K2Schema->TrySetDefaultValue(*GenerateOnDropInputPin, bGenerateOnDropDefault ? TEXT("true") : TEXT("false"));
+    }
+
+    if (!ApplyExecInputPin || !ApplyExecOutputPin)
+    {
+        DestroyCreatedNodes(CreatedNodes);
+        TargetGraph->NotifyGraphChanged();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("ApplyPCGGenerationSettings node is missing exec pins"));
+    }
+
+    const int32 RemovedExistingNodeCount = bReplaceExisting
+        ? RemoveExistingFunctionCallNodesAndBridgeExec(TargetGraph, ApplyFunction, K2Schema, CreatedNodes)
+        : 0;
+
+    TArray<UEdGraphPin*> PreviousExecTargets = EntryThenPin->LinkedTo;
+    EntryThenPin->BreakAllPinLinks();
+    if (!ConnectPinsWithSchema(K2Schema, EntryThenPin, ApplyExecInputPin, ConnectError))
+    {
+        RestoreExecLinks(K2Schema, EntryThenPin, PreviousExecTargets);
+        DestroyCreatedNodes(CreatedNodes);
+        TargetGraph->NotifyGraphChanged();
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to connect entry exec: %s"), *ConnectError));
+    }
+
+    int32 ReconnectedExecTargetCount = 0;
+    for (UEdGraphPin* PreviousTargetPin : PreviousExecTargets)
+    {
+        if (PreviousTargetPin && ConnectPinsWithSchema(K2Schema, ApplyExecOutputPin, PreviousTargetPin, ConnectError))
+        {
+            ++ReconnectedExecTargetCount;
+        }
+    }
+
+    bool bTemplateDefaultsSynced = false;
+    FString TemplateGenerationTriggerName;
+    bool bTemplateRegenerateInEditor = true;
+    bool bTemplateGenerateOnDrop = false;
+    if (bSyncComponentTemplateDefaults)
+    {
+        if (UPCGComponent* PCGComponentTemplate = FindPCGComponentTemplate(Blueprint, ComponentVariableName))
+        {
+            EPCGComponentGenerationTrigger TemplateGenerationTrigger = EPCGComponentGenerationTrigger::GenerateOnLoad;
+            TryReadGenerationTriggerDefaultFromBlueprintCDO(Blueprint, GenerationTriggerVariableName, TemplateGenerationTrigger);
+            TryReadBoolDefaultFromBlueprintCDO(Blueprint, RegenerateInEditorVariableName, bTemplateRegenerateInEditor);
+            if (!GenerateOnDropVariableName.IsEmpty())
+            {
+                TryReadBoolDefaultFromBlueprintCDO(Blueprint, GenerateOnDropVariableName, bTemplateGenerateOnDrop);
+            }
+            else
+            {
+                bTemplateGenerateOnDrop = bGenerateOnDropDefault;
+            }
+
+            PCGComponentTemplate->Modify();
+            PCGComponentTemplate->GenerationTrigger = TemplateGenerationTrigger;
+            PCGComponentTemplate->bGenerateOnDropWhenTriggerOnDemand =
+                TemplateGenerationTrigger == EPCGComponentGenerationTrigger::GenerateOnDemand && bTemplateGenerateOnDrop;
+            PCGComponentTemplate->SetAutoActivate(true);
+#if WITH_EDITORONLY_DATA
+            PCGComponentTemplate->bRegenerateInEditor = bTemplateRegenerateInEditor;
+#endif
+            PCGComponentTemplate->PostEditChange();
+            TemplateGenerationTriggerName = GetPCGGenerationTriggerName(TemplateGenerationTrigger);
+            bTemplateDefaultsSynced = true;
+        }
+    }
+
+    TargetGraph->NotifyGraphChanged();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    Blueprint->MarkPackageDirty();
+
+    bool bCompileSucceeded = true;
+    FString CompileStatusName = TEXT("not_requested");
+    if (bCompile)
+    {
+        FKismetEditorUtilities::CompileBlueprint(Blueprint);
+        CompileStatusName = GetBlueprintNodeStatusName(Blueprint->Status);
+        bCompileSucceeded = Blueprint->Status != BS_Error;
+        if (!bCompileSucceeded)
+        {
+            TSharedPtr<FJsonObject> ErrorObj = FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+                TEXT("Blueprint compile failed after binding PCG generation settings: %s"),
+                *CompileStatusName));
+            ErrorObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+            ErrorObj->SetStringField(TEXT("compile_status"), CompileStatusName);
+            ErrorObj->SetBoolField(TEXT("compiled"), false);
+            ErrorObj->SetBoolField(TEXT("saved"), false);
+            return ErrorObj;
+        }
+    }
+
+    bool bSaved = false;
+    if (bSave)
+    {
+        bSaved = UEditorAssetLibrary::SaveLoadedAsset(Blueprint, false);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetStringField(TEXT("blueprint_name"), BlueprintName);
+    ResultObj->SetStringField(TEXT("component_variable"), ComponentVariableName);
+    ResultObj->SetStringField(TEXT("generation_trigger_variable"), GenerationTriggerVariableName);
+    ResultObj->SetStringField(TEXT("regenerate_in_editor_variable"), RegenerateInEditorVariableName);
+    ResultObj->SetStringField(TEXT("generate_on_drop_variable"), GenerateOnDropVariableName);
+    ResultObj->SetStringField(TEXT("function_class"), ApplyFunctionClass->GetPathName());
+    ResultObj->SetStringField(TEXT("function_name"), ApplyFunction->GetName());
+    ResultObj->SetBoolField(TEXT("generate_on_drop_connected"), bGenerateOnDropConnected);
+    ResultObj->SetNumberField(TEXT("removed_existing_node_count"), RemovedExistingNodeCount);
+    ResultObj->SetNumberField(TEXT("reconnected_exec_target_count"), ReconnectedExecTargetCount);
+    ResultObj->SetBoolField(TEXT("template_defaults_synced"), bTemplateDefaultsSynced);
+    ResultObj->SetStringField(TEXT("template_generation_trigger"), TemplateGenerationTriggerName);
+    ResultObj->SetBoolField(TEXT("template_regenerate_in_editor"), bTemplateRegenerateInEditor);
+    ResultObj->SetBoolField(TEXT("template_generate_on_drop_when_on_demand"), bTemplateGenerateOnDrop);
+    ResultObj->SetBoolField(TEXT("compiled"), bCompile && bCompileSucceeded);
+    ResultObj->SetStringField(TEXT("compile_status"), CompileStatusName);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetObjectField(TEXT("apply_node"), NodeToJson(ApplyNode, true));
+    AddGraphField(ResultObj, Blueprint, TargetGraph);
     return ResultObj;
 }
 
