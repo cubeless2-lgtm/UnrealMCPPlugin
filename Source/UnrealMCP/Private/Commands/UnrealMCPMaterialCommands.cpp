@@ -5665,6 +5665,9 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleRefreshMaterialCachedE
     int64 ClearedStaleFunctionReferenceCount = 0;
     TArray<TSharedPtr<FJsonValue>> ClearedStaleFunctionReferenceDependencyArray;
     TArray<TSharedPtr<FJsonValue>> ClearedStaleFunctionReferenceOwnerArray;
+    int64 RemappedStaleFunctionReferenceCount = 0;
+    TArray<TSharedPtr<FJsonValue>> RemappedStaleFunctionReferenceArray;
+    TArray<TSharedPtr<FJsonValue>> MissingStaleFunctionReferenceTargetArray;
     auto ClearStaleFunctionInfos = [&]()
     {
         FMaterialCachedExpressionData& MutableCachedData = const_cast<FMaterialCachedExpressionData&>(Target.Material->GetCachedExpressionData());
@@ -5679,6 +5682,115 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleRefreshMaterialCachedE
         }
         FunctionInfoCountAfterClear = MutableCachedData.FunctionInfos.Num();
     };
+    auto RemapStaleFunctionReferences = [&]()
+    {
+        bool bReplaceStaleFunctionReferences = false;
+        if (Params->HasField(TEXT("replace_stale_function_references")))
+        {
+            bReplaceStaleFunctionReferences = Params->GetBoolField(TEXT("replace_stale_function_references"));
+        }
+        if (!bReplaceStaleFunctionReferences || !Package)
+        {
+            return;
+        }
+
+        FString SourcePrefix = TEXT("/Game/UltraDynamicSky/Materials/Material_Functions/");
+        Params->TryGetStringField(TEXT("stale_function_source_prefix"), SourcePrefix);
+        if (SourcePrefix.IsEmpty())
+        {
+            return;
+        }
+
+        FString TargetFolder;
+        Params->TryGetStringField(TEXT("stale_function_target_folder"), TargetFolder);
+        TargetFolder.RemoveFromEnd(TEXT("/"));
+        if (TargetFolder.IsEmpty())
+        {
+            return;
+        }
+
+        FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+        TArray<FName> ExistingDependencies;
+        AssetRegistryModule.Get().GetDependencies(FName(*Package->GetName()), ExistingDependencies);
+
+        TMap<UMaterialFunctionInterface*, UMaterialFunctionInterface*> ReplacementMap;
+        for (const FName& DependencyName : ExistingDependencies)
+        {
+            const FString DependencyPath = DependencyName.ToString();
+            if (!DependencyPath.StartsWith(SourcePrefix))
+            {
+                continue;
+            }
+
+            const FString AssetName = FPackageName::GetLongPackageAssetName(DependencyPath);
+            if (AssetName.IsEmpty())
+            {
+                continue;
+            }
+
+            UMaterialFunctionInterface* SourceFunction = LoadObject<UMaterialFunctionInterface>(nullptr, *(DependencyPath + TEXT(".") + AssetName));
+            if (!SourceFunction)
+            {
+                continue;
+            }
+
+            const FString TargetAssetName = FString::Printf(TEXT("MF_Cubeless_UDS_%s_V3"), *AssetName);
+            const FString TargetPackagePath = TargetFolder + TEXT("/") + TargetAssetName;
+            UMaterialFunctionInterface* TargetFunction = LoadObject<UMaterialFunctionInterface>(nullptr, *(TargetPackagePath + TEXT(".") + TargetAssetName));
+            if (!TargetFunction)
+            {
+                MissingStaleFunctionReferenceTargetArray.Add(MakeShared<FJsonValueString>(TargetPackagePath));
+                continue;
+            }
+
+            ReplacementMap.Add(SourceFunction, TargetFunction);
+
+            TSharedPtr<FJsonObject> RemapObject = MakeShared<FJsonObject>();
+            RemapObject->SetStringField(TEXT("source"), SourceFunction->GetPathName());
+            RemapObject->SetStringField(TEXT("target"), TargetFunction->GetPathName());
+            RemappedStaleFunctionReferenceArray.Add(MakeShared<FJsonValueObject>(RemapObject));
+        }
+
+        if (ReplacementMap.Num() == 0)
+        {
+            return;
+        }
+
+        TArray<UObject*> PackageObjects;
+        ForEachObjectWithPackage(Package, [&PackageObjects](UObject* Object)
+        {
+            if (Object && !Object->HasAnyFlags(RF_ClassDefaultObject))
+            {
+                PackageObjects.Add(Object);
+            }
+            return true;
+        }, true);
+
+        for (UObject* Object : PackageObjects)
+        {
+            if (!Object)
+            {
+                continue;
+            }
+
+            Object->Modify();
+            FArchiveReplaceObjectRef<UMaterialFunctionInterface> ReplaceArchive(
+                Object,
+                ReplacementMap,
+                EArchiveReplaceObjectFlags::IgnoreOuterRef |
+                EArchiveReplaceObjectFlags::IgnoreArchetypeRef |
+                EArchiveReplaceObjectFlags::TrackReplacedReferences);
+            RemappedStaleFunctionReferenceCount += ReplaceArchive.GetCount();
+        }
+
+        if (RemappedStaleFunctionReferenceCount > 0)
+        {
+            Target.MarkChanged();
+            Target.Material->UpdateCachedExpressionData();
+            FunctionInfoCountAfterClear = Target.Material->GetCachedExpressionData().FunctionInfos.Num();
+        }
+    };
+    RemapStaleFunctionReferences();
     ClearStaleFunctionInfos();
 
     if (MaterialFunctionCallCount == 0 && Package)
@@ -5836,6 +5948,9 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleRefreshMaterialCachedE
     ResultObj->SetNumberField(TEXT("cleared_stale_function_reference_count"), ClearedStaleFunctionReferenceCount);
     ResultObj->SetArrayField(TEXT("cleared_stale_function_reference_dependencies"), ClearedStaleFunctionReferenceDependencyArray);
     ResultObj->SetArrayField(TEXT("cleared_stale_function_reference_owners"), ClearedStaleFunctionReferenceOwnerArray);
+    ResultObj->SetNumberField(TEXT("remapped_stale_function_reference_count"), RemappedStaleFunctionReferenceCount);
+    ResultObj->SetArrayField(TEXT("remapped_stale_function_references"), RemappedStaleFunctionReferenceArray);
+    ResultObj->SetArrayField(TEXT("missing_stale_function_reference_targets"), MissingStaleFunctionReferenceTargetArray);
     ResultObj->SetBoolField(TEXT("compiled"), bCompiled);
     ResultObj->SetBoolField(TEXT("compilation_finished"), bCompilationFinished);
     ResultObj->SetNumberField(TEXT("compile_error_count"), CompileErrors.Num());
