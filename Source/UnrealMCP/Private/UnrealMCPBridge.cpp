@@ -532,7 +532,10 @@ FString UUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const TShar
                      CommandType == TEXT("repair_world_actor_instances_mcp") ||
                      CommandType == TEXT("run_content_validation_pipeline_mcp") ||
                      CommandType == TEXT("audit_content_root_mcp") ||
-                     CommandType == TEXT("analyze_blueprint_widget_fallbacks_mcp"))
+                     CommandType == TEXT("analyze_blueprint_widget_fallbacks_mcp") ||
+                     CommandType == TEXT("create_volume_texture_from_2d_sheet_mcp") ||
+                     CommandType == TEXT("create_volume_texture_from_raw_rgba16_sheet_mcp") ||
+                     CommandType == TEXT("set_material_texture_sample_sampler_type_mcp"))
             {
                 ResultJson = ProjectCommands->HandleCommand(CommandType, Params);
             }

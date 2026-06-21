@@ -51,6 +51,7 @@
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionTextureBase.h"
+#include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInterface.h"
@@ -422,6 +423,86 @@ bool ValidateContentRootPairForMCP(const FString& SourceRoot, const FString& Tar
         return false;
     }
     return true;
+}
+
+bool TryParseTextureCompressionSettingsForMCP(const FString& RawValue, TextureCompressionSettings& OutValue, FString& OutError)
+{
+    FString Value = RawValue;
+    Value.TrimStartAndEndInline();
+
+    if (Value.IsEmpty() || Value.Equals(TEXT("TC_VectorDisplacementmap"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TC_VECTOR_DISPLACEMENTMAP"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TC_VectorDisplacementmap;
+        return true;
+    }
+    if (Value.Equals(TEXT("TC_Default"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TC_DEFAULT"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TC_Default;
+        return true;
+    }
+    if (Value.Equals(TEXT("TC_HDR"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TC_HDR;
+        return true;
+    }
+    if (Value.Equals(TEXT("TC_Masks"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TC_MASKS"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TC_Masks;
+        return true;
+    }
+    if (Value.Equals(TEXT("TC_Normalmap"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TC_NORMALMAP"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TC_Normalmap;
+        return true;
+    }
+
+    OutError = FString::Printf(TEXT("Unsupported compression_settings: %s"), *RawValue);
+    return false;
+}
+
+bool TryParseTextureMipGenSettingsForMCP(const FString& RawValue, TextureMipGenSettings& OutValue, FString& OutError)
+{
+    FString Value = RawValue;
+    Value.TrimStartAndEndInline();
+
+    if (Value.IsEmpty() || Value.Equals(TEXT("TMGS_NoMipmaps"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TMGS_NOMIPMAPS"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TMGS_NoMipmaps;
+        return true;
+    }
+    if (Value.Equals(TEXT("TMGS_FromTextureGroup"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TMGS_FROMTEXTUREGROUP"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TMGS_FromTextureGroup;
+        return true;
+    }
+
+    OutError = FString::Printf(TEXT("Unsupported mip_gen_settings: %s"), *RawValue);
+    return false;
+}
+
+bool TryParseTextureAddressForMCP(const FString& RawValue, TextureAddress& OutValue, FString& OutError)
+{
+    FString Value = RawValue;
+    Value.TrimStartAndEndInline();
+
+    if (Value.IsEmpty() || Value.Equals(TEXT("TA_Wrap"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TA_WRAP"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TA_Wrap;
+        return true;
+    }
+    if (Value.Equals(TEXT("TA_Clamp"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TA_CLAMP"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TA_Clamp;
+        return true;
+    }
+    if (Value.Equals(TEXT("TA_Mirror"), ESearchCase::IgnoreCase) || Value.Equals(TEXT("TA_MIRROR"), ESearchCase::IgnoreCase))
+    {
+        OutValue = TA_Mirror;
+        return true;
+    }
+
+    OutError = FString::Printf(TEXT("Unsupported address_mode: %s"), *RawValue);
+    return false;
 }
 
 bool IsLiveObjectForMCP(const UObject* Object)
@@ -6317,6 +6398,18 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleCommand(const FString& 
     {
         return HandleAnalyzeBlueprintWidgetFallbacksMCP(Params);
     }
+    if (CommandType == TEXT("create_volume_texture_from_2d_sheet_mcp"))
+    {
+        return HandleCreateVolumeTextureFrom2DSheetMCP(Params);
+    }
+    if (CommandType == TEXT("create_volume_texture_from_raw_rgba16_sheet_mcp"))
+    {
+        return HandleCreateVolumeTextureFromRawRGBA16SheetMCP(Params);
+    }
+    if (CommandType == TEXT("set_material_texture_sample_sampler_type_mcp"))
+    {
+        return HandleSetMaterialTextureSampleSamplerTypeMCP(Params);
+    }
 
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown project command: %s"), *CommandType));
 }
@@ -6711,6 +6804,578 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleAnalyzeBlueprintWidgetF
     AddStringArrayField(ResultObj, TEXT("missing_target_samples"), MissingTargetSamples);
     AddStringArrayField(ResultObj, TEXT("mismatch_samples"), MismatchSamples);
     ResultObj->SetStringField(TEXT("fresh_recreation_conclusion"), ReportObject->GetStringField(TEXT("fresh_recreation_conclusion")));
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleCreateVolumeTextureFrom2DSheetMCP(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!Params.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing parameters"));
+    }
+
+    FString SourceTexturePathRaw;
+    FString TargetVolumeTexturePathRaw;
+    FString ParamError;
+    if (!TryGetRequiredStringParamForMCP(Params, TEXT("source_texture_path"), SourceTexturePathRaw, ParamError) ||
+        !TryGetRequiredStringParamForMCP(Params, TEXT("target_volume_texture_path"), TargetVolumeTexturePathRaw, ParamError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ParamError);
+    }
+
+    const FString SourceTexturePath = NormalizePackagePathParam(SourceTexturePathRaw);
+    const FString TargetVolumeTexturePath = NormalizePackagePathParam(TargetVolumeTexturePathRaw);
+    if (!FPackageName::IsValidLongPackageName(SourceTexturePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Invalid source_texture_path: %s"), *SourceTexturePath));
+    }
+    if (!FPackageName::IsValidLongPackageName(TargetVolumeTexturePath) || !TargetVolumeTexturePath.StartsWith(TEXT("/Game/")))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Invalid target_volume_texture_path: %s"), *TargetVolumeTexturePath));
+    }
+
+    const int32 TileSizeX = GetIntParam(Params, TEXT("tile_size_x"), 128);
+    const int32 TileSizeY = GetIntParam(Params, TEXT("tile_size_y"), 128);
+    if (TileSizeX <= 0 || TileSizeY <= 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("tile_size_x and tile_size_y must be greater than zero"));
+    }
+
+    UTexture2D* SourceTexture = Cast<UTexture2D>(UEditorAssetLibrary::LoadAsset(SourceTexturePath));
+    if (!SourceTexture)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("source_texture_path is not a Texture2D asset: %s"), *SourceTexturePath));
+    }
+    if (!SourceTexture->Source.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("source_texture_path has no valid editor source data: %s"), *SourceTexturePath));
+    }
+
+    const int32 SourceSizeX = SourceTexture->Source.GetSizeX();
+    const int32 SourceSizeY = SourceTexture->Source.GetSizeY();
+    if (SourceSizeX <= 0 || SourceSizeY <= 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Source texture has invalid dimensions"));
+    }
+    if (SourceSizeX % TileSizeX != 0 || SourceSizeY % TileSizeY != 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Source texture dimensions %dx%d are not divisible by tile size %dx%d"),
+            SourceSizeX,
+            SourceSizeY,
+            TileSizeX,
+            TileSizeY));
+    }
+
+    TextureCompressionSettings CompressionSettings = TC_VectorDisplacementmap;
+    TextureMipGenSettings MipGenSettings = TMGS_NoMipmaps;
+    TextureAddress AddressMode = TA_Wrap;
+    FString EnumError;
+    if (!TryParseTextureCompressionSettingsForMCP(GetStringParam(Params, TEXT("compression_settings"), TEXT("TC_VectorDisplacementmap")), CompressionSettings, EnumError) ||
+        !TryParseTextureMipGenSettingsForMCP(GetStringParam(Params, TEXT("mip_gen_settings"), TEXT("TMGS_NoMipmaps")), MipGenSettings, EnumError) ||
+        !TryParseTextureAddressForMCP(GetStringParam(Params, TEXT("address_mode"), TEXT("TA_Wrap")), AddressMode, EnumError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(EnumError);
+    }
+
+    const bool bDryRun = GetBoolParam(Params, TEXT("dry_run"), false);
+    const bool bOverwriteExisting = GetBoolParam(Params, TEXT("overwrite_existing"), false);
+    const bool bSaveAsset = GetBoolParam(Params, TEXT("save_asset"), true);
+    const bool bNeverStream = GetBoolParam(Params, TEXT("never_stream"), true);
+    const bool bVirtualTextureStreaming = GetBoolParam(Params, TEXT("virtual_texture_streaming"), false);
+    const bool bSRGB = Params->HasField(TEXT("srgb")) ? GetBoolParam(Params, TEXT("srgb"), SourceTexture->SRGB) : SourceTexture->SRGB;
+
+    UObject* ExistingTargetObject = UEditorAssetLibrary::LoadAsset(TargetVolumeTexturePath);
+    UVolumeTexture* ExistingTargetTexture = Cast<UVolumeTexture>(ExistingTargetObject);
+    const bool bTargetExists = ExistingTargetObject != nullptr;
+    if (bTargetExists && !ExistingTargetTexture)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Target path already exists and is not a VolumeTexture: %s"), *TargetVolumeTexturePath));
+    }
+    if (bTargetExists && !bOverwriteExisting)
+    {
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), bDryRun);
+        ResultObj->SetBoolField(TEXT("can_create"), false);
+        ResultObj->SetBoolField(TEXT("target_exists"), true);
+        ResultObj->SetStringField(TEXT("message"), TEXT("Target VolumeTexture already exists; set overwrite_existing=true to update it"));
+        ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+        ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+        return ResultObj;
+    }
+
+    const int32 TileCountX = SourceSizeX / TileSizeX;
+    const int32 TileCountY = SourceSizeY / TileSizeY;
+    const int32 RequestedSliceCount = TileCountX * TileCountY;
+    if (bDryRun)
+    {
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), true);
+        ResultObj->SetBoolField(TEXT("can_create"), true);
+        ResultObj->SetBoolField(TEXT("dry_run"), true);
+        ResultObj->SetBoolField(TEXT("target_exists"), bTargetExists);
+        ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+        ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+        ResultObj->SetNumberField(TEXT("source_size_x"), SourceSizeX);
+        ResultObj->SetNumberField(TEXT("source_size_y"), SourceSizeY);
+        ResultObj->SetNumberField(TEXT("tile_size_x"), TileSizeX);
+        ResultObj->SetNumberField(TEXT("tile_size_y"), TileSizeY);
+        ResultObj->SetNumberField(TEXT("tile_count_x"), TileCountX);
+        ResultObj->SetNumberField(TEXT("tile_count_y"), TileCountY);
+        ResultObj->SetNumberField(TEXT("requested_slice_count"), RequestedSliceCount);
+        ResultObj->SetBoolField(TEXT("srgb"), bSRGB);
+        ResultObj->SetStringField(TEXT("compression_settings"), GetStringParam(Params, TEXT("compression_settings"), TEXT("TC_VectorDisplacementmap")));
+        ResultObj->SetStringField(TEXT("mip_gen_settings"), GetStringParam(Params, TEXT("mip_gen_settings"), TEXT("TMGS_NoMipmaps")));
+        ResultObj->SetStringField(TEXT("address_mode"), GetStringParam(Params, TEXT("address_mode"), TEXT("TA_Wrap")));
+        return ResultObj;
+    }
+
+    UVolumeTexture* TargetTexture = ExistingTargetTexture;
+    bool bCreated = false;
+    if (!TargetTexture)
+    {
+        const FString AssetName = FPackageName::GetLongPackageAssetName(TargetVolumeTexturePath);
+        UPackage* Package = CreatePackage(*TargetVolumeTexturePath);
+        if (!Package)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create package: %s"), *TargetVolumeTexturePath));
+        }
+
+        TargetTexture = NewObject<UVolumeTexture>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+        if (!TargetTexture)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create VolumeTexture: %s"), *TargetVolumeTexturePath));
+        }
+        FAssetRegistryModule::AssetCreated(TargetTexture);
+        bCreated = true;
+    }
+    else
+    {
+        TargetTexture->Modify();
+    }
+
+    TargetTexture->PreEditChange(nullptr);
+#if WITH_EDITORONLY_DATA
+    TargetTexture->Source2DTexture = SourceTexture;
+    TargetTexture->Source2DTileSizeX = TileSizeX;
+    TargetTexture->Source2DTileSizeY = TileSizeY;
+#endif
+    TargetTexture->SRGB = bSRGB;
+    TargetTexture->CompressionSettings = CompressionSettings;
+    TargetTexture->MipGenSettings = MipGenSettings;
+    TargetTexture->NeverStream = bNeverStream;
+    TargetTexture->VirtualTextureStreaming = bVirtualTextureStreaming;
+    TargetTexture->AddressMode = AddressMode;
+
+    const bool bUpdatedFromSource = TargetTexture->UpdateSourceFromSourceTexture();
+    TargetTexture->PostEditChange();
+    TargetTexture->UpdateResource();
+    TargetTexture->BlockOnAnyAsyncBuild();
+    TargetTexture->MarkPackageDirty();
+
+    bool bSaved = false;
+    if (bSaveAsset)
+    {
+        bSaved = SaveLoadedAssetForMCP(TargetTexture);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), bUpdatedFromSource && (!bSaveAsset || bSaved));
+    ResultObj->SetBoolField(TEXT("created"), bCreated);
+    ResultObj->SetBoolField(TEXT("updated_existing"), !bCreated);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetBoolField(TEXT("updated_from_source"), bUpdatedFromSource);
+    ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+    ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+    ResultObj->SetNumberField(TEXT("source_size_x"), SourceSizeX);
+    ResultObj->SetNumberField(TEXT("source_size_y"), SourceSizeY);
+    ResultObj->SetNumberField(TEXT("tile_size_x"), TileSizeX);
+    ResultObj->SetNumberField(TEXT("tile_size_y"), TileSizeY);
+    ResultObj->SetNumberField(TEXT("tile_count_x"), TileCountX);
+    ResultObj->SetNumberField(TEXT("tile_count_y"), TileCountY);
+    ResultObj->SetNumberField(TEXT("requested_slice_count"), RequestedSliceCount);
+    ResultObj->SetNumberField(TEXT("volume_size_x"), TargetTexture->GetSizeX());
+    ResultObj->SetNumberField(TEXT("volume_size_y"), TargetTexture->GetSizeY());
+    ResultObj->SetNumberField(TEXT("volume_size_z"), TargetTexture->GetSizeZ());
+    ResultObj->SetBoolField(TEXT("srgb"), bSRGB);
+    ResultObj->SetBoolField(TEXT("never_stream"), bNeverStream);
+    ResultObj->SetBoolField(TEXT("virtual_texture_streaming"), bVirtualTextureStreaming);
+    if (!bUpdatedFromSource)
+    {
+        ResultObj->SetStringField(TEXT("message"), TEXT("VolumeTexture was created/updated, but UpdateSourceFromSourceTexture returned false"));
+    }
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleCreateVolumeTextureFromRawRGBA16SheetMCP(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!Params.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing parameters"));
+    }
+
+    FString RawFilePath;
+    FString SourceTexturePathRaw;
+    FString TargetVolumeTexturePathRaw;
+    FString ParamError;
+    if (!TryGetRequiredStringParamForMCP(Params, TEXT("raw_file_path"), RawFilePath, ParamError) ||
+        !TryGetRequiredStringParamForMCP(Params, TEXT("source_texture_path"), SourceTexturePathRaw, ParamError) ||
+        !TryGetRequiredStringParamForMCP(Params, TEXT("target_volume_texture_path"), TargetVolumeTexturePathRaw, ParamError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ParamError);
+    }
+
+    RawFilePath = FPaths::ConvertRelativePathToFull(RawFilePath);
+    if (!FPaths::FileExists(RawFilePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("raw_file_path does not exist: %s"), *RawFilePath));
+    }
+
+    const FString SourceTexturePath = NormalizePackagePathParam(SourceTexturePathRaw);
+    const FString TargetVolumeTexturePath = NormalizePackagePathParam(TargetVolumeTexturePathRaw);
+    if (!FPackageName::IsValidLongPackageName(SourceTexturePath) || !SourceTexturePath.StartsWith(TEXT("/Game/")))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Invalid source_texture_path: %s"), *SourceTexturePath));
+    }
+    if (!FPackageName::IsValidLongPackageName(TargetVolumeTexturePath) || !TargetVolumeTexturePath.StartsWith(TEXT("/Game/")))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Invalid target_volume_texture_path: %s"), *TargetVolumeTexturePath));
+    }
+
+    const int32 SheetSizeX = GetIntParam(Params, TEXT("sheet_size_x"), 2048);
+    const int32 SheetSizeY = GetIntParam(Params, TEXT("sheet_size_y"), 1024);
+    const int32 TileSizeX = GetIntParam(Params, TEXT("tile_size_x"), 128);
+    const int32 TileSizeY = GetIntParam(Params, TEXT("tile_size_y"), 128);
+    if (SheetSizeX <= 0 || SheetSizeY <= 0 || TileSizeX <= 0 || TileSizeY <= 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("sheet and tile dimensions must be greater than zero"));
+    }
+    if (SheetSizeX % TileSizeX != 0 || SheetSizeY % TileSizeY != 0)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Sheet dimensions %dx%d are not divisible by tile size %dx%d"),
+            SheetSizeX,
+            SheetSizeY,
+            TileSizeX,
+            TileSizeY));
+    }
+
+    const int64 ExpectedByteCount = static_cast<int64>(SheetSizeX) * static_cast<int64>(SheetSizeY) * 4LL * 2LL;
+    TArray<uint8> RawBytes;
+    if (!FFileHelper::LoadFileToArray(RawBytes, *RawFilePath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to read raw_file_path: %s"), *RawFilePath));
+    }
+    if (RawBytes.Num() != ExpectedByteCount)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("raw_file_path byte count %d does not match expected RGBA16 sheet byte count %lld for %dx%d"),
+            RawBytes.Num(),
+            ExpectedByteCount,
+            SheetSizeX,
+            SheetSizeY));
+    }
+
+    TextureCompressionSettings SourceCompressionSettings = TC_Default;
+    TextureCompressionSettings VolumeCompressionSettings = TC_VectorDisplacementmap;
+    TextureMipGenSettings SourceMipGenSettings = TMGS_FromTextureGroup;
+    TextureMipGenSettings VolumeMipGenSettings = TMGS_NoMipmaps;
+    TextureAddress AddressMode = TA_Wrap;
+    FString EnumError;
+    if (!TryParseTextureCompressionSettingsForMCP(GetStringParam(Params, TEXT("source_compression_settings"), TEXT("TC_Default")), SourceCompressionSettings, EnumError) ||
+        !TryParseTextureCompressionSettingsForMCP(GetStringParam(Params, TEXT("volume_compression_settings"), TEXT("TC_VectorDisplacementmap")), VolumeCompressionSettings, EnumError) ||
+        !TryParseTextureMipGenSettingsForMCP(GetStringParam(Params, TEXT("source_mip_gen_settings"), TEXT("TMGS_FromTextureGroup")), SourceMipGenSettings, EnumError) ||
+        !TryParseTextureMipGenSettingsForMCP(GetStringParam(Params, TEXT("volume_mip_gen_settings"), TEXT("TMGS_NoMipmaps")), VolumeMipGenSettings, EnumError) ||
+        !TryParseTextureAddressForMCP(GetStringParam(Params, TEXT("address_mode"), TEXT("TA_Wrap")), AddressMode, EnumError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(EnumError);
+    }
+
+    const bool bDryRun = GetBoolParam(Params, TEXT("dry_run"), false);
+    const bool bOverwriteExisting = GetBoolParam(Params, TEXT("overwrite_existing"), false);
+    const bool bSaveAssets = GetBoolParam(Params, TEXT("save_assets"), true);
+    const bool bSRGB = GetBoolParam(Params, TEXT("srgb"), false);
+    const bool bNeverStreamVolume = GetBoolParam(Params, TEXT("never_stream_volume"), true);
+    const bool bVirtualTextureStreaming = GetBoolParam(Params, TEXT("virtual_texture_streaming"), false);
+
+    UObject* ExistingSourceObject = UEditorAssetLibrary::LoadAsset(SourceTexturePath);
+    UTexture2D* SourceTexture = Cast<UTexture2D>(ExistingSourceObject);
+    if (ExistingSourceObject && !SourceTexture)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Source path already exists and is not a Texture2D: %s"), *SourceTexturePath));
+    }
+
+    UObject* ExistingTargetObject = UEditorAssetLibrary::LoadAsset(TargetVolumeTexturePath);
+    UVolumeTexture* TargetTexture = Cast<UVolumeTexture>(ExistingTargetObject);
+    if (ExistingTargetObject && !TargetTexture)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Target path already exists and is not a VolumeTexture: %s"), *TargetVolumeTexturePath));
+    }
+    if ((ExistingSourceObject || ExistingTargetObject) && !bOverwriteExisting)
+    {
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), bDryRun);
+        ResultObj->SetBoolField(TEXT("can_create"), false);
+        ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
+        ResultObj->SetBoolField(TEXT("source_exists"), ExistingSourceObject != nullptr);
+        ResultObj->SetBoolField(TEXT("target_exists"), ExistingTargetObject != nullptr);
+        ResultObj->SetStringField(TEXT("message"), TEXT("Source or target already exists; set overwrite_existing=true to update it"));
+        ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+        ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+        return ResultObj;
+    }
+
+    const int32 TileCountX = SheetSizeX / TileSizeX;
+    const int32 TileCountY = SheetSizeY / TileSizeY;
+    const int32 RequestedSliceCount = TileCountX * TileCountY;
+    if (bDryRun)
+    {
+        TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+        ResultObj->SetBoolField(TEXT("success"), true);
+        ResultObj->SetBoolField(TEXT("can_create"), true);
+        ResultObj->SetBoolField(TEXT("dry_run"), true);
+        ResultObj->SetStringField(TEXT("raw_file_path"), RawFilePath);
+        ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+        ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+        ResultObj->SetNumberField(TEXT("raw_file_bytes"), RawBytes.Num());
+        ResultObj->SetNumberField(TEXT("sheet_size_x"), SheetSizeX);
+        ResultObj->SetNumberField(TEXT("sheet_size_y"), SheetSizeY);
+        ResultObj->SetNumberField(TEXT("tile_size_x"), TileSizeX);
+        ResultObj->SetNumberField(TEXT("tile_size_y"), TileSizeY);
+        ResultObj->SetNumberField(TEXT("tile_count_x"), TileCountX);
+        ResultObj->SetNumberField(TEXT("tile_count_y"), TileCountY);
+        ResultObj->SetNumberField(TEXT("requested_slice_count"), RequestedSliceCount);
+        return ResultObj;
+    }
+
+    bool bCreatedSource = false;
+    if (!SourceTexture)
+    {
+        const FString AssetName = FPackageName::GetLongPackageAssetName(SourceTexturePath);
+        UPackage* Package = CreatePackage(*SourceTexturePath);
+        if (!Package)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create source texture package: %s"), *SourceTexturePath));
+        }
+        SourceTexture = NewObject<UTexture2D>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+        if (!SourceTexture)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create Texture2D: %s"), *SourceTexturePath));
+        }
+        FAssetRegistryModule::AssetCreated(SourceTexture);
+        bCreatedSource = true;
+    }
+    else
+    {
+        SourceTexture->Modify();
+    }
+
+    SourceTexture->PreEditChange(nullptr);
+#if WITH_EDITORONLY_DATA
+    SourceTexture->Source.Init(SheetSizeX, SheetSizeY, 1, 1, TSF_RGBA16, RawBytes.GetData());
+#endif
+    SourceTexture->SRGB = bSRGB;
+    SourceTexture->CompressionSettings = SourceCompressionSettings;
+    SourceTexture->MipGenSettings = SourceMipGenSettings;
+    SourceTexture->PostEditChange();
+    SourceTexture->UpdateResource();
+    SourceTexture->MarkPackageDirty();
+
+    bool bCreatedVolume = false;
+    if (!TargetTexture)
+    {
+        const FString AssetName = FPackageName::GetLongPackageAssetName(TargetVolumeTexturePath);
+        UPackage* Package = CreatePackage(*TargetVolumeTexturePath);
+        if (!Package)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create volume texture package: %s"), *TargetVolumeTexturePath));
+        }
+        TargetTexture = NewObject<UVolumeTexture>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+        if (!TargetTexture)
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Failed to create VolumeTexture: %s"), *TargetVolumeTexturePath));
+        }
+        FAssetRegistryModule::AssetCreated(TargetTexture);
+        bCreatedVolume = true;
+    }
+    else
+    {
+        TargetTexture->Modify();
+    }
+
+    TargetTexture->PreEditChange(nullptr);
+#if WITH_EDITORONLY_DATA
+    TargetTexture->Source2DTexture = SourceTexture;
+    TargetTexture->Source2DTileSizeX = TileSizeX;
+    TargetTexture->Source2DTileSizeY = TileSizeY;
+#endif
+    TargetTexture->SRGB = bSRGB;
+    TargetTexture->CompressionSettings = VolumeCompressionSettings;
+    TargetTexture->MipGenSettings = VolumeMipGenSettings;
+    TargetTexture->NeverStream = bNeverStreamVolume;
+    TargetTexture->VirtualTextureStreaming = bVirtualTextureStreaming;
+    TargetTexture->AddressMode = AddressMode;
+
+    const bool bUpdatedFromSource = TargetTexture->UpdateSourceFromSourceTexture();
+    TargetTexture->PostEditChange();
+    TargetTexture->UpdateResource();
+    TargetTexture->BlockOnAnyAsyncBuild();
+    TargetTexture->MarkPackageDirty();
+
+    bool bSavedSource = false;
+    bool bSavedVolume = false;
+    if (bSaveAssets)
+    {
+        bSavedSource = SaveLoadedAssetForMCP(SourceTexture);
+        bSavedVolume = SaveLoadedAssetForMCP(TargetTexture);
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), bUpdatedFromSource && (!bSaveAssets || (bSavedSource && bSavedVolume)));
+    ResultObj->SetBoolField(TEXT("created_source_texture"), bCreatedSource);
+    ResultObj->SetBoolField(TEXT("created_volume_texture"), bCreatedVolume);
+    ResultObj->SetBoolField(TEXT("updated_existing_source_texture"), !bCreatedSource);
+    ResultObj->SetBoolField(TEXT("updated_existing_volume_texture"), !bCreatedVolume);
+    ResultObj->SetBoolField(TEXT("updated_from_source"), bUpdatedFromSource);
+    ResultObj->SetBoolField(TEXT("saved_source_texture"), bSavedSource);
+    ResultObj->SetBoolField(TEXT("saved_volume_texture"), bSavedVolume);
+    ResultObj->SetStringField(TEXT("raw_file_path"), RawFilePath);
+    ResultObj->SetStringField(TEXT("source_texture_path"), SourceTexturePath);
+    ResultObj->SetStringField(TEXT("target_volume_texture_path"), TargetVolumeTexturePath);
+    ResultObj->SetNumberField(TEXT("raw_file_bytes"), RawBytes.Num());
+    ResultObj->SetNumberField(TEXT("sheet_size_x"), SheetSizeX);
+    ResultObj->SetNumberField(TEXT("sheet_size_y"), SheetSizeY);
+    ResultObj->SetNumberField(TEXT("tile_size_x"), TileSizeX);
+    ResultObj->SetNumberField(TEXT("tile_size_y"), TileSizeY);
+    ResultObj->SetNumberField(TEXT("tile_count_x"), TileCountX);
+    ResultObj->SetNumberField(TEXT("tile_count_y"), TileCountY);
+    ResultObj->SetNumberField(TEXT("requested_slice_count"), RequestedSliceCount);
+    ResultObj->SetNumberField(TEXT("volume_size_x"), TargetTexture->GetSizeX());
+    ResultObj->SetNumberField(TEXT("volume_size_y"), TargetTexture->GetSizeY());
+    ResultObj->SetNumberField(TEXT("volume_size_z"), TargetTexture->GetSizeZ());
+    if (!bUpdatedFromSource)
+    {
+        ResultObj->SetStringField(TEXT("message"), TEXT("VolumeTexture was created/updated, but UpdateSourceFromSourceTexture returned false"));
+    }
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleSetMaterialTextureSampleSamplerTypeMCP(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!Params.IsValid())
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing parameters"));
+    }
+
+    FString MaterialPathRaw;
+    FString TexturePathRaw;
+    FString ParamError;
+    if (!TryGetRequiredStringParamForMCP(Params, TEXT("material_path"), MaterialPathRaw, ParamError) ||
+        !TryGetRequiredStringParamForMCP(Params, TEXT("texture_path"), TexturePathRaw, ParamError))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ParamError);
+    }
+
+    const FString MaterialPath = NormalizePackagePathParam(MaterialPathRaw);
+    const FString TexturePath = NormalizePackagePathParam(TexturePathRaw);
+    UMaterial* Material = Cast<UMaterial>(UEditorAssetLibrary::LoadAsset(MaterialPath));
+    if (!Material)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("material_path is not a Material asset: %s"), *MaterialPath));
+    }
+
+    UTexture* Texture = Cast<UTexture>(UEditorAssetLibrary::LoadAsset(TexturePath));
+    if (!Texture)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("texture_path is not a Texture asset: %s"), *TexturePath));
+    }
+
+    const FString SamplerTypeRaw = GetStringParam(Params, TEXT("sampler_type"), TEXT("SAMPLERTYPE_LinearColor"));
+    EMaterialSamplerType SamplerType = SAMPLERTYPE_LinearColor;
+    if (SamplerTypeRaw.Equals(TEXT("SAMPLERTYPE_Color"), ESearchCase::IgnoreCase) ||
+        SamplerTypeRaw.Equals(TEXT("Color"), ESearchCase::IgnoreCase))
+    {
+        SamplerType = SAMPLERTYPE_Color;
+    }
+    else if (SamplerTypeRaw.Equals(TEXT("SAMPLERTYPE_LinearColor"), ESearchCase::IgnoreCase) ||
+        SamplerTypeRaw.Equals(TEXT("LinearColor"), ESearchCase::IgnoreCase) ||
+        SamplerTypeRaw.Equals(TEXT("Linear Color"), ESearchCase::IgnoreCase))
+    {
+        SamplerType = SAMPLERTYPE_LinearColor;
+    }
+    else if (SamplerTypeRaw.Equals(TEXT("SAMPLERTYPE_Masks"), ESearchCase::IgnoreCase) ||
+        SamplerTypeRaw.Equals(TEXT("Masks"), ESearchCase::IgnoreCase))
+    {
+        SamplerType = SAMPLERTYPE_Masks;
+    }
+    else
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unsupported sampler_type: %s"), *SamplerTypeRaw));
+    }
+
+    const bool bDryRun = GetBoolParam(Params, TEXT("dry_run"), false);
+    const bool bSave = GetBoolParam(Params, TEXT("save"), true);
+    const bool bCompile = GetBoolParam(Params, TEXT("compile"), true);
+
+    TArray<FString> ChangedNodes;
+    int32 MatchedNodeCount = 0;
+    int32 AlreadyCorrectCount = 0;
+    for (const TObjectPtr<UMaterialExpression>& ExpressionPtr : Material->GetExpressions())
+    {
+        UMaterialExpressionTextureSample* TextureSample = Cast<UMaterialExpressionTextureSample>(ExpressionPtr.Get());
+        if (!TextureSample || TextureSample->Texture != Texture)
+        {
+            continue;
+        }
+
+        ++MatchedNodeCount;
+        if (TextureSample->SamplerType.GetValue() == SamplerType)
+        {
+            ++AlreadyCorrectCount;
+            continue;
+        }
+
+        ChangedNodes.Add(TextureSample->GetName());
+        if (!bDryRun)
+        {
+            TextureSample->Modify();
+            TextureSample->SamplerType = SamplerType;
+        }
+    }
+
+    bool bSaved = false;
+    if (!bDryRun && ChangedNodes.Num() > 0)
+    {
+        Material->Modify();
+        Material->PreEditChange(nullptr);
+        Material->PostEditChange();
+        if (bCompile)
+        {
+            Material->ForceRecompileForRendering();
+        }
+        Material->MarkPackageDirty();
+        if (bSave)
+        {
+            bSaved = SaveLoadedAssetForMCP(Material);
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
+    ResultObj->SetStringField(TEXT("material_path"), MaterialPath);
+    ResultObj->SetStringField(TEXT("texture_path"), TexturePath);
+    ResultObj->SetStringField(TEXT("sampler_type"), SamplerTypeRaw);
+    ResultObj->SetNumberField(TEXT("matched_node_count"), MatchedNodeCount);
+    ResultObj->SetNumberField(TEXT("already_correct_count"), AlreadyCorrectCount);
+    ResultObj->SetNumberField(TEXT("changed_node_count"), ChangedNodes.Num());
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    TArray<TSharedPtr<FJsonValue>> ChangedNodeValues;
+    for (const FString& NodeName : ChangedNodes)
+    {
+        ChangedNodeValues.Add(MakeShared<FJsonValueString>(NodeName));
+    }
+    ResultObj->SetArrayField(TEXT("changed_nodes"), ChangedNodeValues);
     return ResultObj;
 }
 

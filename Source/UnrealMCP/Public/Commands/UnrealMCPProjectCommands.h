@@ -24,4 +24,7 @@ private:
     TSharedPtr<FJsonObject> HandleRunContentValidationPipelineMCP(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAuditContentRootMCP(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleAnalyzeBlueprintWidgetFallbacksMCP(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleCreateVolumeTextureFrom2DSheetMCP(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleCreateVolumeTextureFromRawRGBA16SheetMCP(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetMaterialTextureSampleSamplerTypeMCP(const TSharedPtr<FJsonObject>& Params);
 }; 
