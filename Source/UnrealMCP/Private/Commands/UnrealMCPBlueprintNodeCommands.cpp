@@ -345,6 +345,14 @@ bool GetPinDefaultStringForTypeChecked(const TSharedPtr<FJsonValue>& Value, cons
         OutError = TEXT("Boolean default values must be JSON booleans");
         return false;
     }
+    if (Value.IsValid() &&
+        Value->Type == EJson::String &&
+        (PinType.PinCategory == UEdGraphSchema_K2::PC_Class || PinType.PinCategory == UEdGraphSchema_K2::PC_Object) &&
+        FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+    {
+        OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("default_value"), Value->AsString());
+        return false;
+    }
 
     if (const UEnum* Enum = GetEnumForPinType(PinType))
     {
@@ -508,6 +516,11 @@ bool BuildPinTypeFromDescriptor(const FString& TypeName, const TSharedPtr<FJsonO
             OutError = TEXT("Missing enum type parameter. Use 'type_object', 'enum_type', or 'enum_path'");
             return false;
         }
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(EnumType))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(ObjectFieldName, EnumType);
+            return false;
+        }
 
         UEnum* Enum = LoadEnumForPin(EnumType);
         if (!Enum)
@@ -522,6 +535,12 @@ bool BuildPinTypeFromDescriptor(const FString& TypeName, const TSharedPtr<FJsonO
     else if (NormalizedType == TEXT("object") || NormalizedType == TEXT("class"))
     {
         const FString ClassName = GetStringParam(Params, ObjectFieldName, TEXT("Object"));
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(ClassName))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(ObjectFieldName, ClassName);
+            return false;
+        }
+
         UClass* Class = LoadClassForPin(ClassName);
         if (!Class)
         {
@@ -765,6 +784,12 @@ bool ApplyPinDefaultValueChecked(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
 
     if (Value->Type == EJson::String && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class)
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(Pin->PinName.ToString(), Value->AsString());
+            return false;
+        }
+
         UClass* Class = LoadClassForPin(Value->AsString());
         if (!Class)
         {
@@ -778,6 +803,12 @@ bool ApplyPinDefaultValueChecked(UEdGraphPin* Pin, const TSharedPtr<FJsonValue>&
     }
     else if (Value->Type == EJson::String && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(Pin->PinName.ToString(), Value->AsString());
+            return false;
+        }
+
         UObject* Object = LoadObjectForPin(Value->AsString());
         if (!Object)
         {
@@ -3192,6 +3223,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintFunct
     // Check if we have a target class specified
     if (!Target.IsEmpty())
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Target))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("target"), Target));
+        }
+
         // Try to find the target class
         UClass* TargetClass = nullptr;
 
@@ -3377,6 +3414,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintFunct
                             // - Actor classes must start with 'A' (e.g., ACameraActor)
                             // - Non-actor classes must start with 'U' (e.g., UObject)
                             const FString& ClassName = StringVal;
+                            if (FUnrealMCPCommonUtils::IsMCPDependencyReference(ClassName))
+                            {
+                                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                                    FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(ParamName, ClassName));
+                            }
 
                             // TODO: This likely won't work in UE5.5+, so don't rely on it.
                             UClass* Class = FindFirstObject<UClass>(*ClassName);
@@ -3568,6 +3610,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintCallF
         !Params->TryGetStringField(TEXT("target"), FunctionClassName))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'function_class' parameter"));
+    }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(FunctionClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("function_class"), FunctionClassName));
     }
 
     UClass* FunctionClass = LoadClassForPin(FunctionClassName);
@@ -4138,6 +4185,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleBindPCGGeneration
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(
             TEXT("Missing 'function_class' parameter. Provide a runtime BlueprintFunctionLibrary class that owns ApplyPCGGenerationSettings."));
+    }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(FunctionClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("function_class"), FunctionClassName));
     }
 
     UBlueprint* Blueprint = FUnrealMCPCommonUtils::FindBlueprint(BlueprintName);
@@ -5367,6 +5419,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintDynam
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'target_class' parameter"));
     }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(TargetClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("target_class"), TargetClassName));
+    }
 
     FVector2D NodePosition(0.0f, 0.0f);
     if (Params->HasField(TEXT("node_position")))
@@ -6180,6 +6237,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintVaria
     FString TargetClassName;
     if (Params->TryGetStringField(TEXT("target_class"), TargetClassName) && !TargetClassName.IsEmpty())
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(TargetClassName))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("target_class"), TargetClassName));
+        }
+
         UClass* TargetClass = LoadClassForPin(TargetClassName);
         if (!TargetClass || !TargetClass->IsChildOf(UObject::StaticClass()))
         {
@@ -6481,6 +6544,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintEnumL
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing enum type parameter. Use 'enum_type', 'type_object', or 'enum_path'"));
     }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(EnumType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("enum_type"), EnumType));
+    }
 
     UEnum* Enum = LoadEnumForPin(EnumType);
     if (!Enum)
@@ -6701,6 +6769,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleAddBlueprintSwitc
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing enum type parameter. Use 'enum_type', 'type_object', or 'enum_path'"));
     }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(EnumType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("enum_type"), EnumType));
+    }
 
     UEnum* Enum = LoadEnumForPin(EnumType);
     if (!Enum)
@@ -6862,6 +6935,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintPinDe
 
     if (Value->Type == EJson::String && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class)
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PinName, Value->AsString()));
+        }
+
         UClass* Class = LoadClassForPin(Value->AsString());
         if (!Class)
         {
@@ -6873,6 +6952,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintNodeCommands::HandleSetBlueprintPinDe
     }
     else if (Value->Type == EJson::String && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object)
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PinName, Value->AsString()));
+        }
+
         UObject* Object = LoadObjectForPin(Value->AsString());
         if (!Object)
         {

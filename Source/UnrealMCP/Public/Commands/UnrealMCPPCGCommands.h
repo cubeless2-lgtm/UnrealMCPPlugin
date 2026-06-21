@@ -19,6 +19,7 @@ private:
     TSharedPtr<FJsonObject> HandleAddPCGNode(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleConnectPCGNodes(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetPCGNodeSetting(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleSetPCGAttributeSelector(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCompileOrNotifyPCGGraph(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSavePCGGraph(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleSetSplineComponentPoints(const TSharedPtr<FJsonObject>& Params);

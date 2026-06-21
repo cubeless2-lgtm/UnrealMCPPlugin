@@ -133,6 +133,31 @@ TSharedPtr<FJsonObject> FUnrealMCPCommonUtils::CreateSuccessResponse(const TShar
     return ResponseObject;
 }
 
+bool FUnrealMCPCommonUtils::IsMCPDependencyReference(const FString& Value)
+{
+    FString Candidate = FPackageName::ExportTextPathToObjectPath(Value).TrimStartAndEnd();
+    Candidate.TrimQuotesInline();
+    if (Candidate.IsEmpty())
+    {
+        return false;
+    }
+
+    return Candidate.Contains(TEXT("/Script/UnrealMCP"), ESearchCase::IgnoreCase) ||
+        Candidate.Contains(TEXT("/UnrealMCP"), ESearchCase::IgnoreCase) ||
+        Candidate.Contains(TEXT("UnrealMCP"), ESearchCase::IgnoreCase) ||
+        Candidate.Contains(TEXT("MCPUnreal"), ESearchCase::IgnoreCase) ||
+        Candidate.Contains(TEXT("mcp_unreal"), ESearchCase::IgnoreCase);
+}
+
+FString FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(const FString& FieldName, const FString& Value)
+{
+    const FString FieldLabel = FieldName.IsEmpty() ? TEXT("value") : FieldName;
+    return FString::Printf(
+        TEXT("Refusing to persist MCP-only reference in '%s': %s. UnrealMCP is an editor authoring bridge; finished assets must not depend on it."),
+        *FieldLabel,
+        *Value);
+}
+
 void FUnrealMCPCommonUtils::GetIntArrayFromJson(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName, TArray<int32>& OutArray)
 {
     OutArray.Reset();
@@ -810,6 +835,12 @@ bool FUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString& Pr
         }
 
         const FString ClassPath = Value->AsString();
+        if (!ClassPath.IsEmpty() && IsMCPDependencyReference(ClassPath))
+        {
+            OutErrorMessage = GetMCPDependencyReferenceError(PropertyName, ClassPath);
+            return false;
+        }
+
         UClass* LoadedClass = ClassPath.IsEmpty()
             ? nullptr
             : Cast<UClass>(StaticLoadObject(UClass::StaticClass(), nullptr, *ClassPath));
@@ -841,6 +872,12 @@ bool FUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString& Pr
         }
 
         const FString ObjectPath = Value->AsString();
+        if (!ObjectPath.IsEmpty() && IsMCPDependencyReference(ObjectPath))
+        {
+            OutErrorMessage = GetMCPDependencyReferenceError(PropertyName, ObjectPath);
+            return false;
+        }
+
         UObject* LoadedObject = ObjectPath.IsEmpty()
             ? nullptr
             : StaticLoadObject(ObjectProp->PropertyClass, nullptr, *ObjectPath);

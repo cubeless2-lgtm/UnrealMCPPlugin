@@ -599,6 +599,12 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleCreateBlueprint(const
     // Try to find the specified parent class
     if (!ParentClass.IsEmpty())
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(ParentClass))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("parent_class"), ParentClass));
+        }
+
         FString ClassName = ParentClass;
         if (!ClassName.StartsWith(TEXT("A")))
         {
@@ -677,6 +683,11 @@ TSharedPtr<FJsonObject> FUnrealMCPBlueprintCommands::HandleAddComponentToBluepri
     if (!Params->TryGetStringField(TEXT("component_type"), ComponentType))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'type' parameter"));
+    }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(ComponentType))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("component_type"), ComponentType));
     }
 
     FString ComponentName;

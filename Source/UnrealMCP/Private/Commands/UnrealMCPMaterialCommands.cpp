@@ -880,6 +880,12 @@ bool SetObjectPropertyValue(UObject* Object, const FString& PropertyName, const 
             return false;
         }
 
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+            return false;
+        }
+
         UObject* ObjectValue = LoadObjectValue(Value->AsString());
         if (!ObjectValue)
         {
@@ -905,6 +911,12 @@ bool SetObjectPropertyValue(UObject* Object, const FString& PropertyName, const 
             return false;
         }
 
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+            return false;
+        }
+
         UClass* ClassValue = LoadClassValue(Value->AsString());
         if (!ClassValue)
         {
@@ -916,6 +928,12 @@ bool SetObjectPropertyValue(UObject* Object, const FString& PropertyName, const 
     }
 
     FString ImportText = JsonValueToImportText(Value);
+    if (Value.IsValid() && Value->Type == EJson::String && FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+    {
+        OutError = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+        return false;
+    }
+
     if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
     {
         const FString StructName = StructProperty->Struct ? StructProperty->Struct->GetName() : FString();
@@ -5042,6 +5060,11 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialNode(const 
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'expression_class' parameter"));
     }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(ExpressionClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("expression_class"), ExpressionClassName));
+    }
 
     FString GraphType;
     Params->TryGetStringField(TEXT("graph_type"), GraphType);
@@ -5069,6 +5092,12 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleAddMaterialNode(const 
     FString SelectedAssetPath;
     if (Params->TryGetStringField(TEXT("selected_asset"), SelectedAssetPath) && !SelectedAssetPath.IsEmpty())
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(SelectedAssetPath))
+        {
+            return FUnrealMCPCommonUtils::CreateErrorResponse(
+                FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("selected_asset"), SelectedAssetPath));
+        }
+
         SelectedAsset = LoadObjectValue(SelectedAssetPath);
         if (!SelectedAsset)
         {
@@ -5275,6 +5304,12 @@ TSharedPtr<FJsonObject> FUnrealMCPMaterialCommands::HandleSetMaterialNodePropert
         UMaterialFunctionInterface* NewFunction = nullptr;
         if (!Value->AsString().IsEmpty())
         {
+            if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+            {
+                return FUnrealMCPCommonUtils::CreateErrorResponse(
+                    FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString()));
+            }
+
             NewFunction = Cast<UMaterialFunctionInterface>(LoadObjectValue(Value->AsString()));
             if (!NewFunction)
             {

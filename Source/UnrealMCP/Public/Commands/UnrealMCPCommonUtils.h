@@ -31,6 +31,8 @@ public:
     static FVector2D GetVector2DFromJson(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName);
     static FVector GetVectorFromJson(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName);
     static FRotator GetRotatorFromJson(const TSharedPtr<FJsonObject>& JsonObject, const FString& FieldName);
+    static bool IsMCPDependencyReference(const FString& Value);
+    static FString GetMCPDependencyReferenceError(const FString& FieldName, const FString& Value);
     
     // Actor utilities
     static TSharedPtr<FJsonValue> ActorToJson(AActor* Actor);

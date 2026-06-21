@@ -151,6 +151,108 @@ bool FindBlockedPythonMapTransitionPattern(const FString& Code, FString& Matched
     return false;
 }
 
+bool ContainsAnyNormalizedPattern(const FString& NormalizedCode, const TArray<FString>& Patterns, FString& MatchedPattern)
+{
+    for (const FString& Pattern : Patterns)
+    {
+        if (NormalizedCode.Contains(Pattern, ESearchCase::CaseSensitive))
+        {
+            MatchedPattern = Pattern;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool FindBlockedPCGSelectorPythonPattern(const FString& Code, FString& MatchedPattern)
+{
+    const FString NormalizedCode = NormalizePythonCodeForGuard(Code);
+
+    const TArray<FString> HelperMutatorPatterns =
+    {
+        TEXT("pcgattributepropertyselectorblueprinthelpers.set_attribute_name("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.setattributename("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.set_property_name("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.setpropertyname("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.set_domain_name("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.setdomainname("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.set_point_property("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.setpointproperty("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.set_extra_property("),
+        TEXT("pcgattributepropertyselectorblueprinthelpers.setextraproperty(")
+    };
+
+    if (ContainsAnyNormalizedPattern(NormalizedCode, HelperMutatorPatterns, MatchedPattern))
+    {
+        return true;
+    }
+
+    const TArray<FString> SelectorMutatorPatterns =
+    {
+        TEXT(".set_attribute_name("),
+        TEXT(".setattributename("),
+        TEXT(".set_property_name("),
+        TEXT(".setpropertyname("),
+        TEXT(".set_domain_name("),
+        TEXT(".setdomainname("),
+        TEXT(".set_point_property("),
+        TEXT(".setpointproperty("),
+        TEXT(".set_extra_property("),
+        TEXT(".setextraproperty("),
+        TEXT(".update(")
+    };
+
+    if (NormalizedCode.Contains(TEXT("pcgattributeproperty"), ESearchCase::CaseSensitive) &&
+        ContainsAnyNormalizedPattern(NormalizedCode, SelectorMutatorPatterns, MatchedPattern))
+    {
+        return true;
+    }
+
+    const TArray<FString> KnownSelectorPropertyNames =
+    {
+        TEXT("input_attribute"),
+        TEXT("match_attribute"),
+        TEXT("max_distance_input_attribute"),
+        TEXT("input_weight_attribute"),
+        TEXT("weight_attribute"),
+        TEXT("set_target"),
+        TEXT("input_source"),
+        TEXT("output_target"),
+        TEXT("target_attribute"),
+        TEXT("threshold_attribute"),
+        TEXT("source_weight_attribute"),
+        TEXT("target_weight_attribute"),
+        TEXT("merge_weight_attribute"),
+        TEXT("comparison_source")
+    };
+
+    TArray<FString> SelectorPropertyAccessPatterns;
+    TArray<FString> SelectorPropertyAssignPatterns;
+    for (const FString& PropertyName : KnownSelectorPropertyNames)
+    {
+        SelectorPropertyAccessPatterns.Add(FString::Printf(TEXT("get_editor_property('%s')"), *PropertyName));
+        SelectorPropertyAccessPatterns.Add(FString::Printf(TEXT("get_editor_property(\"%s\")"), *PropertyName));
+        SelectorPropertyAssignPatterns.Add(FString::Printf(TEXT("set_editor_property('%s',"), *PropertyName));
+        SelectorPropertyAssignPatterns.Add(FString::Printf(TEXT("set_editor_property(\"%s\","), *PropertyName));
+    }
+
+    if (ContainsAnyNormalizedPattern(NormalizedCode, SelectorPropertyAssignPatterns, MatchedPattern))
+    {
+        return true;
+    }
+
+    FString SelectorPropertyPattern;
+    if (ContainsAnyNormalizedPattern(NormalizedCode, SelectorPropertyAccessPatterns, SelectorPropertyPattern) &&
+        ContainsAnyNormalizedPattern(NormalizedCode, SelectorMutatorPatterns, MatchedPattern))
+    {
+        MatchedPattern = FString::Printf(TEXT("%s with %s"), *SelectorPropertyPattern, *MatchedPattern);
+        return true;
+    }
+
+    return false;
+}
+
 struct FPathStringReplacement
 {
     FString Source;
@@ -9810,6 +9912,8 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleExecutePython(const TSh
 
     bool bAllowUnsafeEditorScriptingDuringPIE = false;
     Params->TryGetBoolField(TEXT("allow_unsafe_editor_scripting_during_pie"), bAllowUnsafeEditorScriptingDuringPIE);
+    bool bAllowUnsafePCGSelectorPython = false;
+    Params->TryGetBoolField(TEXT("allow_unsafe_pcg_selector_python"), bAllowUnsafePCGSelectorPython);
 
     FString UnsafePattern;
     if (!bAllowUnsafeEditorScriptingDuringPIE && IsPlaySessionActive() && FindUnsafeEditorScriptingPattern(Code, UnsafePattern))
@@ -9825,6 +9929,14 @@ TSharedPtr<FJsonObject> FUnrealMCPProjectCommands::HandleExecutePython(const TSh
         return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
             TEXT("Blocked Python map transition call '%s' in execute_python. Map load/new-map calls through this Python bridge can keep old world packages referenced by FPyReferenceCollector and crash the editor with World Memory Leaks. Use native open_editor_level for existing maps, native safe_new_preview_map for temporary preview maps, or switch maps manually in the editor."),
             *BlockedMapTransitionPattern));
+    }
+
+    FString BlockedPCGSelectorPattern;
+    if (!bAllowUnsafePCGSelectorPython && FindBlockedPCGSelectorPythonPattern(Code, BlockedPCGSelectorPattern))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Blocked Python PCG attribute selector mutation '%s' in execute_python. Mutating FPCGAttributePropertySelector-derived structs through Unreal Python can trigger PythonScriptPlugin wrapper ensures and editor shutdown crashes. Use native PCG command set_pcg_attribute_selector instead; authored assets will remain native PCG content and will not gain an UnrealMCP dependency."),
+            *BlockedPCGSelectorPattern));
     }
 
     FString Mode;

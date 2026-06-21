@@ -20,6 +20,7 @@
 #include "PCGNode.h"
 #include "PCGPin.h"
 #include "PCGSettings.h"
+#include "Metadata/PCGAttributePropertySelector.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/UnrealType.h"
@@ -673,6 +674,18 @@ bool SetPCGSettingsProperty(UPCGSettings* Settings, const FString& PropertyName,
 
     if (FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
     {
+        if (!Value.IsValid() || Value->Type != EJson::String)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Class property requires class path/name string: %s"), *PropertyName);
+            return false;
+        }
+
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutErrorMessage = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+            return false;
+        }
+
         UClass* ClassValue = LoadPCGClassValue(Value->AsString());
         if (!ClassValue)
         {
@@ -685,6 +698,18 @@ bool SetPCGSettingsProperty(UPCGSettings* Settings, const FString& PropertyName,
 
     if (FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
     {
+        if (!Value.IsValid() || Value->Type != EJson::String)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Object property requires object path string: %s"), *PropertyName);
+            return false;
+        }
+
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutErrorMessage = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+            return false;
+        }
+
         UObject* ObjectValue = LoadPCGObjectValue(Value->AsString());
         if (!ObjectValue)
         {
@@ -697,6 +722,12 @@ bool SetPCGSettingsProperty(UPCGSettings* Settings, const FString& PropertyName,
 
     if (Value->Type == EJson::String)
     {
+        if (FUnrealMCPCommonUtils::IsMCPDependencyReference(Value->AsString()))
+        {
+            OutErrorMessage = FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(PropertyName, Value->AsString());
+            return false;
+        }
+
         const FString ImportText = JsonValueToPCGImportText(Value);
         if (Property->ImportText_Direct(*ImportText, PropertyAddr, Settings, PPF_None) != nullptr)
         {
@@ -706,6 +737,281 @@ bool SetPCGSettingsProperty(UPCGSettings* Settings, const FString& PropertyName,
 
     OutErrorMessage = FString::Printf(TEXT("Unsupported property type: %s for property %s"), *Property->GetClass()->GetName(), *PropertyName);
     return false;
+}
+
+FString NormalizePropertyNameForLooseMatch(const FString& PropertyName)
+{
+    FString Normalized;
+    Normalized.Reserve(PropertyName.Len());
+
+    for (const TCHAR Character : PropertyName)
+    {
+        if (Character != TEXT('_') && Character != TEXT('-') && !FChar::IsWhitespace(Character))
+        {
+            Normalized.AppendChar(FChar::ToLower(Character));
+        }
+    }
+
+    return Normalized;
+}
+
+FProperty* FindPCGSettingsPropertyLoose(UPCGSettings* Settings, const FString& PropertyName)
+{
+    if (!Settings || PropertyName.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    if (FProperty* ExactProperty = Settings->GetClass()->FindPropertyByName(*PropertyName))
+    {
+        return ExactProperty;
+    }
+
+    const FString NormalizedNeedle = NormalizePropertyNameForLooseMatch(PropertyName);
+    for (TFieldIterator<FProperty> PropertyIt(Settings->GetClass()); PropertyIt; ++PropertyIt)
+    {
+        FProperty* Candidate = *PropertyIt;
+        if (NormalizePropertyNameForLooseMatch(Candidate->GetName()).Equals(NormalizedNeedle, ESearchCase::CaseSensitive))
+        {
+            return Candidate;
+        }
+    }
+
+    return nullptr;
+}
+
+FString NameToJsonString(const FName& Name)
+{
+    return Name.IsNone() ? FString() : Name.ToString();
+}
+
+FString EnumValueToNameString(const UEnum* Enum, int64 Value)
+{
+    if (!Enum)
+    {
+        return FString::FromInt(static_cast<int32>(Value));
+    }
+
+    FString Name = Enum->GetNameStringByValue(Value);
+    return Name.IsEmpty() ? FString::FromInt(static_cast<int32>(Value)) : Name;
+}
+
+bool TryParseEnumValueByName(const UEnum* Enum, const FString& RawValue, int64& OutValue)
+{
+    if (!Enum)
+    {
+        return false;
+    }
+
+    FString ValueText = RawValue.TrimStartAndEnd();
+    ValueText.RemoveFromStart(Enum->GetName() + TEXT("::"), ESearchCase::IgnoreCase);
+    ValueText.RemoveFromStart(TEXT("EPCGPointProperties::"), ESearchCase::IgnoreCase);
+    ValueText.RemoveFromStart(TEXT("EPCGExtraProperties::"), ESearchCase::IgnoreCase);
+
+    const int64 DirectValue = Enum->GetValueByNameString(ValueText);
+    if (DirectValue != INDEX_NONE)
+    {
+        OutValue = DirectValue;
+        return true;
+    }
+
+    for (int32 Index = 0; Index < Enum->NumEnums(); ++Index)
+    {
+        if (Enum->HasMetaData(TEXT("Hidden"), Index))
+        {
+            continue;
+        }
+
+        const FString Name = Enum->GetNameStringByIndex(Index);
+        const FString DisplayName = Enum->GetDisplayNameTextByIndex(Index).ToString();
+        if (Name.Equals(ValueText, ESearchCase::IgnoreCase) || DisplayName.Equals(ValueText, ESearchCase::IgnoreCase))
+        {
+            OutValue = Enum->GetValueByIndex(Index);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool TryReadStringArrayField(const TSharedPtr<FJsonObject>& Params, const FString& FieldName, TArray<FString>& OutValues, FString& OutErrorMessage)
+{
+    const TArray<TSharedPtr<FJsonValue>>* ArrayValues = nullptr;
+    if (!Params->TryGetArrayField(FieldName, ArrayValues))
+    {
+        return false;
+    }
+
+    OutValues.Reset();
+    for (const TSharedPtr<FJsonValue>& Value : *ArrayValues)
+    {
+        if (!Value.IsValid() || Value->Type != EJson::String)
+        {
+            OutErrorMessage = FString::Printf(TEXT("'%s' must contain only strings"), *FieldName);
+            return false;
+        }
+
+        OutValues.Add(Value->AsString());
+    }
+
+    return true;
+}
+
+TSharedPtr<FJsonObject> PCGSelectorToJson(const FPCGAttributePropertySelector& Selector)
+{
+    TSharedPtr<FJsonObject> SelectorObject = MakeShared<FJsonObject>();
+    SelectorObject->SetStringField(
+        TEXT("selection"),
+        EnumValueToNameString(StaticEnum<EPCGAttributePropertySelection>(), static_cast<int64>(Selector.GetSelection())));
+    SelectorObject->SetStringField(TEXT("attribute_name"), NameToJsonString(Selector.GetAttributeName()));
+    SelectorObject->SetStringField(TEXT("property_name"), NameToJsonString(Selector.GetPropertyName()));
+    SelectorObject->SetStringField(TEXT("domain_name"), NameToJsonString(Selector.GetDomainName()));
+    SelectorObject->SetStringField(
+        TEXT("point_property"),
+        EnumValueToNameString(StaticEnum<EPCGPointProperties>(), static_cast<int64>(Selector.GetPointProperty())));
+    SelectorObject->SetStringField(
+        TEXT("extra_property"),
+        EnumValueToNameString(StaticEnum<EPCGExtraProperties>(), static_cast<int64>(Selector.GetExtraProperty())));
+    SelectorObject->SetStringField(TEXT("name"), NameToJsonString(Selector.GetName()));
+    SelectorObject->SetStringField(TEXT("display"), Selector.ToString());
+    SelectorObject->SetBoolField(TEXT("is_valid"), Selector.IsValid());
+
+    TArray<TSharedPtr<FJsonValue>> ExtraNames;
+    for (const FString& ExtraName : Selector.GetExtraNames())
+    {
+        ExtraNames.Add(MakeShared<FJsonValueString>(ExtraName));
+    }
+    SelectorObject->SetArrayField(TEXT("extra_names"), ExtraNames);
+    return SelectorObject;
+}
+
+bool ApplyPCGAttributeSelectorRequest(
+    const TSharedPtr<FJsonObject>& Params,
+    FPCGAttributePropertySelector& Selector,
+    bool& bOutChanged,
+    FString& OutSelectorType,
+    FString& OutErrorMessage)
+{
+    Params->TryGetStringField(TEXT("selector_type"), OutSelectorType);
+    if (OutSelectorType.IsEmpty())
+    {
+        Params->TryGetStringField(TEXT("selection"), OutSelectorType);
+    }
+
+    FString AttributeName;
+    FString PropertyName;
+    FString DomainName;
+    FString PointPropertyName;
+    FString ExtraPropertyName;
+    const bool bHasAttributeName = Params->TryGetStringField(TEXT("attribute_name"), AttributeName);
+    const bool bHasPropertyName = Params->TryGetStringField(TEXT("selected_property_name"), PropertyName) ||
+        Params->TryGetStringField(TEXT("target_property_name"), PropertyName);
+    const bool bHasDomainName = Params->TryGetStringField(TEXT("domain_name"), DomainName);
+    const bool bHasPointProperty = Params->TryGetStringField(TEXT("point_property"), PointPropertyName);
+    const bool bHasExtraProperty = Params->TryGetStringField(TEXT("extra_property"), ExtraPropertyName);
+
+    if (OutSelectorType.IsEmpty())
+    {
+        if (bHasAttributeName)
+        {
+            OutSelectorType = TEXT("attribute");
+        }
+        else if (bHasPropertyName)
+        {
+            OutSelectorType = TEXT("property");
+        }
+        else if (bHasPointProperty)
+        {
+            OutSelectorType = TEXT("point_property");
+        }
+        else if (bHasExtraProperty)
+        {
+            OutSelectorType = TEXT("extra_property");
+        }
+    }
+
+    const bool bResetExtraNames = JsonBoolOrDefault(Params, TEXT("reset_extra_names"), true);
+    bOutChanged = false;
+
+    if (bHasDomainName)
+    {
+        bOutChanged |= Selector.SetDomainName(FName(*DomainName), false);
+    }
+
+    if (OutSelectorType.Equals(TEXT("attribute"), ESearchCase::IgnoreCase))
+    {
+        if (!bHasAttributeName)
+        {
+            OutErrorMessage = TEXT("selector_type='attribute' requires 'attribute_name'");
+            return false;
+        }
+        bOutChanged |= Selector.SetAttributeName(FName(*AttributeName), bResetExtraNames);
+    }
+    else if (OutSelectorType.Equals(TEXT("property"), ESearchCase::IgnoreCase))
+    {
+        if (!bHasPropertyName)
+        {
+            OutErrorMessage = TEXT("selector_type='property' requires 'selected_property_name'");
+            return false;
+        }
+        bOutChanged |= Selector.SetPropertyName(FName(*PropertyName), bResetExtraNames);
+    }
+    else if (OutSelectorType.Equals(TEXT("point_property"), ESearchCase::IgnoreCase) || OutSelectorType.Equals(TEXT("point"), ESearchCase::IgnoreCase))
+    {
+        if (!bHasPointProperty)
+        {
+            OutErrorMessage = TEXT("selector_type='point_property' requires 'point_property'");
+            return false;
+        }
+
+        int64 EnumValue = 0;
+        if (!TryParseEnumValueByName(StaticEnum<EPCGPointProperties>(), PointPropertyName, EnumValue))
+        {
+            OutErrorMessage = FString::Printf(TEXT("Unknown EPCGPointProperties value: %s"), *PointPropertyName);
+            return false;
+        }
+        bOutChanged |= Selector.SetPointProperty(static_cast<EPCGPointProperties>(EnumValue), bResetExtraNames);
+    }
+    else if (OutSelectorType.Equals(TEXT("extra_property"), ESearchCase::IgnoreCase) || OutSelectorType.Equals(TEXT("extra"), ESearchCase::IgnoreCase))
+    {
+        if (!bHasExtraProperty)
+        {
+            OutErrorMessage = TEXT("selector_type='extra_property' requires 'extra_property'");
+            return false;
+        }
+
+        int64 EnumValue = 0;
+        if (!TryParseEnumValueByName(StaticEnum<EPCGExtraProperties>(), ExtraPropertyName, EnumValue))
+        {
+            OutErrorMessage = FString::Printf(TEXT("Unknown EPCGExtraProperties value: %s"), *ExtraPropertyName);
+            return false;
+        }
+        bOutChanged |= Selector.SetExtraProperty(static_cast<EPCGExtraProperties>(EnumValue), bResetExtraNames);
+    }
+    else
+    {
+        OutErrorMessage = TEXT("Missing or unsupported selector_type. Use attribute, property, point_property, or extra_property.");
+        return false;
+    }
+
+    TArray<FString> ExtraNames;
+    FString ExtraNamesError;
+    const bool bHasExtraNames = TryReadStringArrayField(Params, TEXT("extra_names"), ExtraNames, ExtraNamesError);
+    if (!ExtraNamesError.IsEmpty())
+    {
+        OutErrorMessage = ExtraNamesError;
+        return false;
+    }
+    if (bHasExtraNames)
+    {
+        if (Selector.GetExtraNames() != ExtraNames)
+        {
+            Selector.GetExtraNamesMutable() = ExtraNames;
+            bOutChanged = true;
+        }
+    }
+
+    return true;
 }
 
 TSharedPtr<FJsonObject> PCGPinToJson(const UPCGPin* Pin)
@@ -860,6 +1166,10 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleCommand(const FString& Comm
     {
         return HandleSetPCGNodeSetting(Params);
     }
+    if (CommandType == TEXT("set_pcg_attribute_selector"))
+    {
+        return HandleSetPCGAttributeSelector(Params);
+    }
     if (CommandType == TEXT("compile_or_notify_pcg_graph"))
     {
         return HandleCompileOrNotifyPCGGraph(Params);
@@ -967,6 +1277,11 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleAddPCGNode(const TSharedPtr
     if (!Params->TryGetStringField(TEXT("settings_class"), SettingsClassName))
     {
         return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'settings_class' parameter"));
+    }
+    if (FUnrealMCPCommonUtils::IsMCPDependencyReference(SettingsClassName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(
+            FUnrealMCPCommonUtils::GetMCPDependencyReferenceError(TEXT("settings_class"), SettingsClassName));
     }
 
     UPCGGraph* Graph = FindPCGGraph(GraphPath);
@@ -1137,6 +1452,118 @@ TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleSetPCGNodeSetting(const TSh
 
     TSharedPtr<FJsonObject> ResultObj = PCGNodeToJson(Node, true);
     ResultObj->SetStringField(TEXT("updated_property"), PropertyName);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPPCGCommands::HandleSetPCGAttributeSelector(const TSharedPtr<FJsonObject>& Params)
+{
+    FString GraphPath;
+    if (!Params->TryGetStringField(TEXT("graph_path"), GraphPath))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'graph_path' parameter"));
+    }
+
+    FString NodeId;
+    if (!Params->TryGetStringField(TEXT("node_id"), NodeId))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'node_id' parameter"));
+    }
+
+    FString PropertyName;
+    if (!Params->TryGetStringField(TEXT("selector_property_name"), PropertyName) &&
+        !Params->TryGetStringField(TEXT("property_name"), PropertyName))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'selector_property_name' parameter"));
+    }
+
+    UPCGGraph* Graph = FindPCGGraph(GraphPath);
+    if (!Graph)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("PCG graph not found: %s"), *GraphPath));
+    }
+
+    UPCGNode* Node = FindPCGNodeById(Graph, NodeId);
+    if (!Node)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("PCG node not found: %s"), *NodeId));
+    }
+
+    UPCGSettings* Settings = Node->GetSettings();
+    if (!Settings)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("PCG node has no settings: %s"), *NodeId));
+    }
+
+    FProperty* Property = FindPCGSettingsPropertyLoose(Settings, PropertyName);
+    if (!Property)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Property not found on %s: %s"), *Settings->GetClass()->GetName(), *PropertyName));
+    }
+
+    FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+    if (!StructProperty || !StructProperty->Struct || !StructProperty->Struct->IsChildOf(FPCGAttributePropertySelector::StaticStruct()))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(
+            TEXT("Property '%s' is %s, not an FPCGAttributePropertySelector-derived struct"),
+            *Property->GetName(),
+            *Property->GetClass()->GetName()));
+    }
+
+    void* PropertyAddr = StructProperty->ContainerPtrToValuePtr<void>(Settings);
+    if (!PropertyAddr)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Could not access selector property: %s"), *Property->GetName()));
+    }
+
+    FPCGAttributePropertySelector* Selector = static_cast<FPCGAttributePropertySelector*>(PropertyAddr);
+    const bool bDryRun = JsonBoolOrDefault(Params, TEXT("dry_run"), false);
+    const bool bSave = JsonBoolOrDefault(Params, TEXT("save"), true);
+
+    FPCGAttributePropertySelector PreviewSelector = *Selector;
+    FPCGAttributePropertySelector& TargetSelector = bDryRun ? PreviewSelector : *Selector;
+
+    bool bChanged = false;
+    FString SelectorType;
+    FString ErrorMessage;
+    if (!ApplyPCGAttributeSelectorRequest(Params, TargetSelector, bChanged, SelectorType, ErrorMessage))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(ErrorMessage);
+    }
+
+    bool bSaved = false;
+    if (!bDryRun && bChanged)
+    {
+        Settings->Modify();
+        Graph->Modify();
+        NotifySettingsChanged(Graph, Settings, Property->GetName());
+        Settings->MarkPackageDirty();
+        Graph->MarkPackageDirty();
+
+        if (bSave)
+        {
+            bSaved = UEditorAssetLibrary::SaveLoadedAsset(Graph, false);
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("graph"), Graph->GetPathName());
+    ResultObj->SetStringField(TEXT("node_id"), Node->GetName());
+    ResultObj->SetStringField(TEXT("title"), Node->GetNodeTitle(EPCGNodeTitleType::ListView).ToString());
+    ResultObj->SetStringField(TEXT("settings_class"), Settings->GetClass()->GetName());
+    ResultObj->SetStringField(TEXT("requested_property_name"), PropertyName);
+    ResultObj->SetStringField(TEXT("property_name"), Property->GetName());
+    ResultObj->SetStringField(TEXT("selector_struct"), StructProperty->Struct->GetName());
+    ResultObj->SetStringField(TEXT("selector_type"), SelectorType);
+    ResultObj->SetBoolField(TEXT("changed"), bChanged);
+    ResultObj->SetBoolField(TEXT("dry_run"), bDryRun);
+    ResultObj->SetBoolField(TEXT("save_requested"), bSave);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    ResultObj->SetObjectField(TEXT("selector"), PCGSelectorToJson(TargetSelector));
+    if (bDryRun)
+    {
+        ResultObj->SetObjectField(TEXT("current_selector"), PCGSelectorToJson(*Selector));
+    }
     return ResultObj;
 }
 
